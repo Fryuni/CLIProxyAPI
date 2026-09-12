@@ -52,6 +52,9 @@ func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatE
 // Identifier implements cliproxyauth.ProviderExecutor.
 func (e *OpenAICompatExecutor) Identifier() string { return e.provider }
 
+// SupportsTranscription advertises the standard API for every custom compatible provider.
+func (e *OpenAICompatExecutor) SupportsTranscription() bool { return true }
+
 // PrepareRequest injects OpenAI-compatible credentials into the outgoing HTTP request.
 func (e *OpenAICompatExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -87,8 +90,11 @@ func (e *OpenAICompatExecutor) HttpRequest(ctx context.Context, auth *cliproxyau
 
 func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
+	if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+		return e.executeMedia(ctx, auth, req, opts, "/audio/transcriptions")
+	}
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
-		return e.executeImages(ctx, auth, req, opts, endpointPath)
+		return e.executeMedia(ctx, auth, req, opts, endpointPath)
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -216,7 +222,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	return resp, nil
 }
 
-func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (resp cliproxyexecutor.Response, err error) {
+func (e *OpenAICompatExecutor) executeMedia(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (resp cliproxyexecutor.Response, err error) {
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -228,7 +234,16 @@ func (e *OpenAICompatExecutor) executeImages(ctx context.Context, auth *cliproxy
 		return resp, err
 	}
 
-	payload, contentType, errPrepare := prepareOpenAICompatImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), false)
+	var payload []byte
+	var contentType string
+	var errPrepare error
+	if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+		var audio helps.TranscriptionRequest
+		audio, errPrepare = helps.PrepareTranscriptionRequest(req.Payload, opts.Headers.Get("Content-Type"), baseModel)
+		payload, contentType = audio.Payload, audio.ContentType
+	} else {
+		payload, contentType, errPrepare = prepareOpenAICompatImagesPayload(req.Payload, baseModel, opts.Headers.Get("Content-Type"), false)
+	}
 	if errPrepare != nil {
 		err = errPrepare
 		return resp, err

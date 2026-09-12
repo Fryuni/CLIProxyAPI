@@ -129,6 +129,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		return resp, unwrapExecutionBoundaryError(errHome)
 	}
 
+	if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+		normalized = m.transcriptionProviders(normalized)
+		if len(normalized) == 0 {
+			return cliproxyexecutor.Response{}, transcriptionUnsupportedError(req.Model)
+		}
+	}
+
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
 
 	var lastErr error
@@ -395,7 +402,7 @@ func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexe
 		}
 	}
 	source := opts.SourceFormat.String()
-	if source == "openai-image" || source == "openai-video" {
+	if source == "openai-image" || source == "openai-video" || opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
 		return opts.SourceFormat
 	}
 	if opts.Alt == "responses/compact" && !opts.Stream {
@@ -571,6 +578,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
+			if errExec != nil && opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+				m.recordAvailabilityNeutralResult(execCtx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Error: resultErrorFromError(errExec), Options: execOpts})
+				return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
+			}
 			if errExec != nil {
 				if hasUpstreamExecutionAttempt(errExec) {
 					upstreamErr = errExec

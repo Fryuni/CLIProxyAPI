@@ -89,6 +89,9 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 		pickOpts = withHomeExcludedAuthIDs(pickOpts, tried)
 		selection, errSelection := m.pickHomeDispatchSelection(ctx, routeModel, pickOpts)
 		if errSelection != nil {
+			if isRequestStopError(lastErr) {
+				return cliproxyexecutor.Response{}, lastErr
+			}
 			preferredErr := preferredExecutionAttemptError(lastErr, upstreamErr)
 			var homeCooldown *homeDispatchRetryAfterError
 			if lastErr != nil && errors.As(errSelection, &homeCooldown) && homeCooldown != nil {
@@ -104,6 +107,18 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 		if auth == nil || selection.Executor == nil {
 			selection.End("missing_execution_target")
 			return cliproxyexecutor.Response{}, &Error{Code: "executor_not_found", Message: "executor not registered"}
+		}
+		if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat && !supportsTranscription(selection.Executor) {
+			_, repeated := tried[auth.ID]
+			tried[auth.ID] = struct{}{}
+			lastErr = wrapRequestStopError(transcriptionUnsupportedError(routeModel))
+			if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "transcription_unsupported"); errEnd != nil {
+				return cliproxyexecutor.Response{}, errEnd
+			}
+			if repeated {
+				return cliproxyexecutor.Response{}, lastErr
+			}
+			continue
 		}
 		m.observeHomeRetryLimit(auth, selection, homeRetryLimit)
 		if _, seen := tried[auth.ID]; seen {
@@ -263,6 +278,13 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 					selection.End("completed")
 				}
 				return response, nil
+			}
+			if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+				result.Error = resultErrorFromError(errExecute)
+				m.reportHomeResult(execCtx, result, preparedAuth)
+				releaseAttempt()
+				selection.End("transcription_failed")
+				return cliproxyexecutor.Response{}, wrapRequestStopError(errExecute)
 			}
 			result.Error = resultErrorFromError(errExecute)
 			result.RetryAfter = retryAfterFromError(errExecute)
