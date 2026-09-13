@@ -70,6 +70,15 @@ func (e *pluginRefreshCompatExecutor) Identifier() string {
 	return ""
 }
 
+// SupportsTranscription preserves the optional capability of the native executor.
+func (e *pluginRefreshCompatExecutor) SupportsTranscription() bool {
+	if e == nil {
+		return false
+	}
+	support, ok := e.inner.(cliproxyexecutor.TranscriptionSupport)
+	return ok && support.SupportsTranscription()
+}
+
 func (e *pluginRefreshCompatExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	if e == nil || e.inner == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("plugin refresh compat executor is unavailable")

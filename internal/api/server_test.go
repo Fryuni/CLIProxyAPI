@@ -728,6 +728,24 @@ func TestHealthzAccessLogging(t *testing.T) {
 	}
 }
 
+func TestAudioTranscriptionRouteRequiresAuth(t *testing.T) {
+	server := newTestServer(t)
+	for _, authorized := range []bool{false, true} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		wantStatus := http.StatusUnauthorized
+		if authorized {
+			req.Header.Set("Authorization", "Bearer test-key")
+			wantStatus = http.StatusBadRequest
+		}
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != wantStatus {
+			t.Fatalf("authorized=%v: status=%d body=%s", authorized, rr.Code, rr.Body.String())
+		}
+	}
+}
+
 func TestCodexLiveRoutesRequireAuthAndAreRegistered(t *testing.T) {
 	server := newTestServer(t)
 

@@ -106,6 +106,16 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
 	body, responseHeaders := h.applyResponseInterceptors(ctx, lifecycle.requestID(), responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
+	// Transcription responses may be plain text or subtitles, so their media type
+	// is part of the API contract even when optional header passthrough is disabled.
+	if entryProtocol == coreexecutor.TranscriptionFormat.String() && responseHeaders.Get("Content-Type") == "" {
+		if contentType := rawResponseHeaders.Get("Content-Type"); contentType != "" {
+			if responseHeaders == nil {
+				responseHeaders = make(http.Header)
+			}
+			responseHeaders.Set("Content-Type", contentType)
+		}
+	}
 	lifecycle.complete(pluginapi.RequestCompletionSucceeded, http.StatusOK, nil)
 	return body, responseHeaders, nil
 }
