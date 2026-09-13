@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func transcriptionTestHandler(t *testing.T, baseURL string, compatible bool) *OpenAIAPIHandler {
@@ -210,5 +212,16 @@ func TestAudioTranscriptionsInvalidInput(t *testing.T) {
 		if response.Code != 400 {
 			t.Fatalf("response = %d %s", response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestAudioTranscriptionsRejectsOversizedRequest(t *testing.T) {
+	h := NewOpenAIAPIHandler(handlers.NewBaseAPIHandlers(nil, nil))
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("unread"))
+	c.Request.ContentLength = coreexecutor.TranscriptionMaxRequestBytes + 1
+	h.AudioTranscriptions(c)
+	if c.Writer.Status() != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d", c.Writer.Status())
 	}
 }

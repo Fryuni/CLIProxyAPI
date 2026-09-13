@@ -578,10 +578,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
-			if errExec != nil && opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
-				m.recordAvailabilityNeutralResult(execCtx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Error: resultErrorFromError(errExec), Options: execOpts})
-				return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
-			}
 			if errExec != nil {
 				if hasUpstreamExecutionAttempt(errExec) {
 					upstreamErr = errExec
@@ -590,7 +586,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				refreshCtx := newUpstreamAttemptContext(execCtx)
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized || opts.SourceFormat == cliproxyexecutor.TranscriptionFormat); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
 					execCtx = newUpstreamAttemptContext(execCtx)
@@ -626,10 +622,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
-				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) {
+				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) || (!okAction && isTranscriptionRequestFault(execOpts, errExec)) {
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
 					m.MarkResult(execCtx, result)
+				}
+				if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+					return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {

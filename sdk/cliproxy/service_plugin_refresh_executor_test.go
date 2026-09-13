@@ -1,6 +1,11 @@
 package cliproxy
 
 import (
+	"context"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
@@ -24,11 +29,21 @@ func TestRegisterExecutorForAuth_PluginAuthProviderWrapsOpenAICompatRefresh(t *t
 		pluginHost:  pluginhost.New(),
 	}
 
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		if r.URL.Path != "/v1/audio/transcriptions" {
+			t.Errorf("upstream path = %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"text":"hello"}`))
+	}))
+	defer upstream.Close()
+
 	auth := &coreauth.Auth{
 		ID:       "plugin-auth-1",
 		Provider: "plugin-provider",
 		Attributes: map[string]string{
-			"base_url": "https://compat.example.com/v1",
+			"base_url": upstream.URL + "/v1",
 			"api_key":  "expired-token",
 		},
 		Metadata: map[string]any{
@@ -52,6 +67,18 @@ func TestRegisterExecutorForAuth_PluginAuthProviderWrapsOpenAICompatRefresh(t *t
 	}
 	if _, okOpenAICompat := inner.(*runtimeexecutor.OpenAICompatExecutor); !okOpenAICompat {
 		t.Fatalf("inner executor type = %T, want *executor.OpenAICompatExecutor", inner)
+	}
+
+	if _, err := service.coreManager.Register(context.Background(), auth); err != nil {
+		t.Fatal(err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "whisper-1"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	response, err := service.coreManager.Execute(context.Background(), []string{auth.Provider}, coreexecutor.Request{
+		Model: "whisper-1", Payload: []byte(`{"model":"whisper-1","input_audio":{"data":"AAE=","format":"wav"}}`),
+	}, coreexecutor.Options{SourceFormat: coreexecutor.TranscriptionFormat, Headers: http.Header{"Content-Type": {"application/json"}}})
+	if err != nil || string(response.Payload) != `{"text":"hello"}` || upstreamCalls != 1 {
+		t.Fatalf("wrapped transcription: response=%s calls=%d error=%v", response.Payload, upstreamCalls, err)
 	}
 
 	// Upgrading from bare OpenAICompat without forceReplace should still wrap.

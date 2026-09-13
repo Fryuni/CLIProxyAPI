@@ -30,3 +30,19 @@ func (m *Manager) transcriptionProviders(providers []string) []string {
 	}
 	return filtered
 }
+
+// Request and endpoint failures must not suspend a model's other APIs.
+func isTranscriptionRequestFault(opts cliproxyexecutor.Options, err error) bool {
+	if opts.SourceFormat != cliproxyexecutor.TranscriptionFormat {
+		return false
+	}
+	if isRequestScopedError(err) {
+		return true
+	}
+	switch statusCodeFromError(err) {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
+}

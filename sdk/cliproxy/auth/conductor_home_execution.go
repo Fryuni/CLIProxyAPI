@@ -279,13 +279,6 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 				}
 				return response, nil
 			}
-			if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
-				result.Error = resultErrorFromError(errExecute)
-				m.reportHomeResult(execCtx, result, preparedAuth)
-				releaseAttempt()
-				selection.End("transcription_failed")
-				return cliproxyexecutor.Response{}, wrapRequestStopError(errExecute)
-			}
 			result.Error = resultErrorFromError(errExecute)
 			result.RetryAfter = retryAfterFromError(errExecute)
 			if isCredentialScopedError(errExecute) {
@@ -294,6 +287,11 @@ func (m *Manager) executeHomeOnce(ctx context.Context, providers []string, req c
 			action, okAction := matchRequestScopedErrorAction(preparedAuth, errExecute, m.runtimeConfigSnapshot())
 			applyRequestScopedActionToResult(action, okAction, &result)
 			m.reportHomeResult(execCtx, result, preparedAuth)
+			if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+				releaseAttempt()
+				selection.End("transcription_failed")
+				return cliproxyexecutor.Response{}, wrapRequestStopError(errExecute)
+			}
 			lastErr = errExecute
 			if okAction {
 				if isRequestScopedStop(action, okAction) {

@@ -10,3 +10,7 @@ const TranscriptionFormat sdktranslator.Format = "openai-transcription"
 type TranscriptionSupport interface {
 	SupportsTranscription() bool
 }
+
+// TranscriptionMaxRequestBytes allows a 25 MiB audio file encoded as Base64 plus
+// request fields, while bounding both wire and decompressed request bodies.
+const TranscriptionMaxRequestBytes int64 = 36 << 20

@@ -54,6 +54,10 @@ Send this body with `Content-Type: application/json`. `input_audio.data` must
 contain standard Base64, without a data-URL prefix. `input_audio.format` supplies
 the audio filename extension. The proxy converts the audio to a multipart file
 upload so the same input works with OpenAI and compatible transcription APIs.
+Requests are limited to 36 MiB, both on the wire and after decompression; larger
+requests receive HTTP 413 before audio normalization. This accommodates a 25 MiB
+audio file encoded as Base64 plus form fields.
+
 JSON arrays become repeated form fields, and object values become JSON form
 fields. Upstream upload limits and supported parameters still apply.
 
@@ -64,7 +68,8 @@ Built-in executors without a transcription endpoint are skipped when resolving a
 shared model ID, including through Home dispatch. If no matching provider
 supports transcription, the proxy returns HTTP 400. A runtime failure from a
 compatible provider is returned directly, without trying another credential,
-model-pool entry, or provider.
+model-pool entry, or provider. Credential and quota failures still update health
+and cooldown state for subsequent requests.
 
 Responses are forwarded without chat-completion translation. JSON responses
 contain the provider's transcription fields, normally including `text`.

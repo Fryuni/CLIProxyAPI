@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -12,13 +13,18 @@ import (
 
 // AudioTranscriptions handles file uploads and Base64-encoded audio at /v1/audio/transcriptions.
 func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
-	payload, err := handlers.ReadRequestBody(c)
+	payload, err := handlers.ReadRequestBodyWithLimit(c, coreexecutor.TranscriptionMaxRequestBytes)
 	var audio helps.TranscriptionRequest
 	if err == nil {
 		audio, err = helps.PrepareTranscriptionRequest(payload, c.GetHeader("Content-Type"), "")
 	}
 	if err != nil {
-		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+		status := http.StatusBadRequest
+		var limitErr *http.MaxBytesError
+		if errors.As(err, &limitErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		c.JSON(status, handlers.ErrorResponse{Error: handlers.ErrorDetail{
 			Message: err.Error(), Type: "invalid_request_error",
 		}})
 		return
