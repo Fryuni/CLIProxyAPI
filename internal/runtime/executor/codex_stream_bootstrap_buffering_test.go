@@ -785,6 +785,18 @@ func codexReleasingFrameCases() []struct{ name, frame string } {
 // cancelled read is the context.Canceled sentinel itself, so removing the guard leaves the returned
 // value unchanged and this test green.
 func TestCodexExecutor_BootstrapBuffering_CancelDuringBootstrapIsNotAnUpstreamFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clockReads := 0
+	t.Cleanup(setCodexBootstrapNowForTest(func() time.Time {
+		clockReads++
+		// The first read starts bootstrap, the second checks response.created,
+		// and the third checks its blank separator after the created frame is held.
+		if clockReads == 3 {
+			cancel()
+		}
+		return time.Unix(1, 0)
+	}))
 	released := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -798,16 +810,13 @@ func TestCodexExecutor_BootstrapBuffering_CancelDuringBootstrapIsNotAnUpstreamFa
 	defer server.Close()
 	defer close(released)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
-	}()
-
 	req, opts := codexTestRequest()
 	result, err := NewCodexExecutor(codexBufferingConfig(true)).ExecuteStream(ctx, codexTestAuth(server.URL), req, opts)
 	if result != nil {
-		drainChunks(result)
+		t.Fatal("cancellation during bootstrap must not release a stream")
+	}
+	if clockReads < 3 {
+		t.Fatal("cancellation did not exercise buffering of the created frame")
 	}
 	// Identity rather than errors.Is, so a transport error that merely wraps the cancellation cannot
 	// satisfy it.
