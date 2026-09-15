@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -90,8 +92,9 @@ func TestDevinRemoteOAuthFlow(t *testing.T) {
 	if start.Status != "ok" || start.State == "" || query.Get("state") != start.State || query.Get("code_challenge_method") != "S256" {
 		t.Fatalf("invalid authorization response: %s", w.Body.String())
 	}
-	if got := query.Get("redirect_uri"); got != "http://127.0.0.1:8317/callback" {
-		t.Fatalf("redirect_uri = %q", got)
+	callback, errCallback := url.Parse(query.Get("redirect_uri"))
+	if errCallback != nil || callback.Scheme != "http" || callback.Hostname() != "127.0.0.1" || callback.Port() == "" || callback.Path != "/callback" {
+		t.Fatalf("redirect_uri = %q", query.Get("redirect_uri"))
 	}
 	if query.Get("code_verifier") != "" {
 		t.Fatal("PKCE verifier exposed")
@@ -252,5 +255,80 @@ func TestWaitDevinOAuthCallbackExpiredContext(t *testing.T) {
 	_, errWait := waitDevinOAuthCallback(ctx, filepath.Join(t.TempDir(), "missing.oauth"), state)
 	if errWait == nil || errWait.Error() != "Timeout waiting for OAuth callback" {
 		t.Fatalf("error = %v", errWait)
+	}
+}
+
+func TestDevinOAuthUsesIndependentLoopbackCallback(t *testing.T) {
+	for _, cfg := range []config.Config{
+		{Port: 8317, TLS: config.TLSConfig{Enable: true}},
+		{Host: "192.0.2.10", Port: 8317},
+	} {
+		t.Run(cfg.Host+"/tls="+fmt.Sprint(cfg.TLS.Enable), func(t *testing.T) {
+			cfg.AuthDir = t.TempDir()
+			h := NewHandlerWithoutConfigFilePath(&cfg, nil)
+			exchanged := make(chan string, 1)
+			originalFactory := newDevinOAuthService
+			newDevinOAuthService = func(*config.Config) devinOAuthService {
+				return &fakeDevinOAuthService{exchange: func(_ context.Context, code, _ string) (string, error) {
+					exchanged <- code
+					return "", errors.New("test exchange rejected")
+				}}
+			}
+			t.Cleanup(func() { newDevinOAuthService = originalFactory })
+			router := gin.New()
+			router.GET("/devin-auth-url", h.RequestDevinToken)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/devin-auth-url", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("start: %d %s", w.Code, w.Body.String())
+			}
+			var start struct{ State, URL string }
+			if errDecode := json.Unmarshal(w.Body.Bytes(), &start); errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			t.Cleanup(func() { CancelOAuthSession(start.State) })
+			authURL, errParse := url.Parse(start.URL)
+			if errParse != nil {
+				t.Fatal(errParse)
+			}
+			callback, errCallback := url.Parse(authURL.Query().Get("redirect_uri"))
+			if errCallback != nil {
+				t.Fatal(errCallback)
+			}
+			if callback.Scheme != "http" || callback.Hostname() != "127.0.0.1" || callback.Path != "/callback" || callback.Port() == "" || callback.Port() == "8317" {
+				t.Fatalf("callback must use a dedicated HTTP loopback port: %s", callback)
+			}
+			otherState := start.State + "-other"
+			RegisterOAuthSession(otherState, "devin")
+			t.Cleanup(func() { CancelOAuthSession(otherState) })
+			client := &http.Client{Timeout: 5 * time.Second}
+			for _, state := range []string{otherState, start.State} {
+				callback.RawQuery = url.Values{"state": {state}, "code": {"loopback-code"}}.Encode()
+				resp, errGet := client.Get(callback.String())
+				if errGet != nil {
+					t.Fatal(errGet)
+				}
+				_, errRead := io.Copy(io.Discard, resp.Body)
+				errClose := resp.Body.Close()
+				if errRead != nil || errClose != nil {
+					t.Fatalf("callback response: read=%v close=%v", errRead, errClose)
+				}
+				want := http.StatusOK
+				if state == otherState {
+					want = http.StatusBadRequest
+				}
+				if resp.StatusCode != want {
+					t.Fatalf("callback status = %d, want %d", resp.StatusCode, want)
+				}
+			}
+			select {
+			case code := <-exchanged:
+				if code != "loopback-code" {
+					t.Fatalf("exchanged code = %q", code)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("loopback callback did not reach token exchange")
+			}
+		})
 	}
 }

@@ -61,21 +61,19 @@ func tryRefreshDevinModels(ctx context.Context, label string) {
 		return
 	}
 	log.Infof("%s completed from %s, catalog updated", label, sourceURL)
+	notifyModelRefresh([]string{"devin"})
 }
 
 func fetchDevinModelsFromRemote(ctx context.Context) ([]byte, string) {
-	client := &http.Client{Timeout: modelsFetchTimeout}
+	client := &http.Client{}
 	for _, sourceURL := range devinModelsURLs {
-		reqCtx, cancel := context.WithTimeout(ctx, modelsFetchTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, sourceURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
 		if err != nil {
-			cancel()
 			log.Warnf("devin models updater: invalid request for %s: %v", sourceURL, err)
 			continue
 		}
 
 		resp, err := client.Do(req)
-		cancel()
 		if err != nil {
 			log.Warnf("devin models updater: fetch failed from %s: %v", sourceURL, err)
 			continue

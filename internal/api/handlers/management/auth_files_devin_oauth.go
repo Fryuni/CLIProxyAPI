@@ -31,20 +31,9 @@ var newDevinOAuthService = func(cfg *config.Config) devinOAuthService {
 	return devin.NewDevinAuthService(client)
 }
 
-// devinCallbackURL builds the required loopback callback URL for Devin OAuth.
-// Devin's authorization page strictly validates that redirect_uri matches
-// http://127.0.0.1:<port>/callback (http protocol, 127.0.0.1 host, and /callback path).
-func (h *Handler) devinCallbackURL() (string, error) {
-	if h == nil || h.cfg == nil || h.cfg.Port <= 0 {
-		return "", fmt.Errorf("server port is not configured")
-	}
-	return fmt.Sprintf("http://127.0.0.1:%d/callback", h.cfg.Port), nil
-}
-
 // RequestDevinToken starts the same callback/status flow used by the other WebUI providers.
 func (h *Handler) RequestDevinToken(c *gin.Context) {
-	redirectURI, errRedirect := h.devinCallbackURL()
-	if errRedirect != nil {
+	if h == nil || h.cfg == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 		return
 	}
@@ -59,13 +48,22 @@ func (h *Handler) RequestDevinToken(c *gin.Context) {
 		return
 	}
 
+	authDir := h.cfg.AuthDir
+	redirectURI, stopCallback, errCallback := startDevinOAuthCallback(authDir, state)
+	if errCallback != nil {
+		log.WithError(errCallback).Warn("failed to start Devin OAuth callback server")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
+		return
+	}
 	authSvc := newDevinOAuthService(h.cfg)
 	authURL := authSvc.BuildAuthorizationURL(redirectURI, pkceCodes.CodeChallenge, state)
 	RegisterOAuthSession(state, "devin")
 	// Do not inherit the HTTP request cancellation: login continues after returning the URL.
 	ctx := PopulateAuthContext(context.Background(), c)
-	authDir := h.cfg.AuthDir
-	go h.completeDevinOAuth(ctx, authDir, state, pkceCodes.CodeVerifier, authSvc)
+	go func() {
+		defer stopCallback()
+		h.completeDevinOAuth(ctx, authDir, state, pkceCodes.CodeVerifier, authSvc)
+	}()
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
