@@ -58,12 +58,21 @@ type requestRetryAttemptedAuthsContextKey struct{}
 
 type requestRetryAttempt struct {
 	resultError *Error
+	modelErrors map[string]*Error
 }
 
-func (attempt requestRetryAttempt) allowsHTTP500Bypass() bool {
-	return attempt.resultError != nil &&
-		attempt.resultError.Code != ErrorCodeForceCooldown &&
-		statusCodeFromResult(attempt.resultError) == http.StatusInternalServerError
+func (attempt requestRetryAttempt) errorForModel(model string) *Error {
+	if len(attempt.modelErrors) > 0 {
+		return attempt.modelErrors[canonicalModelKey(model)]
+	}
+	return attempt.resultError
+}
+
+func (attempt requestRetryAttempt) allowsHTTP500Bypass(model string) bool {
+	resultErr := attempt.errorForModel(model)
+	return resultErr != nil &&
+		resultErr.Code != ErrorCodeForceCooldown &&
+		statusCodeFromResult(resultErr) == http.StatusInternalServerError
 }
 
 type authSelectionEligibility struct {
@@ -107,7 +116,14 @@ func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]re
 	}
 	snapshot := make(map[string]requestRetryAttempt, len(attempted))
 	for authID, attempt := range attempted {
-		snapshot[authID] = requestRetryAttempt{resultError: cloneError(attempt.resultError)}
+		attemptSnapshot := requestRetryAttempt{resultError: cloneError(attempt.resultError)}
+		if len(attempt.modelErrors) > 0 {
+			attemptSnapshot.modelErrors = make(map[string]*Error, len(attempt.modelErrors))
+			for model, resultErr := range attempt.modelErrors {
+				attemptSnapshot.modelErrors[model] = cloneError(resultErr)
+			}
+		}
+		snapshot[authID] = attemptSnapshot
 	}
 	return context.WithValue(ctx, requestRetryAttemptedAuthsContextKey{}, snapshot)
 }
@@ -1220,16 +1236,15 @@ func credentialRetryRoundStateEligible(lastErr *Error, quotaExceeded bool) bool 
 // http500RetryRoundCandidate returns a selection-only clone that ignores a
 // server-error cooldown when this request recorded HTTP 500 for the auth.
 // The stored auth remains cooled for other requests.
-func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, allowBypass bool) *Auth {
-	if auth == nil || !allowBypass {
+func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt requestRetryAttempt) *Auth {
+	if auth == nil {
 		return auth
 	}
 	clone := auth.Clone()
 	bypassed := false
-	modelKey := canonicalModelKey(model)
-	if modelKey != "" && len(clone.ModelStates) > 0 {
+	if len(clone.ModelStates) > 0 {
 		for stateModel, state := range clone.ModelStates {
-			if state == nil || canonicalModelKey(stateModel) != modelKey || state.Quota.Exceeded {
+			if state == nil || state.Quota.Exceeded || !attempt.allowsHTTP500Bypass(stateModel) {
 				continue
 			}
 			if state.LastError != nil && state.LastError.Code == ErrorCodeForceCooldown {
@@ -1246,7 +1261,7 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, allowBy
 		if bypassed {
 			updateAggregatedAvailability(clone, now)
 		}
-	} else if !clone.Quota.Exceeded &&
+	} else if attempt.allowsHTTP500Bypass(model) && !clone.Quota.Exceeded &&
 		(clone.LastError == nil || clone.LastError.Code != ErrorCodeForceCooldown) &&
 		statusCodeFromResult(clone.LastError) >= http.StatusInternalServerError &&
 		statusCodeFromResult(clone.LastError) <= 599 {
@@ -1322,7 +1337,7 @@ func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model str
 		if len(attempted) > 0 {
 			attemptInfo, wasAttempted = attempted[auth.ID]
 		}
-		if wasAttempted && http500RetryRoundCandidate(auth, checkModel, now, attemptInfo.allowsHTTP500Bypass()) != auth {
+		if wasAttempted && http500RetryRoundCandidate(auth, checkModel, now, attemptInfo) != auth {
 			// HTTP 500 retries are bounded by request-retry, not the longer
 			// cross-request transient cooldown.
 			return 0, true
@@ -2131,7 +2146,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			if strings.TrimSpace(model) != "" {
 				checkModel = m.selectionModelForAuth(candidate, model)
 			}
-			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now, attemptInfo.allowsHTTP500Bypass())
+			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now, attemptInfo)
 		}
 		candidates = append(candidates, selectionCandidate)
 	}

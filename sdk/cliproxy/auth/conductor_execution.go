@@ -1268,7 +1268,15 @@ func recordAttemptedAuthResult(ctx context.Context, result Result) {
 	if attempted == nil {
 		return
 	}
-	attempted[result.AuthID] = requestRetryAttempt{resultError: cloneError(result.Error)}
+	attempt := attempted[result.AuthID]
+	attempt.resultError = cloneError(result.Error)
+	if model := canonicalModelKey(result.Model); model != "" {
+		if attempt.modelErrors == nil {
+			attempt.modelErrors = make(map[string]*Error)
+		}
+		attempt.modelErrors[model] = cloneError(result.Error)
+	}
+	attempted[result.AuthID] = attempt
 }
 
 func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[string]requestRetryAttempt) cliproxyexecutor.Options {
