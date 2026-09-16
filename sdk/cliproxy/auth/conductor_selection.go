@@ -994,6 +994,14 @@ func (m *Manager) pickViaBuiltinCandidates(ctx context.Context, strategy schedul
 			byProvider[providerKey] = append(byProvider[providerKey], candidate)
 		}
 	}
+	if len(normalized) == 1 {
+		providerKey := normalized[0]
+		auths := byProvider[providerKey]
+		if len(auths) == 0 {
+			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		}
+		return pick(providerKey, auths)
+	}
 	if strategy == schedulerStrategyFillFirst {
 		for _, providerKey := range normalized {
 			if auths := byProvider[providerKey]; len(auths) > 0 {

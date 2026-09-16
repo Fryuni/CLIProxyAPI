@@ -1713,6 +1713,32 @@ func TestManagerPluginSchedulerDelegateMixedRoundRobinDoesNotPreferWebsocketAuth
 	}
 }
 
+func TestManagerPluginSchedulerDelegateSingleProviderMixedRoundRobinPrefersWebsocketAuths(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{}
+	for _, auth := range []*Auth{
+		{ID: "codex-http", Provider: "codex"},
+		{ID: "codex-ws", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
+	} {
+		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	manager.SetPluginScheduler(&fakePluginScheduler{
+		resp:    pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinRoundRobin},
+		handled: true,
+	})
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	picked, _, provider, errPick := manager.pickNextMixed(ctx, []string{" Codex ", "codex"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickNextMixed() error = %v", errPick)
+	}
+	if picked == nil || picked.ID != "codex-ws" || provider != "codex" {
+		t.Fatalf("pickNextMixed() = (%#v, %q), want websocket auth from codex", picked, provider)
+	}
+}
+
 func TestManagerPluginSchedulerPickNextMixedSelectsProvider(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.executors["gemini"] = schedulerTestExecutor{}
