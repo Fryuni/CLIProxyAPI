@@ -1260,7 +1260,7 @@ func withAttemptedAuthResultTracker(ctx context.Context, attempted map[string]re
 	return context.WithValue(ctx, attemptedAuthResultTrackerContextKey{}, attempted)
 }
 
-func recordAttemptedAuthResult(ctx context.Context, result Result, generation uint64) {
+func recordAttemptedAuthResult(ctx context.Context, result Result, generation uint64, cooldownApplied bool) {
 	if ctx == nil || result.AuthID == "" || result.Success {
 		return
 	}
@@ -1270,12 +1270,17 @@ func recordAttemptedAuthResult(ctx context.Context, result Result, generation ui
 	}
 	attempt := attempted[result.AuthID]
 	attempt.resultError = cloneError(result.Error)
+	attempt.resultCooldownApplied = cooldownApplied
 	attempt.generation = generation
 	if model := canonicalModelKey(result.Model); model != "" {
 		if attempt.modelErrors == nil {
 			attempt.modelErrors = make(map[string]*Error)
 		}
 		attempt.modelErrors[model] = cloneError(result.Error)
+		if attempt.modelCooldownApplied == nil {
+			attempt.modelCooldownApplied = make(map[string]bool)
+		}
+		attempt.modelCooldownApplied[model] = cooldownApplied
 	}
 	attempted[result.AuthID] = attempt
 }

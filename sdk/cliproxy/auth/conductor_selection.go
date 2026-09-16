@@ -57,9 +57,11 @@ type requestRetryRoundContextKey struct{}
 type requestRetryAttemptedAuthsContextKey struct{}
 
 type requestRetryAttempt struct {
-	resultError *Error
-	modelErrors map[string]*Error
-	generation  uint64
+	resultError           *Error
+	resultCooldownApplied bool
+	modelErrors           map[string]*Error
+	modelCooldownApplied  map[string]bool
+	generation            uint64
 }
 
 func (attempt requestRetryAttempt) errorForModel(model string) *Error {
@@ -70,8 +72,13 @@ func (attempt requestRetryAttempt) errorForModel(model string) *Error {
 }
 
 func (attempt requestRetryAttempt) allowsHTTP500Bypass(model string) bool {
+	modelKey := canonicalModelKey(model)
+	cooldownApplied := attempt.resultCooldownApplied
+	if len(attempt.modelErrors) > 0 {
+		cooldownApplied = attempt.modelCooldownApplied[modelKey]
+	}
 	resultErr := attempt.errorForModel(model)
-	return resultErr != nil &&
+	return cooldownApplied && resultErr != nil &&
 		resultErr.Code != ErrorCodeForceCooldown &&
 		statusCodeFromResult(resultErr) == http.StatusInternalServerError
 }
@@ -118,8 +125,15 @@ func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]re
 	snapshot := make(map[string]requestRetryAttempt, len(attempted))
 	for authID, attempt := range attempted {
 		attemptSnapshot := requestRetryAttempt{
-			resultError: cloneError(attempt.resultError),
-			generation:  attempt.generation,
+			resultError:           cloneError(attempt.resultError),
+			resultCooldownApplied: attempt.resultCooldownApplied,
+			generation:            attempt.generation,
+		}
+		if len(attempt.modelCooldownApplied) > 0 {
+			attemptSnapshot.modelCooldownApplied = make(map[string]bool, len(attempt.modelCooldownApplied))
+			for model, cooldownApplied := range attempt.modelCooldownApplied {
+				attemptSnapshot.modelCooldownApplied[model] = cooldownApplied
+			}
 		}
 		if len(attempt.modelErrors) > 0 {
 			attemptSnapshot.modelErrors = make(map[string]*Error, len(attempt.modelErrors))

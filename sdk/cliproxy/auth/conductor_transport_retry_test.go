@@ -346,8 +346,9 @@ func TestHTTP500RetryRoundBypassesAuthCooldownWithUnrelatedModelState(t *testing
 		},
 	}
 	attempt := requestRetryAttempt{
-		resultError: &Error{HTTPStatus: http.StatusInternalServerError, Message: "auth-level failure"},
-		generation:  auth.Generation,
+		resultError:           &Error{HTTPStatus: http.StatusInternalServerError, Message: "auth-level failure"},
+		resultCooldownApplied: true,
+		generation:            auth.Generation,
 	}
 
 	candidate := http500RetryRoundCandidate(auth, "", now, attempt)
@@ -415,7 +416,7 @@ func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
 		-1,
 		1,
 		map[string]requestRetryAttempt{
-			http500AuthID:     {resultError: &Error{HTTPStatus: http.StatusInternalServerError}, generation: http500Auth.Generation},
+			http500AuthID:     {resultError: &Error{HTTPStatus: http.StatusInternalServerError}, resultCooldownApplied: true, generation: http500Auth.Generation},
 			rateLimitedAuthID: {resultError: rateLimitErr, generation: rateLimitedAuth.Generation},
 		},
 	)
@@ -527,9 +528,10 @@ func TestHTTP500RetryBypassRequiresRecordedGeneration(t *testing.T) {
 
 			attempted := map[string]requestRetryAttempt{
 				authID: {
-					resultError: &Error{HTTPStatus: tc.requestStatus, Message: "this request failure"},
-					modelErrors: map[string]*Error{model: {HTTPStatus: tc.requestStatus, Message: "this request failure"}},
-					generation:  requestAuth.Generation,
+					resultError:          &Error{HTTPStatus: tc.requestStatus, Message: "this request failure"},
+					modelErrors:          map[string]*Error{model: {HTTPStatus: tc.requestStatus, Message: "this request failure"}},
+					modelCooldownApplied: map[string]bool{model: true},
+					generation:           requestAuth.Generation,
 				},
 			}
 			selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
@@ -544,6 +546,60 @@ func TestHTTP500RetryBypassRequiresRecordedGeneration(t *testing.T) {
 				t.Fatalf("pickNextMixed() selected %#v, want current cooldown preserved for request status %d", auth, tc.requestStatus)
 			}
 		})
+	}
+}
+
+func TestClosedNetworkHTTP500RetryPreservesConcurrent503Cooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&transportThenSuccessExecutor{identifier: "codex"})
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "concurrent-closed-network-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "concurrent upstream failure"},
+	})
+	attempted := map[string]requestRetryAttempt{authID: {}}
+	trackedCtx := withAttemptedAuthResultTracker(context.Background(), attempted)
+	manager.MarkResult(trackedCtx, Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusInternalServerError,
+			Message:    "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection",
+		},
+	})
+
+	attempt := attempted[authID]
+	if attempt.modelCooldownApplied[model] {
+		t.Fatal("closed-network HTTP 500 was recorded as applying a cooldown")
+	}
+	selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
+	selected, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, model, cliproxyexecutor.Options{}, nil)
+	if errPick == nil || selected != nil {
+		t.Fatalf("pickNextMixed() = (%#v, %v), want concurrent 503 cooldown preserved", selected, errPick)
+	}
+	updated, ok := manager.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("auth %q missing after results", authID)
+	}
+	state := updated.ModelStates[model]
+	if state == nil || !state.Unavailable || statusCodeFromResult(state.LastError) != http.StatusServiceUnavailable {
+		t.Fatalf("concurrent 503 state was replaced: %#v", updated)
 	}
 }
 

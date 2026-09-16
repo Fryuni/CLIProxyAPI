@@ -759,6 +759,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	resultCooldownApplied := false
 	now := time.Now()
 
 	m.mu.Lock()
@@ -948,13 +949,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 					auth.Status = StatusError
 					updateAggregatedAvailability(auth, now)
+					resultCooldownApplied = state.Unavailable && state.NextRetryAfter.After(now)
 				}
-			} else {
+			} else if !shouldSkipCredentialCooldown(result.Error) {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				if result.Error != nil && result.Error.Code == ErrorCodeForceCooldown {
 					disableCooling = false
 				}
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				resultCooldownApplied = auth.Unavailable && auth.NextRetryAfter.After(now)
 			}
 		}
 
@@ -977,7 +980,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if authSnapshot != nil {
-		recordAttemptedAuthResult(ctx, result, authSnapshot.Generation)
+		recordAttemptedAuthResult(ctx, result, authSnapshot.Generation, resultCooldownApplied)
 	}
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
