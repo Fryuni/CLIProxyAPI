@@ -140,12 +140,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 	var lastErr error
 	var preferredUpstreamErr error
-	var retryRoundAttempted map[string]struct{}
+	var retryRoundAttempted map[string]requestRetryAttempt
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		roundAttempted := make(map[string]struct{})
+		roundAttempted := make(map[string]requestRetryAttempt)
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
 		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		roundCtx = withAttemptedAuthResultTracker(roundCtx, roundAttempted)
 		resp, errExec := m.executeMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
 			return resp, nil
@@ -202,12 +203,13 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 	var lastErr error
 	var preferredUpstreamErr error
-	var retryRoundAttempted map[string]struct{}
+	var retryRoundAttempted map[string]requestRetryAttempt
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		roundAttempted := make(map[string]struct{})
+		roundAttempted := make(map[string]requestRetryAttempt)
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
 		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		roundCtx = withAttemptedAuthResultTracker(roundCtx, roundAttempted)
 		resp, errExec := m.executeCountMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
 			return resp, nil
@@ -258,16 +260,17 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	var lastErr error
 	var preferredUpstreamErr error
-	var retryRoundAttempted map[string]struct{}
+	var retryRoundAttempted map[string]requestRetryAttempt
 	homeRetryLimit := -1
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	attempt := 0
 	retryRoundPending := false
 	retryRoundWaited := false
 	for {
-		roundAttempted := make(map[string]struct{})
+		roundAttempted := make(map[string]requestRetryAttempt)
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
 		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		roundCtx = withAttemptedAuthResultTracker(roundCtx, roundAttempted)
 		result, errStream := m.executeStreamMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
 		if errStream == nil {
 			return result, nil
@@ -1245,7 +1248,30 @@ func shouldExcludeHomeAuthAfterStreamError(ctx context.Context, _ *Auth, err err
 	return true
 }
 
-func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[string]struct{}) cliproxyexecutor.Options {
+type attemptedAuthResultTrackerContextKey struct{}
+
+func withAttemptedAuthResultTracker(ctx context.Context, attempted map[string]requestRetryAttempt) context.Context {
+	if attempted == nil {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, attemptedAuthResultTrackerContextKey{}, attempted)
+}
+
+func recordAttemptedAuthResult(ctx context.Context, result Result) {
+	if ctx == nil || result.AuthID == "" || result.Success {
+		return
+	}
+	attempted, _ := ctx.Value(attemptedAuthResultTrackerContextKey{}).(map[string]requestRetryAttempt)
+	if attempted == nil {
+		return
+	}
+	attempted[result.AuthID] = requestRetryAttempt{resultError: cloneError(result.Error)}
+}
+
+func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[string]requestRetryAttempt) cliproxyexecutor.Options {
 	if attempted == nil {
 		return opts
 	}
@@ -1253,7 +1279,9 @@ func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[strin
 	prevCallback, _ := meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string))
 	meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
 		if strings.TrimSpace(authID) != "" {
-			attempted[authID] = struct{}{}
+			if _, ok := attempted[authID]; !ok {
+				attempted[authID] = requestRetryAttempt{}
+			}
 		}
 		if prevCallback != nil {
 			prevCallback(authID)

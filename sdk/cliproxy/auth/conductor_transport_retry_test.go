@@ -318,7 +318,7 @@ func TestHTTP500RetryRoundDoesNotBypassForceCooldown(t *testing.T) {
 		0,
 		-1,
 		1,
-		map[string]struct{}{authID: {}},
+		map[string]requestRetryAttempt{authID: {resultError: forceErr}},
 	)
 	if shouldRetry {
 		t.Fatalf("shouldRetryAfterErrorWithAttempted() = (%v, true), want force cooldown preserved", wait)
@@ -368,7 +368,10 @@ func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
 		0,
 		-1,
 		1,
-		map[string]struct{}{http500AuthID: {}, rateLimitedAuthID: {}},
+		map[string]requestRetryAttempt{
+			http500AuthID:     {resultError: &Error{HTTPStatus: http.StatusInternalServerError}},
+			rateLimitedAuthID: {resultError: rateLimitErr},
+		},
 	)
 	if !shouldRetry || wait != 0 {
 		t.Fatalf("shouldRetryAfterErrorWithAttempted() = (%v, %t), want immediate retry for attempted HTTP 500 credential", wait, shouldRetry)
@@ -409,6 +412,66 @@ func TestHTTP500RetryRoundWithDelegatedBuiltinSchedulerUsesBypassedCandidate(t *
 	}
 	if calls := executor.callCount(); calls != 2 {
 		t.Fatalf("executor calls = %d, want 2", calls)
+	}
+}
+
+func TestHTTP500RetryBypassUsesRequestFailureSnapshot(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	for _, tc := range []struct {
+		name           string
+		requestStatus  int
+		currentStatus  int
+		wantSelectable bool
+	}{
+		{
+			name:           "request 500 survives concurrent 503 overwrite",
+			requestStatus:  http.StatusInternalServerError,
+			currentStatus:  http.StatusServiceUnavailable,
+			wantSelectable: true,
+		},
+		{
+			name:           "request 503 does not inherit concurrent 500 bypass",
+			requestStatus:  http.StatusServiceUnavailable,
+			currentStatus:  http.StatusInternalServerError,
+			wantSelectable: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.RegisterExecutor(&transportThenSuccessExecutor{identifier: "codex"})
+			model := "gpt-6-astra-" + uuid.NewString()
+			authID := "concurrent-retry-snapshot-" + uuid.NewString()
+			registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			manager.MarkResult(context.Background(), Result{
+				AuthID:   authID,
+				Provider: "codex",
+				Model:    model,
+				Success:  false,
+				Error:    &Error{HTTPStatus: tc.currentStatus, Message: "concurrent request failure"},
+			})
+
+			attempted := map[string]requestRetryAttempt{
+				authID: {resultError: &Error{HTTPStatus: tc.requestStatus, Message: "this request failure"}},
+			}
+			selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
+			auth, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, model, cliproxyexecutor.Options{}, nil)
+			if tc.wantSelectable {
+				if errPick != nil || auth == nil || auth.ID != authID {
+					t.Fatalf("pickNextMixed() = (%#v, %v), want request-scoped HTTP 500 bypass", auth, errPick)
+				}
+				return
+			}
+			if errPick == nil {
+				t.Fatalf("pickNextMixed() selected %#v, want current cooldown preserved for request status %d", auth, tc.requestStatus)
+			}
+		})
 	}
 }
 

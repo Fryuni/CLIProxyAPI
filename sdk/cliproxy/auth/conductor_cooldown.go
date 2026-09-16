@@ -755,6 +755,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 	}
+	recordAttemptedAuthResult(ctx, result)
 	modelKey := canonicalModelKey(result.Model)
 
 	var authSnapshot *Auth
@@ -1045,6 +1046,7 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	if result.AuthID == "" {
 		return
 	}
+	recordAttemptedAuthResult(ctx, result)
 
 	var authSnapshot *Auth
 	m.mu.Lock()

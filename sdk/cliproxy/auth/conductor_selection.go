@@ -56,6 +56,16 @@ type credentialPolicyContextKey struct{}
 type requestRetryRoundContextKey struct{}
 type requestRetryAttemptedAuthsContextKey struct{}
 
+type requestRetryAttempt struct {
+	resultError *Error
+}
+
+func (attempt requestRetryAttempt) allowsHTTP500Bypass() bool {
+	return attempt.resultError != nil &&
+		attempt.resultError.Code != ErrorCodeForceCooldown &&
+		statusCodeFromResult(attempt.resultError) == http.StatusInternalServerError
+}
+
 type authSelectionEligibility struct {
 	requiredKind     string
 	credentialPolicy string
@@ -88,27 +98,27 @@ func requestRetryRoundFromContext(ctx context.Context) int {
 	return retryRound
 }
 
-func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]struct{}) context.Context {
+func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]requestRetryAttempt) context.Context {
 	if len(attempted) == 0 {
 		return ctx
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ids := make(map[string]struct{}, len(attempted))
-	for authID := range attempted {
-		ids[authID] = struct{}{}
+	snapshot := make(map[string]requestRetryAttempt, len(attempted))
+	for authID, attempt := range attempted {
+		snapshot[authID] = requestRetryAttempt{resultError: cloneError(attempt.resultError)}
 	}
-	return context.WithValue(ctx, requestRetryAttemptedAuthsContextKey{}, ids)
+	return context.WithValue(ctx, requestRetryAttemptedAuthsContextKey{}, snapshot)
 }
 
-func wasAuthAttemptedForRequestRetry(ctx context.Context, authID string) bool {
+func requestRetryAttemptForAuth(ctx context.Context, authID string) (requestRetryAttempt, bool) {
 	if ctx == nil || authID == "" {
-		return false
+		return requestRetryAttempt{}, false
 	}
-	attempted, _ := ctx.Value(requestRetryAttemptedAuthsContextKey{}).(map[string]struct{})
-	_, ok := attempted[authID]
-	return ok
+	attempted, _ := ctx.Value(requestRetryAttemptedAuthsContextKey{}).(map[string]requestRetryAttempt)
+	attempt, ok := attempted[authID]
+	return attempt, ok
 }
 
 func credentialPolicyFromContext(ctx context.Context) string {
@@ -1207,11 +1217,12 @@ func credentialRetryRoundStateEligible(lastErr *Error, quotaExceeded bool) bool 
 	return isCredentialRetryRoundStatus(statusCodeFromResult(lastErr))
 }
 
-// http500RetryRoundCandidate returns a selection-only clone that ignores an
-// HTTP 500 cooldown. The stored auth remains cooled for other requests.
-func http500RetryRoundCandidate(auth *Auth, model string, now time.Time) *Auth {
-	if auth == nil {
-		return nil
+// http500RetryRoundCandidate returns a selection-only clone that ignores a
+// server-error cooldown when this request recorded HTTP 500 for the auth.
+// The stored auth remains cooled for other requests.
+func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, allowBypass bool) *Auth {
+	if auth == nil || !allowBypass {
+		return auth
 	}
 	clone := auth.Clone()
 	bypassed := false
@@ -1224,7 +1235,8 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time) *Auth {
 			if state.LastError != nil && state.LastError.Code == ErrorCodeForceCooldown {
 				continue
 			}
-			if statusCodeFromResult(state.LastError) != http.StatusInternalServerError {
+			status := statusCodeFromResult(state.LastError)
+			if status < http.StatusInternalServerError || status > 599 {
 				continue
 			}
 			state.Unavailable = false
@@ -1236,7 +1248,8 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time) *Auth {
 		}
 	} else if !clone.Quota.Exceeded &&
 		(clone.LastError == nil || clone.LastError.Code != ErrorCodeForceCooldown) &&
-		statusCodeFromResult(clone.LastError) == http.StatusInternalServerError {
+		statusCodeFromResult(clone.LastError) >= http.StatusInternalServerError &&
+		statusCodeFromResult(clone.LastError) <= 599 {
 		clone.Unavailable = false
 		clone.NextRetryAfter = time.Time{}
 		bypassed = true
@@ -1251,7 +1264,7 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	return m.closestCooldownWaitWithAttempted(providers, model, attempt, eligibility, pinnedAuthID, defaultRequestRetry, 0, nil)
 }
 
-func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model string, attempt int, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int, status int, attempted map[string]struct{}) (time.Duration, bool) {
+func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model string, attempt int, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int, status int, attempted map[string]requestRetryAttempt) (time.Duration, bool) {
 	if m == nil || len(providers) == 0 {
 		return 0, false
 	}
@@ -1304,17 +1317,22 @@ func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model str
 			continue
 		}
 
+		attemptInfo := requestRetryAttempt{}
 		wasAttempted := false
 		if len(attempted) > 0 {
-			_, wasAttempted = attempted[auth.ID]
+			attemptInfo, wasAttempted = attempted[auth.ID]
 		}
-		if wasAttempted && http500RetryRoundCandidate(auth, checkModel, now) != auth {
+		if wasAttempted && http500RetryRoundCandidate(auth, checkModel, now, attemptInfo.allowsHTTP500Bypass()) != auth {
 			// HTTP 500 retries are bounded by request-retry, not the longer
 			// cross-request transient cooldown.
 			return 0, true
 		}
+		attemptStatus := status
+		if attemptInfo.resultError != nil {
+			attemptStatus = statusCodeFromResult(attemptInfo.resultError)
+		}
 		coolingDisabled := m.cooldownDisabledForAuth(auth)
-		if !wasAttempted || coolingDisabled || status != http.StatusTooManyRequests {
+		if !wasAttempted || coolingDisabled || attemptStatus != http.StatusTooManyRequests {
 			if next.IsZero() {
 				return 0, true
 			}
@@ -1417,7 +1435,7 @@ func (m *Manager) shouldRetryAfterErrorWithHomeRetryLimit(ctx context.Context, o
 	return m.shouldRetryAfterErrorWithAttempted(ctx, opts, err, attempt, providers, model, maxWait, homeRetryLimit, defaultRequestRetry, nil)
 }
 
-func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts cliproxyexecutor.Options, err error, attempt int, providers []string, model string, maxWait time.Duration, homeRetryLimit int, defaultRequestRetry int, attempted map[string]struct{}) (time.Duration, bool) {
+func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts cliproxyexecutor.Options, err error, attempt int, providers []string, model string, maxWait time.Duration, homeRetryLimit int, defaultRequestRetry int, attempted map[string]requestRetryAttempt) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
 	}
@@ -2108,12 +2126,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		selectionCandidate := candidate
-		if retryRound > 0 && wasAuthAttemptedForRequestRetry(ctx, candidate.ID) {
+		if attemptInfo, okAttempt := requestRetryAttemptForAuth(ctx, candidate.ID); retryRound > 0 && okAttempt {
 			checkModel := model
 			if strings.TrimSpace(model) != "" {
 				checkModel = m.selectionModelForAuth(candidate, model)
 			}
-			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now)
+			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now, attemptInfo.allowsHTTP500Bypass())
 		}
 		candidates = append(candidates, selectionCandidate)
 	}
