@@ -603,6 +603,61 @@ func TestClosedNetworkHTTP500RetryPreservesConcurrent503Cooldown(t *testing.T) {
 	}
 }
 
+func TestHTTP500RetryPreservesLongerConcurrent503Cooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&transportThenSuccessExecutor{identifier: "codex"})
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "concurrent-long-503-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	longRetryAfter := 30 * time.Minute
+	manager.MarkResult(context.Background(), Result{
+		AuthID:     authID,
+		Provider:   "codex",
+		Model:      model,
+		Success:    false,
+		Error:      &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "concurrent upstream failure"},
+		RetryAfter: &longRetryAfter,
+	})
+	concurrentState, ok := manager.GetByID(authID)
+	if !ok || concurrentState == nil || concurrentState.ModelStates[model] == nil {
+		t.Fatalf("concurrent cooldown missing: %#v", concurrentState)
+	}
+	concurrentDeadline := concurrentState.ModelStates[model].NextRetryAfter
+
+	attempted := map[string]requestRetryAttempt{authID: {}}
+	trackedCtx := withAttemptedAuthResultTracker(context.Background(), attempted)
+	manager.MarkResult(trackedCtx, Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "ordinary upstream failure"},
+	})
+
+	attempt := attempted[authID]
+	if attempt.modelCooldownApplied[model] {
+		t.Fatal("HTTP 500 was recorded as applying a longer concurrent cooldown")
+	}
+	selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
+	selected, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, model, cliproxyexecutor.Options{}, nil)
+	if errPick == nil || selected != nil {
+		t.Fatalf("pickNextMixed() = (%#v, %v), want longer concurrent 503 cooldown preserved", selected, errPick)
+	}
+	updated, ok := manager.GetByID(authID)
+	if !ok || updated == nil || updated.ModelStates[model] == nil || !updated.ModelStates[model].NextRetryAfter.Equal(concurrentDeadline) {
+		t.Fatalf("concurrent deadline changed: %#v", updated)
+	}
+}
+
 func TestExecuteHTTP500RetryExhaustionReturns500AndAppliesCooldown(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
