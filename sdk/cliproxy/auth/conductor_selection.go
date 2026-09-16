@@ -916,26 +916,12 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 	}
 }
 
-func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, bool, error) {
-	if m == nil || m.scheduler == nil {
+func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, candidates []*Auth) (*Auth, bool, error) {
+	if m == nil {
 		return nil, false, nil
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
-	var selected *Auth
-	var errPick error
-	if providerKey == "mixed" {
-		selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
-			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
-		}
-	} else {
-		selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
-			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
-		}
-	}
+	selected, errPick := m.pickViaBuiltinCandidates(ctx, strategy, providerKey, providers, model, opts, candidates)
 	if errPick != nil {
 		return nil, true, errPick
 	}
@@ -943,6 +929,70 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 		return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	return selected, true, nil
+}
+
+func (m *Manager) pickViaBuiltinCandidates(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, candidates []*Auth) (*Auth, error) {
+	if len(candidates) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	selectorCtx := context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true)
+	pick := func(providerKey string, auths []*Auth) (*Auth, error) {
+		switch strategy {
+		case schedulerStrategyFillFirst:
+			return (&FillFirstSelector{}).Pick(selectorCtx, providerKey, model, opts, auths)
+		case schedulerStrategyRoundRobin:
+			return m.pluginBuiltinRoundRobin.Pick(selectorCtx, providerKey, model, opts, auths)
+		default:
+			return nil, &Error{Code: "auth_unavailable", Message: "unsupported built-in scheduler strategy"}
+		}
+	}
+	if provider != "mixed" {
+		return pick(provider, candidates)
+	}
+
+	normalized := normalizeProviderKeys(providers)
+	byProvider := make(map[string][]*Auth, len(normalized))
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		providerKey := executorKeyFromAuth(candidate)
+		if containsProvider(normalized, providerKey) {
+			byProvider[providerKey] = append(byProvider[providerKey], candidate)
+		}
+	}
+	if strategy == schedulerStrategyFillFirst {
+		for _, providerKey := range normalized {
+			if auths := byProvider[providerKey]; len(auths) > 0 {
+				return pick(providerKey, auths)
+			}
+		}
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+
+	total := 0
+	for _, providerKey := range normalized {
+		total += len(byProvider[providerKey])
+	}
+	if total == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	key := strings.Join(normalized, ",") + ":" + canonicalModelKey(model)
+	m.pluginBuiltinMixedMu.Lock()
+	slot := m.pluginBuiltinMixedOffsets[key] % total
+	m.pluginBuiltinMixedOffsets[key] = slot + 1
+	m.pluginBuiltinMixedMu.Unlock()
+	for _, providerKey := range normalized {
+		auths := byProvider[providerKey]
+		if slot < len(auths) {
+			return pick(providerKey, auths)
+		}
+		slot -= len(auths)
+	}
+	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
 func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginScheduler, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
@@ -977,7 +1027,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !okStrategy {
 		return nil, false, nil
 	}
-	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
+	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, candidates)
 }
 
 func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {

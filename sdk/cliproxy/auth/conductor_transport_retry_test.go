@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func windowsCodexTLSHandshakeError() error {
@@ -371,6 +372,43 @@ func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
 	)
 	if !shouldRetry || wait != 0 {
 		t.Fatalf("shouldRetryAfterErrorWithAttempted() = (%v, %t), want immediate retry for attempted HTTP 500 credential", wait, shouldRetry)
+	}
+}
+
+func TestHTTP500RetryRoundWithDelegatedBuiltinSchedulerUsesBypassedCandidate(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, 0, 0)
+	manager.SetPluginScheduler(&fakePluginScheduler{
+		resp:    pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: pluginapi.SchedulerBuiltinRoundRobin},
+		handled: true,
+	})
+	executor := &transportThenSuccessExecutor{
+		identifier: "codex",
+		fail:       &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream failure"},
+	}
+	manager.RegisterExecutor(executor)
+
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "delegated-builtin-http-500-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	resp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v, want delegated built-in retry to succeed", errExecute)
+	}
+	if string(resp.Payload) != "ok" {
+		t.Fatalf("Execute() payload = %q, want %q", resp.Payload, "ok")
+	}
+	if calls := executor.callCount(); calls != 2 {
+		t.Fatalf("executor calls = %d, want 2", calls)
 	}
 }
 
