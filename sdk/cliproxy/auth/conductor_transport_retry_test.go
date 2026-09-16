@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sync"
 	"syscall"
 	"testing"
@@ -100,6 +101,7 @@ func TestManager_MarkResult_PreHTTPTransportFailureDoesNotCooldown(t *testing.T)
 		{name: "typed tls handshake", err: resultErrorFromError(windowsCodexTLSHandshakeError())},
 		{name: "connection reset message", err: &Error{Message: "connection reset"}},
 		{name: "HTTP 500 closed network connection", err: resultErrorFromError(&Error{
+			Code:       "internal_server_error",
 			HTTPStatus: http.StatusInternalServerError,
 			Message:    "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection",
 		})},
@@ -238,6 +240,50 @@ func TestExecutionPathsRetryHTTP500WithoutForwardingFailure(t *testing.T) {
 	}
 }
 
+func TestHTTP500RetryRoundDoesNotBypassUnrelatedCredentialCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.SetRetryConfig(1, 0, 0)
+	executor := &transportThenSuccessExecutor{identifier: "codex", fail: dialRefusedError()}
+	manager.RegisterExecutor(executor)
+
+	model := "gpt-6-astra-" + uuid.NewString()
+	unrelatedAuthID := "a-unrelated-http-500-" + uuid.NewString()
+	requestAuthID := "b-current-request-" + uuid.NewString()
+	for _, authID := range []string{unrelatedAuthID, requestAuthID} {
+		registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+			t.Fatalf("register auth %s: %v", authID, errRegister)
+		}
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   unrelatedAuthID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "unrelated upstream failure"},
+	})
+
+	resp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v, want retry on the credential used by this request", errExecute)
+	}
+	if string(resp.Payload) != "ok" {
+		t.Fatalf("Execute() payload = %q, want %q", resp.Payload, "ok")
+	}
+	if ids := executor.callAuthIDs(); !reflect.DeepEqual(ids, []string{requestAuthID, requestAuthID}) {
+		t.Fatalf("executor auth IDs = %v, want current request auth retried", ids)
+	}
+	updated, ok := manager.GetByID(unrelatedAuthID)
+	if !ok || updated == nil || updated.ModelStates[model] == nil || !updated.ModelStates[model].Unavailable {
+		t.Fatalf("unrelated credential cooldown was bypassed or cleared: %#v", updated)
+	}
+}
+
 func TestExecuteHTTP500RetryExhaustionReturns500AndAppliesCooldown(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
@@ -284,6 +330,7 @@ func TestExecuteClosedNetworkHTTP500ExhaustionDoesNotCooldown(t *testing.T) {
 		identifier: "codex",
 		failures:   2,
 		fail: &Error{
+			Code:       "internal_server_error",
 			HTTPStatus: http.StatusInternalServerError,
 			Message:    "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection",
 		},
@@ -390,21 +437,22 @@ type transportThenSuccessExecutor struct {
 	fail       error
 	failures   int
 
-	mu    sync.Mutex
-	calls int
+	mu      sync.Mutex
+	calls   int
+	authIDs []string
 }
 
 func (e *transportThenSuccessExecutor) Identifier() string { return e.identifier }
 
-func (e *transportThenSuccessExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if e.shouldFail() {
+func (e *transportThenSuccessExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if e.shouldFail(auth) {
 		return cliproxyexecutor.Response{}, e.fail
 	}
 	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
 }
 
-func (e *transportThenSuccessExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	if e.shouldFail() {
+func (e *transportThenSuccessExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if e.shouldFail(auth) {
 		return nil, e.fail
 	}
 	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
@@ -417,8 +465,8 @@ func (*transportThenSuccessExecutor) Refresh(_ context.Context, auth *Auth) (*Au
 	return auth, nil
 }
 
-func (e *transportThenSuccessExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if e.shouldFail() {
+func (e *transportThenSuccessExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if e.shouldFail(auth) {
 		return cliproxyexecutor.Response{}, e.fail
 	}
 	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
@@ -428,23 +476,32 @@ func (*transportThenSuccessExecutor) HttpRequest(context.Context, *Auth, *http.R
 	return nil, nil
 }
 
-func (e *transportThenSuccessExecutor) recordCall() int {
+func (e *transportThenSuccessExecutor) recordCall(auth *Auth) int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.calls++
+	if auth != nil {
+		e.authIDs = append(e.authIDs, auth.ID)
+	}
 	return e.calls
 }
 
-func (e *transportThenSuccessExecutor) shouldFail() bool {
+func (e *transportThenSuccessExecutor) shouldFail(auth *Auth) bool {
 	failures := e.failures
 	if failures <= 0 {
 		failures = 1
 	}
-	return e.recordCall() <= failures
+	return e.recordCall(auth) <= failures
 }
 
 func (e *transportThenSuccessExecutor) callCount() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+func (e *transportThenSuccessExecutor) callAuthIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.authIDs...)
 }

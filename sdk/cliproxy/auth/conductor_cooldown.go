@@ -1591,6 +1591,9 @@ func isTransientTransportResultError(err *Error) bool {
 	if err == nil {
 		return false
 	}
+	if statusCodeFromResult(err) == http.StatusInternalServerError && isClosedNetworkConnectionMessage(err.Message) {
+		return true
+	}
 	if err.Code == transientTransportErrorCode {
 		return true
 	}

@@ -140,11 +140,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 	var lastErr error
 	var preferredUpstreamErr error
+	var retryRoundAttempted map[string]struct{}
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		resp, errExec := m.executeMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -162,6 +164,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
+		retryRoundAttempted = roundAttempted
 	}
 	if lastErr != nil {
 		if ctx != nil {
@@ -199,11 +202,13 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 	var lastErr error
 	var preferredUpstreamErr error
+	var retryRoundAttempted map[string]struct{}
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		resp, errExec := m.executeCountMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -221,6 +226,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
+		retryRoundAttempted = roundAttempted
 	}
 	if lastErr != nil {
 		if ctx != nil {
@@ -252,6 +258,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	var lastErr error
 	var preferredUpstreamErr error
+	var retryRoundAttempted map[string]struct{}
 	homeRetryLimit := -1
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	attempt := 0
@@ -260,7 +267,8 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	for {
 		roundAttempted := make(map[string]struct{})
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
+		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		result, errStream := m.executeStreamMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
 		if errStream == nil {
 			return result, nil
 		}
@@ -292,6 +300,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return nil, errWait
 		}
+		retryRoundAttempted = roundAttempted
 		attempt++
 		retryRoundPending = m.HomeEnabled()
 		retryRoundWaited = false

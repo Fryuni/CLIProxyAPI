@@ -54,6 +54,7 @@ func isBuiltInSelector(selector Selector) bool {
 type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
 type requestRetryRoundContextKey struct{}
+type requestRetryAttemptedAuthsContextKey struct{}
 
 type authSelectionEligibility struct {
 	requiredKind     string
@@ -85,6 +86,29 @@ func requestRetryRoundFromContext(ctx context.Context) int {
 	}
 	retryRound, _ := ctx.Value(requestRetryRoundContextKey{}).(int)
 	return retryRound
+}
+
+func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]struct{}) context.Context {
+	if len(attempted) == 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ids := make(map[string]struct{}, len(attempted))
+	for authID := range attempted {
+		ids[authID] = struct{}{}
+	}
+	return context.WithValue(ctx, requestRetryAttemptedAuthsContextKey{}, ids)
+}
+
+func wasAuthAttemptedForRequestRetry(ctx context.Context, authID string) bool {
+	if ctx == nil || authID == "" {
+		return false
+	}
+	attempted, _ := ctx.Value(requestRetryAttemptedAuthsContextKey{}).(map[string]struct{})
+	_, ok := attempted[authID]
+	return ok
 }
 
 func credentialPolicyFromContext(ctx context.Context) string {
@@ -2029,7 +2053,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		selectionCandidate := candidate
-		if retryRound > 0 {
+		if retryRound > 0 && wasAuthAttemptedForRequestRetry(ctx, candidate.ID) {
 			checkModel := model
 			if strings.TrimSpace(model) != "" {
 				checkModel = m.selectionModelForAuth(candidate, model)
