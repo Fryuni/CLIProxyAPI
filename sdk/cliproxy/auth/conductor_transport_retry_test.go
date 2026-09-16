@@ -13,6 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -322,6 +323,43 @@ func TestHTTP500RetryRoundDoesNotBypassForceCooldown(t *testing.T) {
 	)
 	if shouldRetry {
 		t.Fatalf("shouldRetryAfterErrorWithAttempted() = (%v, true), want force cooldown preserved", wait)
+	}
+}
+
+func TestHTTP500RetryRoundBypassesAuthCooldownWithUnrelatedModelState(t *testing.T) {
+	now := time.Now()
+	modelRetry := now.Add(time.Minute)
+	authRetry := now.Add(2 * time.Minute)
+	auth := &Auth{
+		ID:             "auth-level-http-500",
+		Generation:     7,
+		Unavailable:    true,
+		NextRetryAfter: authRetry,
+		LastError:      &Error{HTTPStatus: http.StatusInternalServerError, Message: "auth-level failure"},
+		ModelStates: map[string]*ModelState{
+			"unrelated-model": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: modelRetry,
+				LastError:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "unrelated rate limit"},
+			},
+		},
+	}
+	attempt := requestRetryAttempt{
+		resultError: &Error{HTTPStatus: http.StatusInternalServerError, Message: "auth-level failure"},
+		generation:  auth.Generation,
+	}
+
+	candidate := http500RetryRoundCandidate(auth, "", now, attempt)
+	if candidate == auth || candidate.Unavailable || !candidate.NextRetryAfter.IsZero() {
+		t.Fatalf("http500RetryRoundCandidate() = %#v, want auth-level cooldown bypassed", candidate)
+	}
+	state := candidate.ModelStates["unrelated-model"]
+	if state == nil || !state.Unavailable || !state.NextRetryAfter.Equal(modelRetry) {
+		t.Fatalf("unrelated model state = %#v, want cooldown preserved", state)
+	}
+	if !auth.Unavailable || !auth.NextRetryAfter.Equal(authRetry) {
+		t.Fatalf("stored auth was mutated: %#v", auth)
 	}
 }
 

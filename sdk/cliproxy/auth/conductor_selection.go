@@ -1246,7 +1246,7 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt
 	}
 	clone := auth.Clone()
 	bypassed := false
-	if len(clone.ModelStates) > 0 {
+	if len(clone.ModelStates) > 0 && len(attempt.modelErrors) > 0 {
 		for stateModel, state := range clone.ModelStates {
 			if state == nil || state.Quota.Exceeded || !attempt.allowsHTTP500Bypass(stateModel) {
 				continue
@@ -1265,7 +1265,9 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt
 		if bypassed {
 			updateAggregatedAvailability(clone, now)
 		}
-	} else if attempt.allowsHTTP500Bypass(model) && !clone.Quota.Exceeded &&
+	}
+	if (len(clone.ModelStates) == 0 || len(attempt.modelErrors) == 0) &&
+		attempt.allowsHTTP500Bypass(model) && !clone.Quota.Exceeded &&
 		(clone.LastError == nil || clone.LastError.Code != ErrorCodeForceCooldown) &&
 		statusCodeFromResult(clone.LastError) >= http.StatusInternalServerError &&
 		statusCodeFromResult(clone.LastError) <= 599 {
