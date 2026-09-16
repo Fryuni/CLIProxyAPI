@@ -53,6 +53,35 @@ func isBuiltInSelector(selector Selector) bool {
 
 type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
+type requestRetryRoundContextKey struct{}
+type requestRetryAttemptedAuthsContextKey struct{}
+
+type requestRetryAttempt struct {
+	resultError           *Error
+	resultCooldownApplied bool
+	modelErrors           map[string]*Error
+	modelCooldownApplied  map[string]bool
+	generation            uint64
+}
+
+func (attempt requestRetryAttempt) errorForModel(model string) *Error {
+	if len(attempt.modelErrors) > 0 {
+		return attempt.modelErrors[canonicalModelKey(model)]
+	}
+	return attempt.resultError
+}
+
+func (attempt requestRetryAttempt) allowsHTTP500Bypass(model string) bool {
+	modelKey := canonicalModelKey(model)
+	cooldownApplied := attempt.resultCooldownApplied
+	if len(attempt.modelErrors) > 0 {
+		cooldownApplied = attempt.modelCooldownApplied[modelKey]
+	}
+	resultErr := attempt.errorForModel(model)
+	return cooldownApplied && resultErr != nil &&
+		resultErr.Code != ErrorCodeForceCooldown &&
+		statusCodeFromResult(resultErr) == http.StatusInternalServerError
+}
 
 type authSelectionEligibility struct {
 	requiredKind     string
@@ -66,6 +95,64 @@ func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Cont
 
 func withCredentialPolicy(ctx context.Context, policy string) context.Context {
 	return context.WithValue(ctx, credentialPolicyContextKey{}, policy)
+}
+
+func withRequestRetryRoundSelection(ctx context.Context, retryRound int) context.Context {
+	if retryRound <= 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, requestRetryRoundContextKey{}, retryRound)
+}
+
+func requestRetryRoundFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	retryRound, _ := ctx.Value(requestRetryRoundContextKey{}).(int)
+	return retryRound
+}
+
+func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]requestRetryAttempt) context.Context {
+	if len(attempted) == 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	snapshot := make(map[string]requestRetryAttempt, len(attempted))
+	for authID, attempt := range attempted {
+		attemptSnapshot := requestRetryAttempt{
+			resultError:           cloneError(attempt.resultError),
+			resultCooldownApplied: attempt.resultCooldownApplied,
+			generation:            attempt.generation,
+		}
+		if len(attempt.modelCooldownApplied) > 0 {
+			attemptSnapshot.modelCooldownApplied = make(map[string]bool, len(attempt.modelCooldownApplied))
+			for model, cooldownApplied := range attempt.modelCooldownApplied {
+				attemptSnapshot.modelCooldownApplied[model] = cooldownApplied
+			}
+		}
+		if len(attempt.modelErrors) > 0 {
+			attemptSnapshot.modelErrors = make(map[string]*Error, len(attempt.modelErrors))
+			for model, resultErr := range attempt.modelErrors {
+				attemptSnapshot.modelErrors[model] = cloneError(resultErr)
+			}
+		}
+		snapshot[authID] = attemptSnapshot
+	}
+	return context.WithValue(ctx, requestRetryAttemptedAuthsContextKey{}, snapshot)
+}
+
+func requestRetryAttemptForAuth(ctx context.Context, authID string) (requestRetryAttempt, bool) {
+	if ctx == nil || authID == "" {
+		return requestRetryAttempt{}, false
+	}
+	attempted, _ := ctx.Value(requestRetryAttemptedAuthsContextKey{}).(map[string]requestRetryAttempt)
+	attempt, ok := attempted[authID]
+	return attempt, ok
 }
 
 func credentialPolicyFromContext(ctx context.Context) string {
@@ -873,26 +960,12 @@ func builtinSchedulerStrategy(delegate string) (schedulerStrategy, bool) {
 	}
 }
 
-func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, bool, error) {
-	if m == nil || m.scheduler == nil {
+func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, candidates []*Auth) (*Auth, bool, error) {
+	if m == nil {
 		return nil, false, nil
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
-	var selected *Auth
-	var errPick error
-	if providerKey == "mixed" {
-		selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
-			selected, _, errPick = m.scheduler.pickMixedWithStrategy(ctx, providers, model, opts, tried, strategy)
-		}
-	} else {
-		selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
-		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
-			m.syncScheduler()
-			selected, errPick = m.scheduler.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
-		}
-	}
+	selected, errPick := m.pickViaBuiltinCandidates(ctx, strategy, providerKey, providers, model, opts, candidates)
 	if errPick != nil {
 		return nil, true, errPick
 	}
@@ -900,6 +973,78 @@ func (m *Manager) pickViaBuiltinScheduler(ctx context.Context, strategy schedule
 		return nil, true, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	return selected, true, nil
+}
+
+func (m *Manager) pickViaBuiltinCandidates(ctx context.Context, strategy schedulerStrategy, provider string, providers []string, model string, opts cliproxyexecutor.Options, candidates []*Auth) (*Auth, error) {
+	if len(candidates) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	selectorCtx := context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true)
+	pick := func(providerKey string, auths []*Auth) (*Auth, error) {
+		switch strategy {
+		case schedulerStrategyFillFirst:
+			return (&FillFirstSelector{}).Pick(selectorCtx, providerKey, model, opts, auths)
+		case schedulerStrategyRoundRobin:
+			return m.pluginBuiltinRoundRobin.Pick(selectorCtx, providerKey, model, opts, auths)
+		default:
+			return nil, &Error{Code: "auth_unavailable", Message: "unsupported built-in scheduler strategy"}
+		}
+	}
+	if provider != "mixed" {
+		return pick(provider, candidates)
+	}
+
+	normalized := normalizeProviderKeys(providers)
+	byProvider := make(map[string][]*Auth, len(normalized))
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		providerKey := executorKeyFromAuth(candidate)
+		if containsProvider(normalized, providerKey) {
+			byProvider[providerKey] = append(byProvider[providerKey], candidate)
+		}
+	}
+	if len(normalized) == 1 {
+		providerKey := normalized[0]
+		auths := byProvider[providerKey]
+		if len(auths) == 0 {
+			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+		}
+		return pick(providerKey, auths)
+	}
+	if strategy == schedulerStrategyFillFirst {
+		for _, providerKey := range normalized {
+			if auths := byProvider[providerKey]; len(auths) > 0 {
+				return pick("mixed:"+providerKey, auths)
+			}
+		}
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+
+	total := 0
+	for _, providerKey := range normalized {
+		total += len(byProvider[providerKey])
+	}
+	if total == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	key := strings.Join(normalized, ",") + ":" + canonicalModelKey(model)
+	m.pluginBuiltinMixedMu.Lock()
+	slot := m.pluginBuiltinMixedOffsets[key] % total
+	m.pluginBuiltinMixedOffsets[key] = slot + 1
+	m.pluginBuiltinMixedMu.Unlock()
+	for _, providerKey := range normalized {
+		auths := byProvider[providerKey]
+		if slot < len(auths) {
+			return pick("mixed:"+providerKey, auths)
+		}
+		slot -= len(auths)
+	}
+	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
 func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginScheduler, provider string, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, candidates []*Auth) (*Auth, bool, error) {
@@ -934,7 +1079,7 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !okStrategy {
 		return nil, false, nil
 	}
-	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, tried)
+	return m.pickViaBuiltinScheduler(ctx, strategy, providerKey, providers, model, opts, candidates)
 }
 
 func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
@@ -1114,11 +1259,55 @@ func credentialRetryRoundStateEligible(lastErr *Error, quotaExceeded bool) bool 
 	return isCredentialRetryRoundStatus(statusCodeFromResult(lastErr))
 }
 
+// http500RetryRoundCandidate returns a selection-only clone that ignores a
+// server-error cooldown when this request recorded HTTP 500 for the auth.
+// The stored auth remains cooled for other requests.
+func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt requestRetryAttempt) *Auth {
+	if auth == nil || attempt.generation == 0 || auth.Generation != attempt.generation {
+		return auth
+	}
+	clone := auth.Clone()
+	bypassed := false
+	if len(clone.ModelStates) > 0 && len(attempt.modelErrors) > 0 {
+		for stateModel, state := range clone.ModelStates {
+			if state == nil || state.Quota.Exceeded || !attempt.allowsHTTP500Bypass(stateModel) {
+				continue
+			}
+			if state.LastError != nil && state.LastError.Code == ErrorCodeForceCooldown {
+				continue
+			}
+			status := statusCodeFromResult(state.LastError)
+			if status < http.StatusInternalServerError || status > 599 {
+				continue
+			}
+			state.Unavailable = false
+			state.NextRetryAfter = time.Time{}
+			bypassed = true
+		}
+		if bypassed {
+			updateAggregatedAvailability(clone, now)
+		}
+	}
+	if (len(clone.ModelStates) == 0 || len(attempt.modelErrors) == 0) &&
+		attempt.allowsHTTP500Bypass(model) && !clone.Quota.Exceeded &&
+		(clone.LastError == nil || clone.LastError.Code != ErrorCodeForceCooldown) &&
+		statusCodeFromResult(clone.LastError) >= http.StatusInternalServerError &&
+		statusCodeFromResult(clone.LastError) <= 599 {
+		clone.Unavailable = false
+		clone.NextRetryAfter = time.Time{}
+		bypassed = true
+	}
+	if !bypassed {
+		return auth
+	}
+	return clone
+}
+
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int) (time.Duration, bool) {
 	return m.closestCooldownWaitWithAttempted(providers, model, attempt, eligibility, pinnedAuthID, defaultRequestRetry, 0, nil)
 }
 
-func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model string, attempt int, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int, status int, attempted map[string]struct{}) (time.Duration, bool) {
+func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model string, attempt int, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int, status int, attempted map[string]requestRetryAttempt) (time.Duration, bool) {
 	if m == nil || len(providers) == 0 {
 		return 0, false
 	}
@@ -1171,12 +1360,22 @@ func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model str
 			continue
 		}
 
+		attemptInfo := requestRetryAttempt{}
 		wasAttempted := false
 		if len(attempted) > 0 {
-			_, wasAttempted = attempted[auth.ID]
+			attemptInfo, wasAttempted = attempted[auth.ID]
+		}
+		if wasAttempted && http500RetryRoundCandidate(auth, checkModel, now, attemptInfo) != auth {
+			// HTTP 500 retries are bounded by request-retry, not the longer
+			// cross-request transient cooldown.
+			return 0, true
+		}
+		attemptStatus := status
+		if attemptInfo.resultError != nil {
+			attemptStatus = statusCodeFromResult(attemptInfo.resultError)
 		}
 		coolingDisabled := m.cooldownDisabledForAuth(auth)
-		if !wasAttempted || coolingDisabled || status != http.StatusTooManyRequests {
+		if !wasAttempted || coolingDisabled || attemptStatus != http.StatusTooManyRequests {
 			if next.IsZero() {
 				return 0, true
 			}
@@ -1279,7 +1478,7 @@ func (m *Manager) shouldRetryAfterErrorWithHomeRetryLimit(ctx context.Context, o
 	return m.shouldRetryAfterErrorWithAttempted(ctx, opts, err, attempt, providers, model, maxWait, homeRetryLimit, defaultRequestRetry, nil)
 }
 
-func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts cliproxyexecutor.Options, err error, attempt int, providers []string, model string, maxWait time.Duration, homeRetryLimit int, defaultRequestRetry int, attempted map[string]struct{}) (time.Duration, bool) {
+func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts cliproxyexecutor.Options, err error, attempt int, providers []string, model string, maxWait time.Duration, homeRetryLimit int, defaultRequestRetry int, attempted map[string]requestRetryAttempt) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
 	}
@@ -1941,6 +2140,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	retryRound := requestRetryRoundFromContext(ctx)
+	now := time.Now()
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled {
 			continue
@@ -1967,7 +2168,15 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
-		candidates = append(candidates, candidate)
+		selectionCandidate := candidate
+		if attemptInfo, okAttempt := requestRetryAttemptForAuth(ctx, candidate.ID); retryRound > 0 && okAttempt {
+			checkModel := model
+			if strings.TrimSpace(model) != "" {
+				checkModel = m.selectionModelForAuth(candidate, model)
+			}
+			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now, attemptInfo)
+		}
+		candidates = append(candidates, selectionCandidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
@@ -2025,7 +2234,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	// Retry rounds need selection-only HTTP 500 cooldown bypasses. The legacy
+	// path can safely apply them to cloned candidates without changing stored state.
+	if requestRetryRoundFromContext(ctx) > 0 || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 

@@ -140,11 +140,14 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 	var lastErr error
 	var preferredUpstreamErr error
+	var retryRoundAttempted map[string]requestRetryAttempt
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		roundAttempted := make(map[string]struct{})
+		roundAttempted := make(map[string]requestRetryAttempt)
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		roundCtx = withAttemptedAuthResultTracker(roundCtx, roundAttempted)
+		resp, errExec := m.executeMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -162,6 +165,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
+		retryRoundAttempted = roundAttempted
 	}
 	if lastErr != nil {
 		if ctx != nil {
@@ -199,11 +203,14 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 
 	var lastErr error
 	var preferredUpstreamErr error
+	var retryRoundAttempted map[string]requestRetryAttempt
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	for attempt := 0; ; attempt++ {
-		roundAttempted := make(map[string]struct{})
+		roundAttempted := make(map[string]requestRetryAttempt)
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		resp, errExec := m.executeCountMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
+		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		roundCtx = withAttemptedAuthResultTracker(roundCtx, roundAttempted)
+		resp, errExec := m.executeCountMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, attempt, defaultRequestRetry)
 		if errExec == nil {
 			return resp, nil
 		}
@@ -221,6 +228,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
+		retryRoundAttempted = roundAttempted
 	}
 	if lastErr != nil {
 		if ctx != nil {
@@ -252,15 +260,18 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 
 	var lastErr error
 	var preferredUpstreamErr error
+	var retryRoundAttempted map[string]requestRetryAttempt
 	homeRetryLimit := -1
 	retryModel := authSelectionModelFromOptions(opts, req.Model)
 	attempt := 0
 	retryRoundPending := false
 	retryRoundWaited := false
 	for {
-		roundAttempted := make(map[string]struct{})
+		roundAttempted := make(map[string]requestRetryAttempt)
 		roundOpts := withAttemptedAuthTracker(opts, roundAttempted)
-		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
+		roundCtx := withRequestRetryAttemptedAuths(ctx, retryRoundAttempted)
+		roundCtx = withAttemptedAuthResultTracker(roundCtx, roundAttempted)
+		result, errStream := m.executeStreamMixedOnce(roundCtx, normalized, req, roundOpts, maxRetryCredentials, &homeRetryLimit, attempt, defaultRequestRetry)
 		if errStream == nil {
 			return result, nil
 		}
@@ -292,6 +303,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if errWait := waitForCooldown(ctx, wait, maxWait); errWait != nil {
 			return nil, errWait
 		}
+		retryRoundAttempted = roundAttempted
 		attempt++
 		retryRoundPending = m.HomeEnabled()
 		retryRoundWaited = false
@@ -472,6 +484,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
+	selectionCtx := withRequestRetryRoundSelection(ctx, retryRound)
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
@@ -495,7 +508,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			pickOpts = withHomeAuthCount(pickOpts, homeAuthCount)
 			pickOpts = withHomeExcludedAuthIDs(pickOpts, tried)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(selectionCtx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
@@ -688,6 +701,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
+	selectionCtx := withRequestRetryRoundSelection(ctx, retryRound)
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
@@ -711,7 +725,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			pickOpts = withHomeAuthCount(pickOpts, homeAuthCount)
 			pickOpts = withHomeExcludedAuthIDs(pickOpts, tried)
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(selectionCtx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, preferredExecutionAttemptError(lastErr, upstreamErr)
@@ -906,6 +920,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	executionModel, restoreExecutionModel := executionModelForAuthSelection(opts, req.Model)
 	opts = ensureRequestedModelMetadata(opts, routeModel)
 	homeMode := m.HomeEnabled()
+	selectionCtx := withRequestRetryRoundSelection(ctx, retryRound)
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
@@ -953,7 +968,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				provider = selection.Provider
 			}
 		} else {
-			auth, executor, provider, errPick = m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
+			auth, executor, provider, errPick = m.pickNextMixed(selectionCtx, providers, routeModel, pickOpts, tried)
 		}
 		if errPick != nil {
 			preferredErr := preferredExecutionAttemptError(lastErr, upstreamErr)
@@ -1233,7 +1248,44 @@ func shouldExcludeHomeAuthAfterStreamError(ctx context.Context, _ *Auth, err err
 	return true
 }
 
-func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[string]struct{}) cliproxyexecutor.Options {
+type attemptedAuthResultTrackerContextKey struct{}
+
+func withAttemptedAuthResultTracker(ctx context.Context, attempted map[string]requestRetryAttempt) context.Context {
+	if attempted == nil {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, attemptedAuthResultTrackerContextKey{}, attempted)
+}
+
+func recordAttemptedAuthResult(ctx context.Context, result Result, generation uint64, cooldownApplied bool) {
+	if ctx == nil || result.AuthID == "" || result.Success {
+		return
+	}
+	attempted, _ := ctx.Value(attemptedAuthResultTrackerContextKey{}).(map[string]requestRetryAttempt)
+	if attempted == nil {
+		return
+	}
+	attempt := attempted[result.AuthID]
+	attempt.resultError = cloneError(result.Error)
+	attempt.resultCooldownApplied = cooldownApplied
+	attempt.generation = generation
+	if model := canonicalModelKey(result.Model); model != "" {
+		if attempt.modelErrors == nil {
+			attempt.modelErrors = make(map[string]*Error)
+		}
+		attempt.modelErrors[model] = cloneError(result.Error)
+		if attempt.modelCooldownApplied == nil {
+			attempt.modelCooldownApplied = make(map[string]bool)
+		}
+		attempt.modelCooldownApplied[model] = cooldownApplied
+	}
+	attempted[result.AuthID] = attempt
+}
+
+func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[string]requestRetryAttempt) cliproxyexecutor.Options {
 	if attempted == nil {
 		return opts
 	}
@@ -1241,7 +1293,9 @@ func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[strin
 	prevCallback, _ := meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string))
 	meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey] = func(authID string) {
 		if strings.TrimSpace(authID) != "" {
-			attempted[authID] = struct{}{}
+			if _, ok := attempted[authID]; !ok {
+				attempted[authID] = requestRetryAttempt{}
+			}
 		}
 		if prevCallback != nil {
 			prevCallback(authID)
