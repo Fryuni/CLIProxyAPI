@@ -1260,7 +1260,7 @@ func withAttemptedAuthResultTracker(ctx context.Context, attempted map[string]re
 	return context.WithValue(ctx, attemptedAuthResultTrackerContextKey{}, attempted)
 }
 
-func recordAttemptedAuthResult(ctx context.Context, result Result) {
+func recordAttemptedAuthResult(ctx context.Context, result Result, generation uint64) {
 	if ctx == nil || result.AuthID == "" || result.Success {
 		return
 	}
@@ -1270,6 +1270,7 @@ func recordAttemptedAuthResult(ctx context.Context, result Result) {
 	}
 	attempt := attempted[result.AuthID]
 	attempt.resultError = cloneError(result.Error)
+	attempt.generation = generation
 	if model := canonicalModelKey(result.Model); model != "" {
 		if attempt.modelErrors == nil {
 			attempt.modelErrors = make(map[string]*Error)

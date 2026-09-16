@@ -357,6 +357,14 @@ func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
 		Success:  false,
 		Error:    rateLimitErr,
 	})
+	http500Auth, ok := manager.GetByID(http500AuthID)
+	if !ok || http500Auth == nil {
+		t.Fatalf("HTTP 500 auth %q missing", http500AuthID)
+	}
+	rateLimitedAuth, ok := manager.GetByID(rateLimitedAuthID)
+	if !ok || rateLimitedAuth == nil {
+		t.Fatalf("rate-limited auth %q missing", rateLimitedAuthID)
+	}
 
 	wait, shouldRetry := manager.shouldRetryAfterErrorWithAttempted(
 		context.Background(),
@@ -369,8 +377,8 @@ func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
 		-1,
 		1,
 		map[string]requestRetryAttempt{
-			http500AuthID:     {resultError: &Error{HTTPStatus: http.StatusInternalServerError}},
-			rateLimitedAuthID: {resultError: rateLimitErr},
+			http500AuthID:     {resultError: &Error{HTTPStatus: http.StatusInternalServerError}, generation: http500Auth.Generation},
+			rateLimitedAuthID: {resultError: rateLimitErr, generation: rateLimitedAuth.Generation},
 		},
 	)
 	if !shouldRetry || wait != 0 {
@@ -415,7 +423,7 @@ func TestHTTP500RetryRoundWithDelegatedBuiltinSchedulerUsesBypassedCandidate(t *
 	}
 }
 
-func TestHTTP500RetryBypassUsesRequestFailureSnapshot(t *testing.T) {
+func TestHTTP500RetryBypassRequiresRecordedGeneration(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
@@ -424,18 +432,27 @@ func TestHTTP500RetryBypassUsesRequestFailureSnapshot(t *testing.T) {
 		name           string
 		requestStatus  int
 		currentStatus  int
+		overwrite      bool
 		wantSelectable bool
 	}{
 		{
-			name:           "request 500 survives concurrent 503 overwrite",
+			name:           "matching request 500 generation is bypassed",
+			requestStatus:  http.StatusInternalServerError,
+			currentStatus:  http.StatusInternalServerError,
+			wantSelectable: true,
+		},
+		{
+			name:           "request 500 does not clear concurrent 503 generation",
 			requestStatus:  http.StatusInternalServerError,
 			currentStatus:  http.StatusServiceUnavailable,
-			wantSelectable: true,
+			overwrite:      true,
+			wantSelectable: false,
 		},
 		{
 			name:           "request 503 does not inherit concurrent 500 bypass",
 			requestStatus:  http.StatusServiceUnavailable,
 			currentStatus:  http.StatusInternalServerError,
+			overwrite:      true,
 			wantSelectable: false,
 		},
 	} {
@@ -454,11 +471,28 @@ func TestHTTP500RetryBypassUsesRequestFailureSnapshot(t *testing.T) {
 				Provider: "codex",
 				Model:    model,
 				Success:  false,
-				Error:    &Error{HTTPStatus: tc.currentStatus, Message: "concurrent request failure"},
+				Error:    &Error{HTTPStatus: tc.requestStatus, Message: "this request failure"},
 			})
+			requestAuth, ok := manager.GetByID(authID)
+			if !ok || requestAuth == nil {
+				t.Fatalf("request auth %q missing", authID)
+			}
+			if tc.overwrite {
+				manager.MarkResult(context.Background(), Result{
+					AuthID:   authID,
+					Provider: "codex",
+					Model:    model,
+					Success:  false,
+					Error:    &Error{HTTPStatus: tc.currentStatus, Message: "concurrent request failure"},
+				})
+			}
 
 			attempted := map[string]requestRetryAttempt{
-				authID: {resultError: &Error{HTTPStatus: tc.requestStatus, Message: "this request failure"}},
+				authID: {
+					resultError: &Error{HTTPStatus: tc.requestStatus, Message: "this request failure"},
+					modelErrors: map[string]*Error{model: {HTTPStatus: tc.requestStatus, Message: "this request failure"}},
+					generation:  requestAuth.Generation,
+				},
 			}
 			selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
 			auth, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, model, cliproxyexecutor.Options{}, nil)

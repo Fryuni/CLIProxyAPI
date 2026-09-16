@@ -59,6 +59,7 @@ type requestRetryAttemptedAuthsContextKey struct{}
 type requestRetryAttempt struct {
 	resultError *Error
 	modelErrors map[string]*Error
+	generation  uint64
 }
 
 func (attempt requestRetryAttempt) errorForModel(model string) *Error {
@@ -116,7 +117,10 @@ func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]re
 	}
 	snapshot := make(map[string]requestRetryAttempt, len(attempted))
 	for authID, attempt := range attempted {
-		attemptSnapshot := requestRetryAttempt{resultError: cloneError(attempt.resultError)}
+		attemptSnapshot := requestRetryAttempt{
+			resultError: cloneError(attempt.resultError),
+			generation:  attempt.generation,
+		}
 		if len(attempt.modelErrors) > 0 {
 			attemptSnapshot.modelErrors = make(map[string]*Error, len(attempt.modelErrors))
 			for model, resultErr := range attempt.modelErrors {
@@ -1237,7 +1241,7 @@ func credentialRetryRoundStateEligible(lastErr *Error, quotaExceeded bool) bool 
 // server-error cooldown when this request recorded HTTP 500 for the auth.
 // The stored auth remains cooled for other requests.
 func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt requestRetryAttempt) *Auth {
-	if auth == nil {
+	if auth == nil || attempt.generation == 0 || auth.Generation != attempt.generation {
 		return auth
 	}
 	clone := auth.Clone()
