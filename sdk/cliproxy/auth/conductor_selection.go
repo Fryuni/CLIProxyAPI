@@ -993,7 +993,7 @@ func (m *Manager) pickViaBuiltinCandidates(ctx context.Context, strategy schedul
 	if strategy == schedulerStrategyFillFirst {
 		for _, providerKey := range normalized {
 			if auths := byProvider[providerKey]; len(auths) > 0 {
-				return pick(providerKey, auths)
+				return pick("mixed:"+providerKey, auths)
 			}
 		}
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1014,7 +1014,7 @@ func (m *Manager) pickViaBuiltinCandidates(ctx context.Context, strategy schedul
 	for _, providerKey := range normalized {
 		auths := byProvider[providerKey]
 		if slot < len(auths) {
-			return pick(providerKey, auths)
+			return pick("mixed:"+providerKey, auths)
 		}
 		slot -= len(auths)
 	}
