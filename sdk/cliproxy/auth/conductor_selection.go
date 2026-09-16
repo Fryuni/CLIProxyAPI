@@ -1171,6 +1171,9 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time) *Auth {
 			if state == nil || canonicalModelKey(stateModel) != modelKey || state.Quota.Exceeded {
 				continue
 			}
+			if state.LastError != nil && state.LastError.Code == ErrorCodeForceCooldown {
+				continue
+			}
 			if statusCodeFromResult(state.LastError) != http.StatusInternalServerError {
 				continue
 			}
@@ -1181,7 +1184,9 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time) *Auth {
 		if bypassed {
 			updateAggregatedAvailability(clone, now)
 		}
-	} else if !clone.Quota.Exceeded && statusCodeFromResult(clone.LastError) == http.StatusInternalServerError {
+	} else if !clone.Quota.Exceeded &&
+		(clone.LastError == nil || clone.LastError.Code != ErrorCodeForceCooldown) &&
+		statusCodeFromResult(clone.LastError) == http.StatusInternalServerError {
 		clone.Unavailable = false
 		clone.NextRetryAfter = time.Time{}
 		bypassed = true
@@ -1253,7 +1258,7 @@ func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model str
 		if len(attempted) > 0 {
 			_, wasAttempted = attempted[auth.ID]
 		}
-		if wasAttempted && status == http.StatusInternalServerError && http500RetryRoundCandidate(auth, checkModel, now) != auth {
+		if wasAttempted && http500RetryRoundCandidate(auth, checkModel, now) != auth {
 			// HTTP 500 retries are bounded by request-retry, not the longer
 			// cross-request transient cooldown.
 			return 0, true

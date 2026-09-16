@@ -284,6 +284,96 @@ func TestHTTP500RetryRoundDoesNotBypassUnrelatedCredentialCooldown(t *testing.T)
 	}
 }
 
+func TestHTTP500RetryRoundDoesNotBypassForceCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, 0, 0)
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "force-cooldown-http-500-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	forceErr := &Error{Code: ErrorCodeForceCooldown, HTTPStatus: http.StatusInternalServerError, Message: "policy requires cooldown"}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    forceErr,
+	})
+
+	wait, shouldRetry := manager.shouldRetryAfterErrorWithAttempted(
+		context.Background(),
+		cliproxyexecutor.Options{},
+		forceErr,
+		0,
+		[]string{"codex"},
+		model,
+		0,
+		-1,
+		1,
+		map[string]struct{}{authID: {}},
+	)
+	if shouldRetry {
+		t.Fatalf("shouldRetryAfterErrorWithAttempted() = (%v, true), want force cooldown preserved", wait)
+	}
+}
+
+func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, 0, 0)
+	model := "gpt-6-astra-" + uuid.NewString()
+	http500AuthID := "a-http-500-" + uuid.NewString()
+	rateLimitedAuthID := "b-rate-limited-" + uuid.NewString()
+	for _, authID := range []string{http500AuthID, rateLimitedAuthID} {
+		registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+			t.Fatalf("register auth %s: %v", authID, errRegister)
+		}
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   http500AuthID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream failure"},
+	})
+	rateLimitErr := &Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   rateLimitedAuthID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    rateLimitErr,
+	})
+
+	wait, shouldRetry := manager.shouldRetryAfterErrorWithAttempted(
+		context.Background(),
+		cliproxyexecutor.Options{},
+		rateLimitErr,
+		0,
+		[]string{"codex"},
+		model,
+		0,
+		-1,
+		1,
+		map[string]struct{}{http500AuthID: {}, rateLimitedAuthID: {}},
+	)
+	if !shouldRetry || wait != 0 {
+		t.Fatalf("shouldRetryAfterErrorWithAttempted() = (%v, %t), want immediate retry for attempted HTTP 500 credential", wait, shouldRetry)
+	}
+}
+
 func TestExecuteHTTP500RetryExhaustionReturns500AndAppliesCooldown(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
