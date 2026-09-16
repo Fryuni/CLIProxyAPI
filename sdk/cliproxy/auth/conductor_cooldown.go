@@ -1558,9 +1558,10 @@ func isTransientTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// HTTP-status failures stay on the credential/status retry path.
-	if statusCodeFromError(err) != 0 {
-		return false
+	// A closed local socket can be wrapped by an upstream gateway as HTTP 500.
+	// It remains a transport-path failure and must not cool the credential.
+	if status := statusCodeFromError(err); status != 0 {
+		return status == http.StatusInternalServerError && isClosedNetworkConnectionMessage(err.Error())
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
@@ -1619,7 +1620,8 @@ func isTransientTransportMessage(message string) bool {
 		return false
 	}
 	switch {
-	case strings.Contains(lower, "tls: tls handshake"),
+	case isClosedNetworkConnectionMessage(lower),
+		strings.Contains(lower, "tls: tls handshake"),
 		strings.Contains(lower, "tls handshake timeout"),
 		strings.Contains(lower, "wsarecv"),
 		strings.Contains(lower, "wsasend"),
@@ -1639,6 +1641,10 @@ func isTransientTransportMessage(message string) bool {
 	default:
 		return false
 	}
+}
+
+func isClosedNetworkConnectionMessage(message string) bool {
+	return strings.Contains(strings.ToLower(message), "use of closed network connection")
 }
 
 func isUnauthorizedError(err error) bool {

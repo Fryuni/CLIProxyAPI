@@ -53,6 +53,7 @@ func isBuiltInSelector(selector Selector) bool {
 
 type requiredAuthKindContextKey struct{}
 type credentialPolicyContextKey struct{}
+type requestRetryRoundContextKey struct{}
 
 type authSelectionEligibility struct {
 	requiredKind     string
@@ -66,6 +67,24 @@ func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Cont
 
 func withCredentialPolicy(ctx context.Context, policy string) context.Context {
 	return context.WithValue(ctx, credentialPolicyContextKey{}, policy)
+}
+
+func withRequestRetryRoundSelection(ctx context.Context, retryRound int) context.Context {
+	if retryRound <= 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, requestRetryRoundContextKey{}, retryRound)
+}
+
+func requestRetryRoundFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	retryRound, _ := ctx.Value(requestRetryRoundContextKey{}).(int)
+	return retryRound
 }
 
 func credentialPolicyFromContext(ctx context.Context) string {
@@ -1114,6 +1133,41 @@ func credentialRetryRoundStateEligible(lastErr *Error, quotaExceeded bool) bool 
 	return isCredentialRetryRoundStatus(statusCodeFromResult(lastErr))
 }
 
+// http500RetryRoundCandidate returns a selection-only clone that ignores an
+// HTTP 500 cooldown. The stored auth remains cooled for other requests.
+func http500RetryRoundCandidate(auth *Auth, model string, now time.Time) *Auth {
+	if auth == nil {
+		return nil
+	}
+	clone := auth.Clone()
+	bypassed := false
+	modelKey := canonicalModelKey(model)
+	if modelKey != "" && len(clone.ModelStates) > 0 {
+		for stateModel, state := range clone.ModelStates {
+			if state == nil || canonicalModelKey(stateModel) != modelKey || state.Quota.Exceeded {
+				continue
+			}
+			if statusCodeFromResult(state.LastError) != http.StatusInternalServerError {
+				continue
+			}
+			state.Unavailable = false
+			state.NextRetryAfter = time.Time{}
+			bypassed = true
+		}
+		if bypassed {
+			updateAggregatedAvailability(clone, now)
+		}
+	} else if !clone.Quota.Exceeded && statusCodeFromResult(clone.LastError) == http.StatusInternalServerError {
+		clone.Unavailable = false
+		clone.NextRetryAfter = time.Time{}
+		bypassed = true
+	}
+	if !bypassed {
+		return auth
+	}
+	return clone
+}
+
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int, eligibility authSelectionEligibility, pinnedAuthID string, defaultRequestRetry int) (time.Duration, bool) {
 	return m.closestCooldownWaitWithAttempted(providers, model, attempt, eligibility, pinnedAuthID, defaultRequestRetry, 0, nil)
 }
@@ -1174,6 +1228,11 @@ func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model str
 		wasAttempted := false
 		if len(attempted) > 0 {
 			_, wasAttempted = attempted[auth.ID]
+		}
+		if wasAttempted && status == http.StatusInternalServerError && http500RetryRoundCandidate(auth, checkModel, now) != auth {
+			// HTTP 500 retries are bounded by request-retry, not the longer
+			// cross-request transient cooldown.
+			return 0, true
 		}
 		coolingDisabled := m.cooldownDisabledForAuth(auth)
 		if !wasAttempted || coolingDisabled || status != http.StatusTooManyRequests {
@@ -1941,6 +2000,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	retryRound := requestRetryRoundFromContext(ctx)
+	now := time.Now()
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled {
 			continue
@@ -1967,7 +2028,15 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
-		candidates = append(candidates, candidate)
+		selectionCandidate := candidate
+		if retryRound > 0 {
+			checkModel := model
+			if strings.TrimSpace(model) != "" {
+				checkModel = m.selectionModelForAuth(candidate, model)
+			}
+			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now)
+		}
+		candidates = append(candidates, selectionCandidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
@@ -2025,7 +2094,9 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = "mixed"
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
 
-	if m.hasPluginScheduler() || !m.useSchedulerFastPath() {
+	// Retry rounds need selection-only HTTP 500 cooldown bypasses. The legacy
+	// path can safely apply them to cloned candidates without changing stored state.
+	if requestRetryRoundFromContext(ctx) > 0 || m.hasPluginScheduler() || !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 

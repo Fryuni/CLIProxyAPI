@@ -99,6 +99,10 @@ func TestManager_MarkResult_PreHTTPTransportFailureDoesNotCooldown(t *testing.T)
 	}{
 		{name: "typed tls handshake", err: resultErrorFromError(windowsCodexTLSHandshakeError())},
 		{name: "connection reset message", err: &Error{Message: "connection reset"}},
+		{name: "HTTP 500 closed network connection", err: resultErrorFromError(&Error{
+			HTTPStatus: http.StatusInternalServerError,
+			Message:    "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection",
+		})},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -151,6 +155,169 @@ func TestExecuteRetriesPreHTTPTransportFailureWithoutCooling(t *testing.T) {
 		t.Fatalf("executor calls = %d, want 2", calls)
 	}
 	assertNoCooldown(t, manager, authID, model)
+}
+
+func TestExecutionPathsRetryHTTP500WithoutForwardingFailure(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	paths := []struct {
+		name   string
+		invoke func(*Manager, cliproxyexecutor.Request) error
+	}{
+		{
+			name: "non-stream",
+			invoke: func(manager *Manager, req cliproxyexecutor.Request) error {
+				resp, errExecute := manager.Execute(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{})
+				if errExecute == nil && string(resp.Payload) != "ok" {
+					return fmt.Errorf("Execute() payload = %q, want %q", resp.Payload, "ok")
+				}
+				return errExecute
+			},
+		},
+		{
+			name: "count-tokens",
+			invoke: func(manager *Manager, req cliproxyexecutor.Request) error {
+				resp, errExecute := manager.ExecuteCount(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{})
+				if errExecute == nil && string(resp.Payload) != "ok" {
+					return fmt.Errorf("ExecuteCount() payload = %q, want %q", resp.Payload, "ok")
+				}
+				return errExecute
+			},
+		},
+		{
+			name: "stream-bootstrap",
+			invoke: func(manager *Manager, req cliproxyexecutor.Request) error {
+				result, errExecute := manager.ExecuteStream(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{Stream: true})
+				if errExecute != nil {
+					return errExecute
+				}
+				if result == nil || result.Chunks == nil {
+					return errors.New("ExecuteStream() returned no stream")
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						return chunk.Err
+					}
+				}
+				return nil
+			},
+		},
+	}
+
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetRetryConfig(1, 0, 0)
+			executor := &transportThenSuccessExecutor{
+				identifier: "codex",
+				fail: &Error{
+					HTTPStatus: http.StatusInternalServerError,
+					Message:    "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection",
+				},
+			}
+			manager.RegisterExecutor(executor)
+
+			model := "gpt-6-astra-" + uuid.NewString()
+			authID := "codex-http-500-" + uuid.NewString()
+			registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+
+			if errExecute := path.invoke(manager, cliproxyexecutor.Request{Model: model}); errExecute != nil {
+				t.Fatalf("execution error = %v, want success after HTTP 500 retry", errExecute)
+			}
+			if calls := executor.callCount(); calls != 2 {
+				t.Fatalf("executor calls = %d, want 2", calls)
+			}
+			assertNoCooldown(t, manager, authID, model)
+		})
+	}
+}
+
+func TestExecuteHTTP500RetryExhaustionReturns500AndAppliesCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, 0, 0)
+	executor := &transportThenSuccessExecutor{
+		identifier: "codex",
+		failures:   2,
+		fail:       &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream failure"},
+	}
+	manager.RegisterExecutor(executor)
+
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "codex-http-500-exhausted-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	_, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if status := statusCodeFromError(errExecute); status != http.StatusInternalServerError {
+		t.Fatalf("Execute() status = %d, want 500; err=%v", status, errExecute)
+	}
+	if calls := executor.callCount(); calls != 2 {
+		t.Fatalf("executor calls = %d, want 2", calls)
+	}
+	updated, ok := manager.GetByID(authID)
+	if !ok || updated == nil || updated.ModelStates[model] == nil || !updated.ModelStates[model].Unavailable {
+		t.Fatalf("final HTTP 500 did not apply cooldown: %#v", updated)
+	}
+}
+
+func TestExecuteClosedNetworkHTTP500ExhaustionDoesNotCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(1, 0, 0)
+	executor := &transportThenSuccessExecutor{
+		identifier: "codex",
+		failures:   2,
+		fail: &Error{
+			HTTPStatus: http.StatusInternalServerError,
+			Message:    "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection",
+		},
+	}
+	manager.RegisterExecutor(executor)
+
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "codex-http-500-closed-network-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	req := cliproxyexecutor.Request{Model: model}
+	_, errExecute := manager.Execute(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{})
+	if status := statusCodeFromError(errExecute); status != http.StatusInternalServerError {
+		t.Fatalf("first Execute() status = %d, want 500; err=%v", status, errExecute)
+	}
+	if calls := executor.callCount(); calls != 2 {
+		t.Fatalf("executor calls after first request = %d, want 2", calls)
+	}
+	assertNoCooldown(t, manager, authID, model)
+
+	resp, errExecute := manager.Execute(context.Background(), []string{"codex"}, req, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("second Execute() error = %v, want fresh connection attempt to succeed", errExecute)
+	}
+	if string(resp.Payload) != "ok" {
+		t.Fatalf("second Execute() payload = %q, want %q", resp.Payload, "ok")
+	}
+	if calls := executor.callCount(); calls != 3 {
+		t.Fatalf("executor calls after second request = %d, want 3", calls)
+	}
 }
 
 func TestExecuteDoesNotPoisonCredentialOnPreHTTPTransportFailure(t *testing.T) {
@@ -221,6 +388,7 @@ func TestHomeExecuteRetriesPreHTTPTransportFailure(t *testing.T) {
 type transportThenSuccessExecutor struct {
 	identifier string
 	fail       error
+	failures   int
 
 	mu    sync.Mutex
 	calls int
@@ -229,17 +397,18 @@ type transportThenSuccessExecutor struct {
 func (e *transportThenSuccessExecutor) Identifier() string { return e.identifier }
 
 func (e *transportThenSuccessExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if e.recordCall() == 1 {
+	if e.shouldFail() {
 		return cliproxyexecutor.Response{}, e.fail
 	}
 	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
 }
 
 func (e *transportThenSuccessExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	if e.recordCall() == 1 {
+	if e.shouldFail() {
 		return nil, e.fail
 	}
-	chunks := make(chan cliproxyexecutor.StreamChunk)
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("ok")}
 	close(chunks)
 	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
 }
@@ -249,7 +418,7 @@ func (*transportThenSuccessExecutor) Refresh(_ context.Context, auth *Auth) (*Au
 }
 
 func (e *transportThenSuccessExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if e.recordCall() == 1 {
+	if e.shouldFail() {
 		return cliproxyexecutor.Response{}, e.fail
 	}
 	return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
@@ -264,6 +433,14 @@ func (e *transportThenSuccessExecutor) recordCall() int {
 	defer e.mu.Unlock()
 	e.calls++
 	return e.calls
+}
+
+func (e *transportThenSuccessExecutor) shouldFail() bool {
+	failures := e.failures
+	if failures <= 0 {
+		failures = 1
+	}
+	return e.recordCall() <= failures
 }
 
 func (e *transportThenSuccessExecutor) callCount() int {
