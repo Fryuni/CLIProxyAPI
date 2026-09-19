@@ -7,7 +7,7 @@ import (
 )
 
 func TestStreamResponseModelObserver_ChunkSplit(t *testing.T) {
-	// JSON split across network chunk boundaries (拆包)
+	// JSON split across network chunk boundaries (split chunks)
 	reporter := newMultiProviderTestReporter(context.Background(), "openai-compat", "dall-e-3", nil)
 	observer := NewStreamResponseModelObserver(reporter)
 
@@ -28,7 +28,7 @@ func TestStreamResponseModelObserver_ChunkSplit(t *testing.T) {
 }
 
 func TestStreamResponseModelObserver_MultiEventChunk(t *testing.T) {
-	// Multiple SSE events packed into a single chunk (合包)
+	// Multiple SSE events packed into a single chunk (coalesced chunks)
 	reporter := newMultiProviderTestReporter(context.Background(), "openai-compat", "dall-e-3", nil)
 	observer := NewStreamResponseModelObserver(reporter)
 

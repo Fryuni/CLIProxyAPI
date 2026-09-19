@@ -125,6 +125,48 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DefersMessageUntil
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReusedCallIDAcrossTurns(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"one\"}"},
+			{"type":"message","role":"user","content":"first reminder"},
+			{"type":"function_call_output","call_id":"call_reused","output":"first result"},
+			{"type":"message","role":"assistant","content":"first done"},
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"two\"}"},
+			{"type":"message","role":"user","content":"second reminder"},
+			{"type":"function_call_output","call_id":"call_reused","output":"second result"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5-codex", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := []string{"first result", "second result"}
+	paired := 0
+	contents := make(map[string]bool)
+	for i, message := range messages {
+		contents[message.Get("content").String()] = true
+		if !message.Get("tool_calls").Exists() {
+			continue
+		}
+		if paired >= len(results) || i+1 >= len(messages) {
+			t.Fatalf("unexpected tool-call group: %s", out)
+		}
+		result := messages[i+1]
+		if result.Get("role").String() != "tool" || result.Get("tool_call_id").String() != message.Get("tool_calls.0.id").String() || result.Get("content").String() != results[paired] {
+			t.Fatalf("tool result does not immediately follow its owning turn: %s", out)
+		}
+		paired++
+	}
+	if paired != len(results) {
+		t.Fatalf("paired groups = %d, want %d; output=%s", paired, len(results), out)
+	}
+	for _, content := range []string{"first reminder", "second reminder", "first done"} {
+		if !contents[content] {
+			t.Fatalf("lost message content %q: %s", content, out)
+		}
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringifiedToolOutputImages(t *testing.T) {
 	tests := []struct {
 		name         string

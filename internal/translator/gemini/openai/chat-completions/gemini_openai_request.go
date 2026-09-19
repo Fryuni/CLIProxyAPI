@@ -240,10 +240,12 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(tc.Get("function.arguments").String()))
 						part, _ = sjson.SetBytes(part, "thoughtSignature", openAIToolCallGeminiThoughtSignature(tc))
 						partItems = append(partItems, part)
-						toolCalls = append(toolCalls, assistantToolCall{
-							id:   functionID,
-							name: functionName,
-						})
+						if functionID != "" {
+							toolCalls = append(toolCalls, assistantToolCall{
+								id:   functionID,
+								name: functionName,
+							})
+						}
 					}
 					if len(partItems) > 0 {
 						contentItems = append(contentItems, geminiContentNode("model", partItems))

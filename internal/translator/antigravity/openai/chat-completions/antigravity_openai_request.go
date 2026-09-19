@@ -262,10 +262,12 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						}
 						part, _ = sjson.SetBytes(part, "thoughtSignature", antigravityFunctionThoughtSignature)
 						partItems = append(partItems, part)
-						toolCalls = append(toolCalls, assistantToolCall{
-							id:   functionID,
-							name: functionName,
-						})
+						if functionID != "" {
+							toolCalls = append(toolCalls, assistantToolCall{
+								id:   functionID,
+								name: functionName,
+							})
+						}
 					}
 					if len(partItems) > 0 {
 						contentItems = append(contentItems, antigravityOpenAIContent("model", partItems))

@@ -9,11 +9,11 @@ import (
 
 func TestAlignOpenAIToolCallMessages(t *testing.T) {
 	t.Run("empty or single message unchanged", func(t *testing.T) {
-		if got := AlignOpenAIToolCallMessages(nil); got != nil {
+		if got := AlignOpenAIToolCallMessages(nil, nil); got != nil {
 			t.Fatalf("expected nil, got %v", got)
 		}
 		single := [][]byte{[]byte(`{"role":"user","content":"hi"}`)}
-		if got := AlignOpenAIToolCallMessages(single); !reflect.DeepEqual(got, single) {
+		if got := AlignOpenAIToolCallMessages(single, nil); !reflect.DeepEqual(got, single) {
 			t.Fatalf("expected single message unchanged")
 		}
 	})
@@ -25,7 +25,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(`{"role":"tool","tool_call_id":"call_1","content":"res1"}`),
 			[]byte(`{"role":"assistant","content":"done"}`),
 		}
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		if len(got) != len(messages) {
 			t.Fatalf("expected %d messages, got %d", len(messages), len(got))
 		}
@@ -47,7 +47,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(`{"role":"user","content":"final prompt"}`),
 		}
 
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		if len(got) != 7 {
 			t.Fatalf("expected 7 messages, got %d", len(got))
 		}
@@ -90,7 +90,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(`{"role":"user","content":"middle"}`),
 			[]byte(`{"role":"tool","tool_call_id":"call_1","content":"res1"}`),
 		}
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		for i := range messages {
 			if string(got[i]) != string(messages[i]) {
 				t.Fatalf("incomplete history should be untouched, but differed at %d", i)
@@ -103,7 +103,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(`{"role":"user","content":"start"}`),
 			[]byte(`{"role":"tool","tool_call_id":"call_orphan","content":"orphan"}`),
 		}
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		for i := range messages {
 			if string(got[i]) != string(messages[i]) {
 				t.Fatalf("orphan history should be untouched, but differed at %d", i)
@@ -111,14 +111,32 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 		}
 	})
 
-	t.Run("leaves ambiguous duplicate call IDs untouched", func(t *testing.T) {
+	t.Run("reuses call IDs across distinct assistant turns", func(t *testing.T) {
 		messages := [][]byte{
 			[]byte(`{"role":"assistant","tool_calls":[{"id":"dup_call"}]}`),
+			[]byte(`{"role":"user","content":"middle 1"}`),
+			[]byte(`{"role":"tool","tool_call_id":"dup_call","content":"res 1"}`),
+			[]byte(`{"role":"assistant","tool_calls":[{"id":"dup_call"}]}`),
+			[]byte(`{"role":"user","content":"middle 2"}`),
+			[]byte(`{"role":"tool","tool_call_id":"dup_call","content":"res 2"}`),
+		}
+		got := AlignOpenAIToolCallMessages(messages, nil)
+		wantRoles := []string{"assistant", "tool", "user", "assistant", "tool", "user"}
+		for i, wantRole := range wantRoles {
+			if role := gjson.GetBytes(got[i], "role").String(); role != wantRole {
+				t.Fatalf("got[%d].role = %q, want %q", i, role, wantRole)
+			}
+		}
+	})
+
+	t.Run("leaves duplicate outputs within one assistant turn untouched", func(t *testing.T) {
+		messages := [][]byte{
 			[]byte(`{"role":"assistant","tool_calls":[{"id":"dup_call"}]}`),
 			[]byte(`{"role":"user","content":"middle"}`),
-			[]byte(`{"role":"tool","tool_call_id":"dup_call","content":"res"}`),
+			[]byte(`{"role":"tool","tool_call_id":"dup_call","content":"res 1"}`),
+			[]byte(`{"role":"tool","tool_call_id":"dup_call","content":"res 2"}`),
 		}
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		for i := range messages {
 			if string(got[i]) != string(messages[i]) {
 				t.Fatalf("ambiguous history should be untouched, but differed at %d", i)
@@ -133,7 +151,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(`{"role":"user","content":"reminder"}`),
 			[]byte(`{"role":"tool","tool_call_id":"call_a","content":"res_a"}`),
 		}
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		for i := range messages {
 			if string(got[i]) != string(messages[i]) {
 				t.Fatalf("mixed empty ID history should be untouched, but differed at %d", i)
@@ -152,7 +170,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(toolJSON),
 		}
 
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		if len(got) != 3 {
 			t.Fatalf("expected 3 messages, got %d", len(got))
 		}
@@ -172,7 +190,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(`{"role":"tool","tool_call_id":"call_future","content":"res"}`),
 			[]byte(`{"role":"assistant","tool_calls":[{"id":"call_future"}]}`),
 		}
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		for i := range messages {
 			if string(got[i]) != string(messages[i]) {
 				t.Fatalf("causal violation history should be untouched, but differed at %d", i)
@@ -189,7 +207,7 @@ func TestAlignOpenAIToolCallMessages(t *testing.T) {
 			[]byte(`{"role":"user","content":"reminder 2"}`),
 			[]byte(`{"role":"tool","tool_call_id":"call_2","content":"res 2"}`),
 		}
-		got := AlignOpenAIToolCallMessages(messages)
+		got := AlignOpenAIToolCallMessages(messages, nil)
 		if len(got) != 6 {
 			t.Fatalf("expected 6 messages, got %d", len(got))
 		}

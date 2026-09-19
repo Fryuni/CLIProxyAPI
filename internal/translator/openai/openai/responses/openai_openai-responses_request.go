@@ -68,7 +68,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		appendMessage(systemMessage)
 	}
 
-	duplicateOutputIDs := make(map[string]struct{})
+	ambiguousOutputIDsByAssistant := make(map[int]map[string]bool)
 
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
@@ -94,7 +94,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		pendingToolCallIDs := make([]string, 0)
 		pendingReasoningContent := ""
 		awaitingToolOutputs := make(map[string]struct{})
-		outputCounts := make(map[string]int)
+		outputCountsByPendingGroup := make(map[string]int)
+		toolCallAssistantByID := make(map[string]int)
 		mergeableAssistantIndex := -1
 
 		takePendingReasoningContent := func() string {
@@ -108,6 +109,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			}
 
 			reasoningContent := takePendingReasoningContent()
+			assistantIndex := mergeableAssistantIndex
 			mergedIntoAssistant := false
 			if mergeableAssistantIndex >= 0 && mergeableAssistantIndex == len(messages)-1 {
 				assistantMessage := gjson.ParseBytes(messages[mergeableAssistantIndex])
@@ -128,6 +130,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", reasoningContent)
 				}
 				appendMessage(assistantMessage)
+				assistantIndex = len(messages) - 1
 			}
 			for _, id := range pendingToolCallIDs {
 				trimmed := strings.TrimSpace(id)
@@ -135,6 +138,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					continue
 				}
 				awaitingToolOutputs[trimmed] = struct{}{}
+				outputCountsByPendingGroup[trimmed] = 0
+				toolCallAssistantByID[trimmed] = assistantIndex
 			}
 			pendingToolCalls = pendingToolCalls[:0]
 			pendingToolCallIDs = pendingToolCallIDs[:0]
@@ -253,10 +258,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "function_call_output":
 				mergeableAssistantIndex = -1
 				callID := translatorcommon.ExtractResponsesCallID(item)
-				if callID != "" {
-					outputCounts[callID]++
-					if outputCounts[callID] > 1 {
-						duplicateOutputIDs[callID] = struct{}{}
+				if assistantIndex, knownCall := toolCallAssistantByID[callID]; callID != "" && knownCall {
+					outputCountsByPendingGroup[callID]++
+					if outputCountsByPendingGroup[callID] > 1 {
+						if ambiguousOutputIDsByAssistant[assistantIndex] == nil {
+							ambiguousOutputIDsByAssistant[assistantIndex] = make(map[string]bool)
+						}
+						ambiguousOutputIDsByAssistant[assistantIndex][callID] = true
 					}
 				}
 				if _, awaiting := awaitingToolOutputs[callID]; !awaiting {
@@ -298,10 +306,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "custom_tool_call_output":
 				mergeableAssistantIndex = -1
 				callID := translatorcommon.ExtractResponsesCallID(item)
-				if callID != "" {
-					outputCounts[callID]++
-					if outputCounts[callID] > 1 {
-						duplicateOutputIDs[callID] = struct{}{}
+				if assistantIndex, knownCall := toolCallAssistantByID[callID]; callID != "" && knownCall {
+					outputCountsByPendingGroup[callID]++
+					if outputCountsByPendingGroup[callID] > 1 {
+						if ambiguousOutputIDsByAssistant[assistantIndex] == nil {
+							ambiguousOutputIDsByAssistant[assistantIndex] = make(map[string]bool)
+						}
+						ambiguousOutputIDsByAssistant[assistantIndex][callID] = true
 					}
 				}
 				if _, awaiting := awaitingToolOutputs[callID]; !awaiting {
@@ -331,11 +342,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	if len(messages) > 0 {
-		var extraAmbiguous []string
-		for id := range duplicateOutputIDs {
-			extraAmbiguous = append(extraAmbiguous, id)
-		}
-		messages = translatorcommon.AlignOpenAIToolCallMessages(messages, extraAmbiguous...)
+		messages = translatorcommon.AlignOpenAIToolCallMessages(messages, ambiguousOutputIDsByAssistant)
 		out, _ = sjson.SetRawBytes(out, "messages", translatorcommon.JoinRawArray(messages))
 	}
 

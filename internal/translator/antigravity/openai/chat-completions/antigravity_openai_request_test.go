@@ -812,3 +812,36 @@ func TestConvertOpenAIRequestToAntigravity_ParallelAndOutOfOrderToolResponses(t 
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed: %v; output=%s", errPairing, out)
 	}
 }
+
+func TestConvertOpenAIRequestToAntigravity_EmptyToolCallIDDoesNotFabricateResponse(t *testing.T) {
+	inputJSON := `{
+		"messages": [
+			{"role": "user", "content": "run tools"},
+			{"role": "assistant", "tool_calls": [
+				{"id": "", "type": "function", "function": {"name": "missing_id", "arguments": "{}"}},
+				{"id": "call_1", "type": "function", "function": {"name": "normal", "arguments": "{}"}}
+			]},
+			{"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+			{"role": "user", "content": "done"}
+		]
+	}`
+
+	out := ConvertOpenAIRequestToAntigravity("gemini-3-flash", []byte(inputJSON), false)
+	modelParts := gjson.GetBytes(out, "request.contents.1.parts").Array()
+	if len(modelParts) != 2 {
+		t.Fatalf("model parts length = %d, want 2 emitted function calls. Output: %s", len(modelParts), out)
+	}
+	if got := modelParts[0].Get("functionCall.name").String(); got != "missing_id" {
+		t.Fatalf("first functionCall.name = %q, want missing_id. Output: %s", got, out)
+	}
+	responseParts := gjson.GetBytes(out, "request.contents.2.parts").Array()
+	if len(responseParts) != 1 {
+		t.Fatalf("response parts length = %d, want 1 (no empty-ID response). Output: %s", len(responseParts), out)
+	}
+	if got := responseParts[0].Get("functionResponse.id").String(); got != "call_1" {
+		t.Fatalf("functionResponse.id = %q, want call_1. Output: %s", got, out)
+	}
+	if got := responseParts[0].Get("functionResponse.name").String(); got != "normal" {
+		t.Fatalf("functionResponse.name = %q, want normal. Output: %s", got, out)
+	}
+}

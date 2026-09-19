@@ -23,7 +23,7 @@ func TestOpenAICompatExecutor_ImageStreamChunkBoundaryObservability(t *testing.T
 		wantModel string
 	}{
 		{
-			name: "chunk split across json boundaries (拆包)",
+			name: "chunk split across JSON boundaries (split chunks)",
 			chunks: []string{
 				`data: {"id":"img_split","cre`,
 				`ated":123,"mo`,
@@ -32,7 +32,7 @@ func TestOpenAICompatExecutor_ImageStreamChunkBoundaryObservability(t *testing.T
 			wantModel: "dall-e-3",
 		},
 		{
-			name: "multiple events in single network chunk (合包)",
+			name: "multiple events in single network chunk (coalesced chunks)",
 			chunks: []string{
 				"event: ping\ndata: {}\n\nevent: completion\ndata: {\"model\":\"dall-e-3\",\"status\":\"done\"}\n\n",
 			},
