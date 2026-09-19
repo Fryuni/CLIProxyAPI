@@ -754,52 +754,74 @@ func TestPutClaudeKeysNewCredentialWithDifferentPrefixDoesNotInheritMode(t *test
 	}
 }
 
-func TestPutClaudeKeysOmittedCloakPreservesExistingMode(t *testing.T) {
+func TestPutClaudeKeysOmittedCloakPreservesFullConfigAndExplicitUpdatesApply(t *testing.T) {
 	configFile := writeTestConfigFile(t)
 	initialYAML := `claude-api-key:
   - api-key: sk-ant-test
     cloak:
       mode: always
+      strict-mode: true
+      sensitive-words:
+        - secret
+      cache-user-id: true
 `
 	if errWrite := os.WriteFile(configFile, []byte(initialYAML), 0o600); errWrite != nil {
 		t.Fatalf("os.WriteFile() error = %v", errWrite)
 	}
 
+	cacheTrue := true
 	cfg := &config.Config{
 		ClaudeKey: []config.ClaudeKey{
 			{
 				APIKey: "sk-ant-test",
-				Cloak:  &config.CloakConfig{Mode: "always"},
+				Cloak: &config.CloakConfig{
+					Mode:           "always",
+					StrictMode:     true,
+					SensitiveWords: []string{"secret"},
+					CacheUserID:    &cacheTrue,
+				},
 			},
 		},
 	}
 	h := &Handler{cfg: cfg, configFilePath: configFile}
 
-	// PUT sends the credential without a cloak block. Existing mode: always must be preserved.
-	payload := `[{"api-key":"sk-ant-test"}]`
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/claude-api-key",
-		strings.NewReader(payload))
-	ctx.Request.Header.Set("Content-Type", "application/json")
-	h.PutClaudeKeys(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	if len(cfg.ClaudeKey) != 1 {
-		t.Fatalf("ClaudeKey length = %d, want 1", len(cfg.ClaudeKey))
-	}
-	if cfg.ClaudeKey[0].Cloak == nil || cfg.ClaudeKey[0].Cloak.Mode != "always" {
-		t.Fatalf("Cloak = %+v, want preserved mode: always", cfg.ClaudeKey[0].Cloak)
+	put := func(payload string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/claude-api-key", strings.NewReader(payload))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		h.PutClaudeKeys(ctx)
+		return rec
 	}
 
-	savedBytes, errRead := os.ReadFile(configFile)
-	if errRead != nil {
-		t.Fatalf("os.ReadFile() error = %v", errRead)
+	// Older clients omit cloak entirely. The complete existing configuration must survive.
+	if rec := put(`[{"api-key":"sk-ant-test"}]`); rec.Code != http.StatusOK {
+		t.Fatalf("omitted cloak status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	savedText := string(savedBytes)
-	if !strings.Contains(savedText, "mode: always") {
-		t.Fatalf("saved YAML lost preserved 'mode: always':\n%s", savedText)
+	cloak := cfg.ClaudeKey[0].Cloak
+	if cloak == nil || cloak.Mode != "always" || !cloak.StrictMode ||
+		len(cloak.SensitiveWords) != 1 || cloak.SensitiveWords[0] != "secret" ||
+		cloak.CacheUserID == nil || !*cloak.CacheUserID {
+		t.Fatalf("Cloak = %+v, want full existing config preserved", cloak)
+	}
+
+	// An explicitly supplied cloak object remains a replacement, apart from the established empty-mode preservation.
+	if rec := put(`[{"api-key":"sk-ant-test","cloak":{"mode":"","strict-mode":false,"sensitive-words":["updated"],"cache-user-id":false}}]`); rec.Code != http.StatusOK {
+		t.Fatalf("replacement cloak status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	cloak = cfg.ClaudeKey[0].Cloak
+	if cloak == nil || cloak.Mode != "always" || cloak.StrictMode ||
+		len(cloak.SensitiveWords) != 1 || cloak.SensitiveWords[0] != "updated" ||
+		cloak.CacheUserID == nil || *cloak.CacheUserID {
+		t.Fatalf("Cloak = %+v, want explicit replacement with preserved mode", cloak)
+	}
+
+	// Explicit null still clears the cloak configuration.
+	if rec := put(`[{"api-key":"sk-ant-test","cloak":null}]`); rec.Code != http.StatusOK {
+		t.Fatalf("cleared cloak status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if cfg.ClaudeKey[0].Cloak != nil {
+		t.Fatalf("Cloak = %+v, want nil after explicit clear", cfg.ClaudeKey[0].Cloak)
 	}
 }

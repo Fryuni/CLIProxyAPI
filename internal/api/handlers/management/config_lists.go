@@ -583,6 +583,19 @@ func (h *Handler) findExistingClaudeKey(existing []config.ClaudeKey, item config
 	return nil
 }
 
+func cloneCloakConfig(cloak *config.CloakConfig) *config.CloakConfig {
+	if cloak == nil {
+		return nil
+	}
+	cloned := *cloak
+	cloned.SensitiveWords = append([]string(nil), cloak.SensitiveWords...)
+	if cloak.CacheUserID != nil {
+		cacheUserID := *cloak.CacheUserID
+		cloned.CacheUserID = &cacheUserID
+	}
+	return &cloned
+}
+
 // claude-api-key: []ClaudeKey
 func (h *Handler) GetClaudeKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"claude-api-key": h.claudeKeysWithAuthIndex()})
@@ -594,6 +607,9 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 		return
 	}
 	var arr []config.ClaudeKey
+	var rawArr []struct {
+		Cloak json.RawMessage `json:"cloak"`
+	}
 	if err = json.Unmarshal(data, &arr); err != nil {
 		var obj struct {
 			Items []config.ClaudeKey `json:"items"`
@@ -603,15 +619,26 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 			return
 		}
 		arr = obj.Items
+		var rawObj struct {
+			Items []struct {
+				Cloak json.RawMessage `json:"cloak"`
+			} `json:"items"`
+		}
+		_ = json.Unmarshal(data, &rawObj)
+		rawArr = rawObj.Items
+	} else {
+		_ = json.Unmarshal(data, &rawArr)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for i := range arr {
-		if arr[i].Cloak == nil {
-			if old := h.findExistingClaudeKey(h.cfg.ClaudeKey, arr[i]); old != nil && old.Cloak != nil && old.Cloak.Mode != "" {
-				arr[i].Cloak = &config.CloakConfig{Mode: old.Cloak.Mode}
+		cloakProvided := i < len(rawArr) && len(rawArr[i].Cloak) > 0
+		cloakCleared := cloakProvided && strings.TrimSpace(string(rawArr[i].Cloak)) == "null"
+		if !cloakProvided {
+			if old := h.findExistingClaudeKey(h.cfg.ClaudeKey, arr[i]); old != nil {
+				arr[i].Cloak = cloneCloakConfig(old.Cloak)
 			}
-		} else if strings.TrimSpace(arr[i].Cloak.Mode) == "" {
+		} else if !cloakCleared && arr[i].Cloak != nil && strings.TrimSpace(arr[i].Cloak.Mode) == "" {
 			if old := h.findExistingClaudeKey(h.cfg.ClaudeKey, arr[i]); old != nil && old.Cloak != nil && old.Cloak.Mode != "" {
 				arr[i].Cloak.Mode = old.Cloak.Mode
 			}
