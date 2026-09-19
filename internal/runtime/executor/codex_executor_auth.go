@@ -120,6 +120,9 @@ func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.Code
 }
 
 func (e *CodexExecutor) resolveCodexModelIsCompat(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, baseModel string) bool {
+	if modelInfo, ok := cliproxyauth.ResolvedAPIKeyModelInfo(req); ok && modelInfo != nil {
+		return modelInfo.IsCompat
+	}
 	if modelInfo, ok := cliproxyauth.ResolvedModelInfo(req); ok && modelInfo != nil {
 		return modelInfo.IsCompat
 	}

@@ -346,6 +346,59 @@ func TestCodexExecutorCompactPreservesReasoningTextForCompatModelInResponsesRequ
 	}
 }
 
+func TestCodexExecutorPrefersAPIKeyCompatMetadataForHomeDispatch(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		gotBody = body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"background\":false,\"error\":null}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+			"api_key":  "home-selected-api-key",
+		},
+	}
+	payload := []byte(`{"model":"deepseek-home","input":[` +
+		`{"id":"rs_home","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"preserve Home-dispatched reasoning"}]}` +
+		`]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-home",
+		Payload: payload,
+		Metadata: map[string]any{
+			"cliproxy.resolved_api_key_model_info": &registry.ModelInfo{ID: "deepseek-upstream", IsCompat: true},
+			"cliproxy.resolved_home_model_info":    &registry.ModelInfo{ID: "deepseek-upstream"},
+		},
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+
+	reasoningItem := gjson.GetBytes(gotBody, "input.0")
+	if gotID := reasoningItem.Get("id").String(); gotID != "rs_home" {
+		t.Fatalf("reasoning id = %q, want rs_home; body=%s", gotID, string(gotBody))
+	}
+	content := reasoningItem.Get("content")
+	if !content.Exists() || !content.IsArray() || len(content.Array()) == 0 {
+		t.Fatalf("Home-selected API-key compatibility should preserve reasoning content; body=%s", string(gotBody))
+	}
+	if gotText := content.Get("0.text").String(); gotText != "preserve Home-dispatched reasoning" {
+		t.Fatalf("reasoning text = %q, want preserved Home-dispatched reasoning; body=%s", gotText, string(gotBody))
+	}
+}
+
 func TestCodexExecutorHonorsAuthoritativeResolvedModelInfoIsCompatFalse(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

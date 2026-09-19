@@ -2290,6 +2290,61 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DuplicateCustomOut
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_InfersMissingOutputIDsPerPendingGroup(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call_output","output":"result a"},
+			{"role":"user","content":"continue"},
+			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
+			{"type":"function_call_output","output":"result b"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := make(map[string]string)
+	for _, message := range messages {
+		if message.Get("role").String() == "tool" {
+			results[message.Get("tool_call_id").String()] = message.Get("content").String()
+		}
+	}
+	if got := results["call_a"]; got != "result a" {
+		t.Fatalf("call_a result = %q, want result a; output=%s", got, out)
+	}
+	if got := results["call_b"]; got != "result b" {
+		t.Fatalf("call_b result = %q, want result b; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_InfersMissingOutputIDsByUniqueFunctionName(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
+			{"type":"function_call_output","name":"tool_b","output":"result b"},
+			{"type":"function_call_output","name":"tool_a","output":"result a"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := make(map[string]string)
+	for _, message := range messages {
+		if message.Get("role").String() == "tool" {
+			results[message.Get("tool_call_id").String()] = message.Get("content").String()
+		}
+	}
+	if got := results["call_a"]; got != "result a" {
+		t.Fatalf("call_a result = %q, want result a; output=%s", got, out)
+	}
+	if got := results["call_b"]; got != "result b" {
+		t.Fatalf("call_b result = %q, want result b; output=%s", got, out)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MultipleOutputsWithoutIDDoNotGuessOrReorder(t *testing.T) {
 	// If assistant issues function_call(a) and function_call(b), and multiple outputs arrive
 	// without call_ids, the assignment is a non-unique guess. The history must stay untouched!

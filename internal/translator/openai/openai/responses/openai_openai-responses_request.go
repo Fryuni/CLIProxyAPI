@@ -73,45 +73,21 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		rawInputArray := input.Array()
-		explicitOutputCounts := make(map[string]int)
-		missingIDOutputsCount := 0
-		for _, item := range rawInputArray {
-			itemType := item.Get("type").String()
-			if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
-				id := translatorcommon.ExtractResponsesCallID(item)
-				if id != "" {
-					explicitOutputCounts[id]++
-				} else {
-					missingIDOutputsCount++
-				}
-			}
-		}
-
-		unclaimedCalls := make(map[string]bool)
-		for _, item := range rawInputArray {
-			itemType := item.Get("type").String()
-			if itemType == "function_call" || itemType == "custom_tool_call" {
-				id := translatorcommon.ExtractResponsesCallID(item)
-				if id != "" && explicitOutputCounts[id] == 0 {
-					unclaimedCalls[id] = true
-				}
-			}
-		}
-
+		unambiguousInferredOutputs := unambiguousResponsesOutputInferences(rawInputArray)
 		inputItems := translatorcommon.NormalizeResponsesToolCallOutputs(rawInputArray)
-		if missingIDOutputsCount > 1 || (missingIDOutputsCount > 0 && len(unclaimedCalls) > 1) {
-			for idx, item := range inputItems {
-				itemType := item.Get("type").String()
-				if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
-					if idx < len(rawInputArray) && translatorcommon.ExtractResponsesCallID(rawInputArray[idx]) == "" {
-						raw := []byte(item.Raw)
-						raw, _ = sjson.DeleteBytes(raw, "call_id")
-						raw, _ = sjson.DeleteBytes(raw, "tool_call_id")
-						raw, _ = sjson.DeleteBytes(raw, "callId")
-						inputItems[idx] = gjson.ParseBytes(raw)
-					}
-				}
+		for idx, item := range inputItems {
+			itemType := item.Get("type").String()
+			if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
+				continue
 			}
+			if idx >= len(rawInputArray) || translatorcommon.ExtractResponsesCallID(rawInputArray[idx]) != "" || unambiguousInferredOutputs[idx] {
+				continue
+			}
+			raw := []byte(item.Raw)
+			raw, _ = sjson.DeleteBytes(raw, "call_id")
+			raw, _ = sjson.DeleteBytes(raw, "tool_call_id")
+			raw, _ = sjson.DeleteBytes(raw, "callId")
+			inputItems[idx] = gjson.ParseBytes(raw)
 		}
 
 		pendingToolCalls := make([]interface{}, 0)
@@ -647,4 +623,107 @@ func combineOpenAIResponsesReasoning(existing, incoming string) string {
 	default:
 		return existing + "\n\n" + incoming
 	}
+}
+
+func unambiguousResponsesOutputInferences(items []gjson.Result) map[int]bool {
+	type pendingCall struct {
+		id   string
+		name string
+	}
+
+	explicitOutputCounts := make(map[string]int)
+	for _, item := range items {
+		itemType := item.Get("type").String()
+		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
+			if callID := translatorcommon.ExtractResponsesCallID(item); callID != "" {
+				explicitOutputCounts[callID]++
+			}
+		}
+	}
+
+	unambiguous := make(map[int]bool)
+	pending := make([]pendingCall, 0)
+	for index := 0; index < len(items); {
+		item := items[index]
+		itemType := item.Get("type").String()
+		if itemType == "function_call" || itemType == "custom_tool_call" {
+			if callID := translatorcommon.ExtractResponsesCallID(item); callID != "" {
+				pending = append(pending, pendingCall{id: callID, name: strings.TrimSpace(item.Get("name").String())})
+			}
+			index++
+			continue
+		}
+		if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
+			index++
+			continue
+		}
+
+		outputStart := index
+		for index < len(items) {
+			outputType := items[index].Get("type").String()
+			if outputType != "function_call_output" && outputType != "custom_tool_call_output" {
+				break
+			}
+			index++
+		}
+
+		matchedPending := make(map[int]bool)
+		for outputIndex := outputStart; outputIndex < index; outputIndex++ {
+			callID := translatorcommon.ExtractResponsesCallID(items[outputIndex])
+			if callID == "" {
+				continue
+			}
+			explicitOutputCounts[callID]--
+			for pendingIndex, call := range pending {
+				if !matchedPending[pendingIndex] && call.id == callID {
+					matchedPending[pendingIndex] = true
+					break
+				}
+			}
+		}
+
+		matchNamedOutputs := func(namedOnly bool) {
+			outputCandidates := make(map[int][]int)
+			pendingCandidateCounts := make(map[int]int)
+			for outputIndex := outputStart; outputIndex < index; outputIndex++ {
+				output := items[outputIndex]
+				if translatorcommon.ExtractResponsesCallID(output) != "" || unambiguous[outputIndex] {
+					continue
+				}
+				outputName := strings.TrimSpace(output.Get("name").String())
+				if namedOnly != (outputName != "") {
+					continue
+				}
+				for pendingIndex, call := range pending {
+					if matchedPending[pendingIndex] || explicitOutputCounts[call.id] > 0 {
+						continue
+					}
+					if outputName != "" && call.name != outputName {
+						continue
+					}
+					outputCandidates[outputIndex] = append(outputCandidates[outputIndex], pendingIndex)
+					pendingCandidateCounts[pendingIndex]++
+				}
+			}
+
+			for outputIndex, candidates := range outputCandidates {
+				if len(candidates) != 1 || pendingCandidateCounts[candidates[0]] != 1 {
+					continue
+				}
+				unambiguous[outputIndex] = true
+				matchedPending[candidates[0]] = true
+			}
+		}
+		matchNamedOutputs(true)
+		matchNamedOutputs(false)
+
+		remainingPending := pending[:0]
+		for pendingIndex, call := range pending {
+			if !matchedPending[pendingIndex] {
+				remainingPending = append(remainingPending, call)
+			}
+		}
+		pending = remainingPending
+	}
+	return unambiguous
 }
