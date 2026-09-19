@@ -138,7 +138,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					continue
 				}
 				awaitingToolOutputs[trimmed] = struct{}{}
-				outputCountsByPendingGroup[trimmed] = 0
+				delete(outputCountsByPendingGroup, trimmed)
 				toolCallAssistantByID[trimmed] = assistantIndex
 			}
 			pendingToolCalls = pendingToolCalls[:0]
