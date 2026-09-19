@@ -14,11 +14,30 @@ func ShouldUseMaxCompletionTokensForModel(compat *config.OpenAICompatibility, up
 	if compat == nil {
 		return false
 	}
+	if useMCT, matched := openAICompatibilityModelAliasUsesMaxCompletionTokens(compat.Models, upstreamModel, requestedModel); matched {
+		return useMCT
+	}
 	if useMCT, matched := openAICompatibilityModelUsesMaxCompletionTokens(compat.Models, upstreamModel); matched {
 		return useMCT
 	}
 	useMCT, _ := openAICompatibilityModelUsesMaxCompletionTokens(compat.Models, requestedModel)
 	return useMCT
+}
+
+func openAICompatibilityModelAliasUsesMaxCompletionTokens(models []config.OpenAICompatibilityModel, upstreamModel, requestedModel string) (bool, bool) {
+	upstreamModel = normalizeOpenAICompatibilityModelName(upstreamModel)
+	requestedModel = normalizeOpenAICompatibilityModelName(requestedModel)
+	if upstreamModel == "" || requestedModel == "" {
+		return false, false
+	}
+
+	for i := range models {
+		if strings.EqualFold(upstreamModel, normalizeOpenAICompatibilityModelName(models[i].Name)) &&
+			strings.EqualFold(requestedModel, normalizeOpenAICompatibilityModelName(models[i].Alias)) {
+			return models[i].UseMaxCompletionTokens, true
+		}
+	}
+	return false, false
 }
 
 func openAICompatibilityModelUsesMaxCompletionTokens(models []config.OpenAICompatibilityModel, model string) (bool, bool) {

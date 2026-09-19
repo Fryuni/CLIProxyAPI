@@ -38,6 +38,16 @@ func TestOpenAICompatExecutor_MaxTokensNormalization(t *testing.T) {
 					Alias:                  "alias-legacy",
 					UseMaxCompletionTokens: false,
 				},
+				{
+					Name:                   "shared-upstream",
+					Alias:                  "shared-modern",
+					UseMaxCompletionTokens: true,
+				},
+				{
+					Name:                   "shared-upstream",
+					Alias:                  "shared-legacy",
+					UseMaxCompletionTokens: false,
+				},
 			},
 		}},
 	}
@@ -138,6 +148,54 @@ func TestOpenAICompatExecutor_MaxTokensNormalization(t *testing.T) {
 		}
 		if gjson.GetBytes(gotBody, "max_completion_tokens").Exists() {
 			t.Fatalf("max_completion_tokens should be absent; body=%s", string(gotBody))
+		}
+	})
+
+	t.Run("Execute same upstream uses authoritative requested alias preference", func(t *testing.T) {
+		tests := []struct {
+			name            string
+			requestedModel  string
+			wantField       string
+			unexpectedField string
+		}{
+			{
+				name:            "modern alias",
+				requestedModel:  "shared-modern",
+				wantField:       "max_completion_tokens",
+				unexpectedField: "max_tokens",
+			},
+			{
+				name:            "legacy alias",
+				requestedModel:  "shared-legacy",
+				wantField:       "max_tokens",
+				unexpectedField: "max_completion_tokens",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				gotBody = nil
+				payload := []byte(`{"model":"payload-model-is-not-authoritative","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":384}`)
+				_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+					Model:   "shared-upstream",
+					Payload: payload,
+				}, cliproxyexecutor.Options{
+					SourceFormat: sdktranslator.FromString("openai"),
+					Metadata: map[string]any{
+						cliproxyexecutor.RequestedModelMetadataKey: tt.requestedModel,
+					},
+				})
+				if err != nil {
+					t.Fatalf("Execute error: %v", err)
+				}
+
+				if got := gjson.GetBytes(gotBody, tt.wantField).Int(); got != 384 {
+					t.Fatalf("%s = %d, want 384; body=%s", tt.wantField, got, string(gotBody))
+				}
+				if gjson.GetBytes(gotBody, tt.unexpectedField).Exists() {
+					t.Fatalf("%s should be absent; body=%s", tt.unexpectedField, string(gotBody))
+				}
+			})
 		}
 	})
 

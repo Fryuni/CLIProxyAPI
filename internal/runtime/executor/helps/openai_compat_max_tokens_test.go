@@ -25,6 +25,16 @@ func TestShouldUseMaxCompletionTokensForModel(t *testing.T) {
 				Alias: "gpt-3.5",
 				// Omitted defaults to false
 			},
+			{
+				Name:                   "shared/upstream",
+				Alias:                  "shared-modern",
+				UseMaxCompletionTokens: true,
+			},
+			{
+				Name:                   "shared/upstream",
+				Alias:                  "shared-legacy",
+				UseMaxCompletionTokens: false,
+			},
 		},
 	}
 
@@ -90,6 +100,27 @@ func TestShouldUseMaxCompletionTokensForModel(t *testing.T) {
 			upstreamModel:  "legacy/gpt-3.5",
 			requestedModel: "gpt-3.5",
 			want:           false,
+		},
+		{
+			name:           "same upstream selects requested true alias",
+			compat:         compat,
+			upstreamModel:  "shared/upstream",
+			requestedModel: "shared-modern",
+			want:           true,
+		},
+		{
+			name:           "same upstream selects requested false alias",
+			compat:         compat,
+			upstreamModel:  "shared/upstream",
+			requestedModel: "shared-legacy",
+			want:           false,
+		},
+		{
+			name:           "same upstream without matching alias preserves name fallback",
+			compat:         compat,
+			upstreamModel:  "shared/upstream",
+			requestedModel: "unknown-alias",
+			want:           true,
 		},
 		{
 			name:           "unmatched model returns false",
