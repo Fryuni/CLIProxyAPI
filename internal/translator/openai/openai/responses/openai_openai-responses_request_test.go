@@ -125,6 +125,90 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DefersMessageUntil
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReusedCallIDAcrossTurns(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"one\"}"},
+			{"type":"message","role":"user","content":"first reminder"},
+			{"type":"function_call_output","call_id":"call_reused","output":"first result"},
+			{"type":"message","role":"assistant","content":"first done"},
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"two\"}"},
+			{"type":"message","role":"user","content":"second reminder"},
+			{"type":"function_call_output","call_id":"call_reused","output":"second result"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5-codex", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := []string{"first result", "second result"}
+	paired := 0
+	contents := make(map[string]bool)
+	for i, message := range messages {
+		contents[message.Get("content").String()] = true
+		if !message.Get("tool_calls").Exists() {
+			continue
+		}
+		if paired >= len(results) || i+1 >= len(messages) {
+			t.Fatalf("unexpected tool-call group: %s", out)
+		}
+		result := messages[i+1]
+		if result.Get("role").String() != "tool" || result.Get("tool_call_id").String() != message.Get("tool_calls.0.id").String() || result.Get("content").String() != results[paired] {
+			t.Fatalf("tool result does not immediately follow its owning turn: %s", out)
+		}
+		paired++
+	}
+	if paired != len(results) {
+		t.Fatalf("paired groups = %d, want %d; output=%s", paired, len(results), out)
+	}
+	for _, content := range []string{"first reminder", "second reminder", "first done"} {
+		if !contents[content] {
+			t.Fatalf("lost message content %q: %s", content, out)
+		}
+	}
+}
+
+// An explicit output belonging to a later turn that reuses a call_id must not suppress ID
+// inference for the earlier turn's ID-less output: the earlier assistant tool call would
+// otherwise be left unmatched, which strict chat-completions upstreams reject.
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReusedCallIDDoesNotSuppressEarlierInference(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"one\"}"},
+			{"type":"function_call_output","output":"first result"},
+			{"type":"message","role":"assistant","content":"first done"},
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"two\"}"},
+			{"type":"function_call_output","call_id":"call_reused","output":"second result"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5-codex", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := []string{"first result", "second result"}
+	paired := 0
+	for i, message := range messages {
+		if !message.Get("tool_calls").Exists() {
+			continue
+		}
+		if paired >= len(results) || i+1 >= len(messages) {
+			t.Fatalf("unexpected tool-call group: %s", out)
+		}
+		result := messages[i+1]
+		if result.Get("role").String() != "tool" {
+			t.Fatalf("tool call is not followed by its result: %s", out)
+		}
+		if result.Get("tool_call_id").String() != message.Get("tool_calls.0.id").String() {
+			t.Fatalf("tool result is not bound to its owning call: %s", out)
+		}
+		if result.Get("content").String() != results[paired] {
+			t.Fatalf("tool result content = %q, want %q; output=%s", result.Get("content").String(), results[paired], out)
+		}
+		paired++
+	}
+	if paired != len(results) {
+		t.Fatalf("paired groups = %d, want %d; output=%s", paired, len(results), out)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringifiedToolOutputImages(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -2088,5 +2172,393 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_QualifiedIdentityO
 		if got != tc.want {
 			t.Fatalf("namespaced replay for %s/%s resolved to %q, want %q; output=%s", tc.namespace, tc.name, got, tc.want, namespacedOut)
 		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_IncompleteToolCallsDoNotDeferMessages(t *testing.T) {
+	// If assistant issues function_call(a) and function_call(b), but only function_call_output(a)
+	// arrives, the history is incomplete. Intervening messages (e.g. user reminder) must NOT
+	// be deferred; original order must be preserved.
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
+			{"role":"user","content":"reminder before results"},
+			{"type":"function_call_output","call_id":"call_a","output":"result_a"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Incomplete history must stay untouched:
+	// messages[0]: assistant (tool_calls [call_a, call_b])
+	// messages[1]: user ("reminder before results")
+	// messages[2]: tool (tool_call_id: call_a)
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "user" || roles[2] != "tool" {
+		t.Fatalf("expected untouched order [assistant, user, tool], got: %v (output=%s)", roles, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_CompleteToolCallsDoPairMessages(t *testing.T) {
+	// If assistant issues function_call(a) and function_call(b), and both function_call_output(a)
+	// and function_call_output(b) arrive, with an intervening user reminder, the tool outputs
+	// must be paired immediately following the assistant tool_calls message.
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
+			{"role":"user","content":"reminder during execution"},
+			{"type":"function_call_output","call_id":"call_b","output":"result_b"},
+			{"type":"function_call_output","call_id":"call_a","output":"result_a"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Expected:
+	// messages[0]: assistant (tool_calls [call_a, call_b])
+	// messages[1]: tool
+	// messages[2]: tool
+	// messages[3]: user ("reminder during execution")
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "tool" || roles[2] != "tool" || roles[3] != "user" {
+		t.Fatalf("expected order [assistant, tool, tool, user], got: %v (output=%s)", roles, out)
+	}
+	toolIDs := []string{messages[1].Get("tool_call_id").String(), messages[2].Get("tool_call_id").String()}
+	if toolIDs[0] != "call_b" || toolIDs[1] != "call_a" {
+		t.Fatalf("expected tool messages in relative input order [call_b, call_a], got: %v", toolIDs)
+	}
+	if messages[1].Get("content").String() != "result_b" || messages[2].Get("content").String() != "result_a" {
+		t.Fatalf("expected contents [result_b, result_a], got [%s, %s]", messages[1].Get("content").String(), messages[2].Get("content").String())
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MixedEmptyIDDoesNotReorder(t *testing.T) {
+	// Mixed empty call_id and valid call_a: incomplete/ambiguous history must remain untouched
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"","name":"unknown","arguments":"{}"},
+			{"type":"function_call","call_id":"a","name":"known","arguments":"{}"},
+			{"role":"user","content":"reminder"},
+			{"type":"function_call_output","call_id":"a","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Must stay in natural input order: assistant -> user -> tool
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "user" || roles[2] != "tool" {
+		t.Fatalf("expected untouched order [assistant, user, tool], got: %v (output=%s)", roles, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DuplicateCallIDDoesNotReorder(t *testing.T) {
+	// Duplicate call_id: ambiguous history must remain untouched
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"dup","name":"tool_1","arguments":"{}"},
+			{"type":"function_call","call_id":"dup","name":"tool_2","arguments":"{}"},
+			{"role":"user","content":"reminder"},
+			{"type":"function_call_output","call_id":"dup","output":"ok"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Must stay in natural input order: assistant -> user -> tool
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "user" || roles[2] != "tool" {
+		t.Fatalf("expected untouched order [assistant, user, tool], got: %v (output=%s)", roles, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DuplicateOutputCallIDDoesNotReorder(t *testing.T) {
+	// Duplicate function_call_output for the same call_id: ambiguous results must not be prematurely reordered
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"call_dup_out","name":"tool_a","arguments":"{}"},
+			{"role":"user","content":"reminder before results"},
+			{"type":"function_call_output","call_id":"call_dup_out","output":"first"},
+			{"type":"function_call_output","call_id":"call_dup_out","output":"second"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Must stay in natural input order: assistant -> user ("reminder before results") -> tool/user
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "user" {
+		t.Fatalf("expected natural order with user reminder preserved at index 1, got roles: %v (output=%s)", roles, out)
+	}
+	if messages[1].Get("content").String() != "reminder before results" {
+		t.Fatalf("expected message[1] to be reminder, got: %s", messages[1].Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DuplicateCustomOutputCallIDDoesNotReorder(t *testing.T) {
+	// Duplicate custom_tool_call_output for the same call_id: ambiguous results must not be prematurely reordered
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"custom_tool_call","call_id":"custom_dup","name":"custom_a","input":"{}"},
+			{"role":"user","content":"reminder before custom results"},
+			{"type":"custom_tool_call_output","call_id":"custom_dup","output":"output 1"},
+			{"type":"custom_tool_call_output","call_id":"custom_dup","output":"output 2"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Must stay in natural input order: assistant -> user ("reminder before custom results") -> tool/user
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "user" {
+		t.Fatalf("expected natural order with user reminder preserved at index 1, got roles: %v (output=%s)", roles, out)
+	}
+	if messages[1].Get("content").String() != "reminder before custom results" {
+		t.Fatalf("expected message[1] to be reminder, got: %s", messages[1].Raw)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_InfersMissingOutputIDsPerPendingGroup(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call_output","output":"result a"},
+			{"role":"user","content":"continue"},
+			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
+			{"type":"function_call_output","output":"result b"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := make(map[string]string)
+	for _, message := range messages {
+		if message.Get("role").String() == "tool" {
+			results[message.Get("tool_call_id").String()] = message.Get("content").String()
+		}
+	}
+	if got := results["call_a"]; got != "result a" {
+		t.Fatalf("call_a result = %q, want result a; output=%s", got, out)
+	}
+	if got := results["call_b"]; got != "result b" {
+		t.Fatalf("call_b result = %q, want result b; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_InfersMissingOutputIDsByUniqueFunctionName(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
+			{"type":"function_call_output","name":"tool_b","output":"result b"},
+			{"type":"function_call_output","name":"tool_a","output":"result a"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := make(map[string]string)
+	for _, message := range messages {
+		if message.Get("role").String() == "tool" {
+			results[message.Get("tool_call_id").String()] = message.Get("content").String()
+		}
+	}
+	if got := results["call_a"]; got != "result a" {
+		t.Fatalf("call_a result = %q, want result a; output=%s", got, out)
+	}
+	if got := results["call_b"]; got != "result b" {
+		t.Fatalf("call_b result = %q, want result b; output=%s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MultipleOutputsWithoutIDDoNotGuessOrReorder(t *testing.T) {
+	// If assistant issues function_call(a) and function_call(b), and multiple outputs arrive
+	// without call_ids, the assignment is a non-unique guess. The history must stay untouched!
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"a","name":"unknown_a","arguments":"{}"},
+			{"type":"function_call","call_id":"b","name":"unknown_b","arguments":"{}"},
+			{"role":"user","content":"reminder before results"},
+			{"type":"function_call_output","output":"output X"},
+			{"type":"function_call_output","output":"output Y"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Must stay in natural input order: assistant -> user ("reminder before results") -> user ("output X") -> user ("output Y")
+	// Crucially, outputs X and Y must NOT be given guessed tool_call_id "a" or "b" and must NOT be fabricated as tool messages.
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "user" || roles[2] != "user" || roles[3] != "user" {
+		t.Fatalf("expected natural order with user reminder and un-guessed outputs preserved, got roles: %v (output=%s)", roles, out)
+	}
+	if messages[1].Get("content").String() != "reminder before results" {
+		t.Fatalf("expected message[1] to be reminder, got: %s", messages[1].Raw)
+	}
+	if messages[2].Get("content").String() != "output X" || messages[3].Get("content").String() != "output Y" {
+		t.Fatalf("expected outputs X and Y as standalone user messages, got msg2=%s msg3=%s", messages[2].Raw, messages[3].Raw)
+	}
+	// Verify no tool messages were created with guessed call IDs
+	for _, m := range messages {
+		if m.Get("role").String() == "tool" {
+			t.Fatalf("unexpected tool message created via guessing: %s", m.Raw)
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MultipleOutputsWithoutIDAndOrphanOutputDoNotGuessOrReorder(t *testing.T) {
+	// Call A, Call B.
+	// User reminder.
+	// Output 1 has NO ID (X).
+	// Output 2 has NO ID (Y).
+	// Output 3 has orphan explicit ID (Z).
+	// The presence of orphan_id must NOT cause X/Y to be guessed and reordered before the reminder!
+	inputJSON := []byte(`{
+		"model": "deepseek-v4.1-flash",
+		"input": [
+			{"type":"function_call","call_id":"a","name":"tool_a","arguments":"{}"},
+			{"type":"function_call","call_id":"b","name":"tool_b","arguments":"{}"},
+			{"role":"user","content":"reminder before results"},
+			{"type":"function_call_output","output":"output X"},
+			{"type":"function_call_output","output":"output Y"},
+			{"type":"function_call_output","call_id":"orphan_id","output":"output Z"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+
+	roles := make([]string, 0, len(messages))
+	for _, m := range messages {
+		roles = append(roles, m.Get("role").String())
+	}
+
+	// Must stay in natural input order: assistant -> user ("reminder before results") -> user (X) -> user (Y) -> user (Z)
+	// Outputs X and Y must NOT be guessed as tool calls "a" and "b" and must NOT be moved before reminder!
+	if len(messages) != 5 {
+		t.Fatalf("expected 5 messages, got %d: %s", len(messages), out)
+	}
+	if roles[0] != "assistant" || roles[1] != "user" {
+		t.Fatalf("expected natural order with user reminder preserved at index 1 without guessing, got roles: %v (output=%s)", roles, out)
+	}
+	if messages[1].Get("content").String() != "reminder before results" {
+		t.Fatalf("expected message[1] to be reminder, got: %s", messages[1].Raw)
+	}
+	// Verify no tool messages were created with guessed call IDs
+	for _, m := range messages {
+		if m.Get("role").String() == "tool" {
+			t.Fatalf("unexpected tool message created via guessing: %s", m.Raw)
+		}
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MapsMaxOutputTokensToMaxTokens(t *testing.T) {
+	raw := []byte(`{
+		"model": "gpt-5.4",
+		"input": "hello",
+		"max_output_tokens": 1024
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", raw, false)
+
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 1024 {
+		t.Fatalf("max_tokens = %d, want 1024; output=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "max_completion_tokens").Exists() {
+		t.Fatalf("max_completion_tokens should be absent; output=%s", string(out))
+	}
+
+	rawWithoutLimit := []byte(`{
+		"model": "gpt-5.4",
+		"input": "hello"
+	}`)
+
+	outWithoutLimit := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", rawWithoutLimit, false)
+	if gjson.GetBytes(outWithoutLimit, "max_completion_tokens").Exists() {
+		t.Fatalf("max_completion_tokens should be absent when omitted; output=%s", string(outWithoutLimit))
+	}
+	if gjson.GetBytes(outWithoutLimit, "max_tokens").Exists() {
+		t.Fatalf("max_tokens should be absent when omitted; output=%s", string(outWithoutLimit))
+	}
+
+	rawNull := []byte(`{
+		"model": "gpt-5.4",
+		"input": "hello",
+		"max_output_tokens": null
+	}`)
+
+	outNull := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5.4", rawNull, false)
+	if got := gjson.GetBytes(outNull, "max_tokens"); !got.Exists() || got.Type != gjson.Null {
+		t.Fatalf("max_tokens = %v, want null; output=%s", got, string(outNull))
+	}
+	if gjson.GetBytes(outNull, "max_completion_tokens").Exists() {
+		t.Fatalf("max_completion_tokens should be absent; output=%s", string(outNull))
 	}
 }

@@ -591,7 +591,8 @@ func isCodexEmptyPart(payload []byte) bool {
 	}
 }
 
-// observeCodexTokenEvent inspects a stream payload and marks TTFT on the first substantive token event.
+// observeCodexTokenEvent inspects a stream payload, marks TTFT on the first substantive
+// token event, and records the model the upstream reports serving.
 func observeCodexTokenEvent(reporter *helps.UsageReporter, payload []byte) {
 	helps.ObserveResponsesTokenEvent(reporter, payload)
 }

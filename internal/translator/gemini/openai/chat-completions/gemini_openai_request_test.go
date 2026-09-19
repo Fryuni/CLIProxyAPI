@@ -3,6 +3,7 @@ package chat_completions
 import (
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/tidwall/gjson"
 )
 
@@ -564,5 +565,179 @@ func TestConvertOpenAIRequestToGeminiResponseFormatNoOp(t *testing.T) {
 				t.Fatalf("temperature = %v, want 0.5. Output: %s", got, output)
 			}
 		})
+	}
+}
+
+func TestConvertOpenAIRequestToGemini_MultiTurnRepeatedToolCallID_Issue5933(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"messages": [
+			{"role": "user", "content": "list files"},
+			{
+				"role": "assistant",
+				"tool_calls": [{
+					"id": "call_1",
+					"type": "function",
+					"function": {"name": "glob", "arguments": "{\"pattern\":\"*.go\"}"}
+				}]
+			},
+			{"role": "tool", "tool_call_id": "call_1", "content": "[\"main.go\"]"},
+			{"role": "user", "content": "read main.go"},
+			{
+				"role": "assistant",
+				"tool_calls": [{
+					"id": "call_1",
+					"type": "function",
+					"function": {"name": "read", "arguments": "{\"path\":\"main.go\"}"}
+				}]
+			},
+			{"role": "tool", "tool_call_id": "call_1", "content": "package main"}
+		]
+	}`
+
+	out := ConvertOpenAIRequestToGemini("gemini-3-flash", []byte(inputJSON), false)
+
+	// In Turn 1 (contents[1] = model functionCall, contents[2] = user functionResponse):
+	// functionCall.name must be "glob", and functionResponse.name must be "glob".
+	call1Name := gjson.GetBytes(out, "contents.1.parts.0.functionCall.name").String()
+	resp1Name := gjson.GetBytes(out, "contents.2.parts.0.functionResponse.name").String()
+	resp1Result := gjson.GetBytes(out, "contents.2.parts.0.functionResponse.response.result").String()
+
+	if call1Name != "glob" {
+		t.Fatalf("turn 1 functionCall.name = %q, want glob", call1Name)
+	}
+	if resp1Name != "glob" {
+		t.Fatalf("turn 1 functionResponse.name = %q, want glob (got overwritten by subsequent turn)", resp1Name)
+	}
+	if resp1Result != `["main.go"]` {
+		t.Fatalf("turn 1 functionResponse result = %q, want %q", resp1Result, `["main.go"]`)
+	}
+
+	// In Turn 2 (contents[4] = model functionCall, contents[5] = user functionResponse):
+	// functionCall.name must be "read", and functionResponse.name must be "read".
+	call2Name := gjson.GetBytes(out, "contents.4.parts.0.functionCall.name").String()
+	resp2Name := gjson.GetBytes(out, "contents.5.parts.0.functionResponse.name").String()
+	resp2Result := gjson.GetBytes(out, "contents.5.parts.0.functionResponse.response.result").String()
+
+	if call2Name != "read" {
+		t.Fatalf("turn 2 functionCall.name = %q, want read", call2Name)
+	}
+	if resp2Name != "read" {
+		t.Fatalf("turn 2 functionResponse.name = %q, want read", resp2Name)
+	}
+	if resp2Result != "package main" {
+		t.Fatalf("turn 2 functionResponse result = %q, want %q", resp2Result, "package main")
+	}
+
+	// Verify pairing validator passes without error
+	if errPairing := signature.ValidateGeminiFunctionCallPairing(out); errPairing != nil {
+		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Gemini output: %v; output=%s", errPairing, out)
+	}
+}
+
+func TestConvertOpenAIRequestToGemini_PreservesStructuredAndTextToolResponses(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"messages": [
+			{"role": "user", "content": "inspect"},
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{"id": "call_json", "type": "function", "function": {"name": "inspect", "arguments": "{}"}},
+					{"id": "call_text", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_json", "content": "{\"output\":{\"count\":2,\"items\":[\"a\",\"b\"]},\"ok\":true}"},
+			{"role": "tool", "tool_call_id": "call_text", "content": "package main"}
+		]
+	}`
+
+	out := ConvertOpenAIRequestToGemini("gemini-3-flash", []byte(inputJSON), false)
+	structured := gjson.GetBytes(out, "contents.2.parts.0.functionResponse.response.result")
+	if !structured.IsObject() {
+		t.Fatalf("structured tool response type = %s, want object. Output: %s", structured.Type, out)
+	}
+	if got := structured.Get("output.count").Int(); got != 2 {
+		t.Fatalf("structured output.count = %d, want 2. Output: %s", got, out)
+	}
+	if got := structured.Get("output.items.1").String(); got != "b" {
+		t.Fatalf("structured output.items[1] = %q, want b. Output: %s", got, out)
+	}
+	if !structured.Get("ok").Bool() {
+		t.Fatalf("structured ok = false, want true. Output: %s", out)
+	}
+
+	text := gjson.GetBytes(out, "contents.2.parts.1.functionResponse.response.result")
+	if text.Type != gjson.String || text.String() != "package main" {
+		t.Fatalf("text tool response = %s, want string %q. Output: %s", text.Raw, "package main", out)
+	}
+}
+
+func TestConvertOpenAIRequestToGemini_ParallelAndOutOfOrderToolResponses(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"messages": [
+			{"role": "user", "content": "run parallel tools"},
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{"id": "call_1", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
+					{"id": "call_2", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_2", "content": "res_b"},
+			{"role": "tool", "tool_call_id": "call_1", "content": "res_a"}
+		]
+	}`
+
+	out := ConvertOpenAIRequestToGemini("gemini-3-flash", []byte(inputJSON), false)
+
+	resp0Name := gjson.GetBytes(out, "contents.2.parts.0.functionResponse.name").String()
+	resp0Result := gjson.GetBytes(out, "contents.2.parts.0.functionResponse.response.result").String()
+	resp1Name := gjson.GetBytes(out, "contents.2.parts.1.functionResponse.name").String()
+	resp1Result := gjson.GetBytes(out, "contents.2.parts.1.functionResponse.response.result").String()
+
+	if resp0Name != "tool_a" || resp0Result != "res_a" {
+		t.Fatalf("part 0 want tool_a / res_a, got %s / %s", resp0Name, resp0Result)
+	}
+	if resp1Name != "tool_b" || resp1Result != "res_b" {
+		t.Fatalf("part 1 want tool_b / res_b, got %s / %s", resp1Name, resp1Result)
+	}
+
+	if errPairing := signature.ValidateGeminiFunctionCallPairing(out); errPairing != nil {
+		t.Fatalf("ValidateGeminiFunctionCallPairing failed: %v; output=%s", errPairing, out)
+	}
+}
+
+func TestConvertOpenAIRequestToGemini_EmptyToolCallIDDoesNotFabricateResponse(t *testing.T) {
+	inputJSON := `{
+		"messages": [
+			{"role": "user", "content": "run tools"},
+			{"role": "assistant", "tool_calls": [
+				{"id": "", "type": "function", "function": {"name": "missing_id", "arguments": "{}"}},
+				{"id": "call_1", "type": "function", "function": {"name": "normal", "arguments": "{}"}}
+			]},
+			{"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+			{"role": "user", "content": "done"}
+		]
+	}`
+
+	out := ConvertOpenAIRequestToGemini("gemini-3-flash", []byte(inputJSON), false)
+	modelParts := gjson.GetBytes(out, "contents.1.parts").Array()
+	if len(modelParts) != 2 {
+		t.Fatalf("model parts length = %d, want 2 emitted function calls. Output: %s", len(modelParts), out)
+	}
+	if got := modelParts[0].Get("functionCall.name").String(); got != "missing_id" {
+		t.Fatalf("first functionCall.name = %q, want missing_id. Output: %s", got, out)
+	}
+	responseParts := gjson.GetBytes(out, "contents.2.parts").Array()
+	if len(responseParts) != 1 {
+		t.Fatalf("response parts length = %d, want 1 (no empty-ID response). Output: %s", len(responseParts), out)
+	}
+	if got := responseParts[0].Get("functionResponse.name").String(); got != "normal" {
+		t.Fatalf("functionResponse.name = %q, want normal. Output: %s", got, out)
+	}
+	if got := responseParts[0].Get("functionResponse.response.result").String(); got != "ok" {
+		t.Fatalf("functionResponse result = %q, want %q. Output: %s", got, "ok", out)
 	}
 }
