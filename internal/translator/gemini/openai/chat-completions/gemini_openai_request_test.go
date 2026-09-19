@@ -609,8 +609,8 @@ func TestConvertOpenAIRequestToGemini_MultiTurnRepeatedToolCallID_Issue5933(t *t
 	if resp1Name != "glob" {
 		t.Fatalf("turn 1 functionResponse.name = %q, want glob (got overwritten by subsequent turn)", resp1Name)
 	}
-	if resp1Result != `"[\"main.go\"]"` {
-		t.Fatalf("turn 1 functionResponse result = %q, want %q", resp1Result, `"[\"main.go\"]"`)
+	if resp1Result != `["main.go"]` {
+		t.Fatalf("turn 1 functionResponse result = %q, want %q", resp1Result, `["main.go"]`)
 	}
 
 	// In Turn 2 (contents[4] = model functionCall, contents[5] = user functionResponse):
@@ -625,13 +625,51 @@ func TestConvertOpenAIRequestToGemini_MultiTurnRepeatedToolCallID_Issue5933(t *t
 	if resp2Name != "read" {
 		t.Fatalf("turn 2 functionResponse.name = %q, want read", resp2Name)
 	}
-	if resp2Result != `"package main"` {
-		t.Fatalf("turn 2 functionResponse result = %q, want %q", resp2Result, `"package main"`)
+	if resp2Result != "package main" {
+		t.Fatalf("turn 2 functionResponse result = %q, want %q", resp2Result, "package main")
 	}
 
 	// Verify pairing validator passes without error
 	if errPairing := signature.ValidateGeminiFunctionCallPairing(out); errPairing != nil {
 		t.Fatalf("ValidateGeminiFunctionCallPairing failed on Gemini output: %v; output=%s", errPairing, out)
+	}
+}
+
+func TestConvertOpenAIRequestToGemini_PreservesStructuredAndTextToolResponses(t *testing.T) {
+	inputJSON := `{
+		"model": "gemini-3-flash",
+		"messages": [
+			{"role": "user", "content": "inspect"},
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{"id": "call_json", "type": "function", "function": {"name": "inspect", "arguments": "{}"}},
+					{"id": "call_text", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_json", "content": "{\"output\":{\"count\":2,\"items\":[\"a\",\"b\"]},\"ok\":true}"},
+			{"role": "tool", "tool_call_id": "call_text", "content": "package main"}
+		]
+	}`
+
+	out := ConvertOpenAIRequestToGemini("gemini-3-flash", []byte(inputJSON), false)
+	structured := gjson.GetBytes(out, "contents.2.parts.0.functionResponse.response.result")
+	if !structured.IsObject() {
+		t.Fatalf("structured tool response type = %s, want object. Output: %s", structured.Type, out)
+	}
+	if got := structured.Get("output.count").Int(); got != 2 {
+		t.Fatalf("structured output.count = %d, want 2. Output: %s", got, out)
+	}
+	if got := structured.Get("output.items.1").String(); got != "b" {
+		t.Fatalf("structured output.items[1] = %q, want b. Output: %s", got, out)
+	}
+	if !structured.Get("ok").Bool() {
+		t.Fatalf("structured ok = false, want true. Output: %s", out)
+	}
+
+	text := gjson.GetBytes(out, "contents.2.parts.1.functionResponse.response.result")
+	if text.Type != gjson.String || text.String() != "package main" {
+		t.Fatalf("text tool response = %s, want string %q. Output: %s", text.Raw, "package main", out)
 	}
 }
 
@@ -659,11 +697,11 @@ func TestConvertOpenAIRequestToGemini_ParallelAndOutOfOrderToolResponses(t *test
 	resp1Name := gjson.GetBytes(out, "contents.2.parts.1.functionResponse.name").String()
 	resp1Result := gjson.GetBytes(out, "contents.2.parts.1.functionResponse.response.result").String()
 
-	if resp0Name != "tool_a" || resp0Result != `"res_a"` {
-		t.Fatalf("part 0 want tool_a / \"res_a\", got %s / %s", resp0Name, resp0Result)
+	if resp0Name != "tool_a" || resp0Result != "res_a" {
+		t.Fatalf("part 0 want tool_a / res_a, got %s / %s", resp0Name, resp0Result)
 	}
-	if resp1Name != "tool_b" || resp1Result != `"res_b"` {
-		t.Fatalf("part 1 want tool_b / \"res_b\", got %s / %s", resp1Name, resp1Result)
+	if resp1Name != "tool_b" || resp1Result != "res_b" {
+		t.Fatalf("part 1 want tool_b / res_b, got %s / %s", resp1Name, resp1Result)
 	}
 
 	if errPairing := signature.ValidateGeminiFunctionCallPairing(out); errPairing != nil {
@@ -699,7 +737,7 @@ func TestConvertOpenAIRequestToGemini_EmptyToolCallIDDoesNotFabricateResponse(t 
 	if got := responseParts[0].Get("functionResponse.name").String(); got != "normal" {
 		t.Fatalf("functionResponse.name = %q, want normal. Output: %s", got, out)
 	}
-	if got := responseParts[0].Get("functionResponse.response.result").String(); got != `"ok"` {
-		t.Fatalf("functionResponse result = %q, want %q. Output: %s", got, `"ok"`, out)
+	if got := responseParts[0].Get("functionResponse.response.result").String(); got != "ok" {
+		t.Fatalf("functionResponse result = %q, want %q. Output: %s", got, "ok", out)
 	}
 }

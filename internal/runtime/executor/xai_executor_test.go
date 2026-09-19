@@ -6559,6 +6559,89 @@ func TestXAIExecutorAliasesClientWebSearchFunctionInRequest(t *testing.T) {
 	}
 }
 
+func TestXAIExecutorAliasesClientWebSearchAlongsideFoldedWebSearchNamespace(t *testing.T) {
+	t.Parallel()
+
+	var childTools []string
+	for i := range xaiMaxTools {
+		childTools = append(childTools, fmt.Sprintf(`{"type":"function","name":"tool_%d","parameters":{"type":"object"}}`, i))
+	}
+	namespaceTool := fmt.Sprintf(`{"type":"namespace","name":"web_search","tools":[%s]}`, strings.Join(childTools, ","))
+	payload := func(choice string) []byte {
+		return []byte(fmt.Sprintf(`{
+			"model":"grok-4.6",
+			"tools":[%s,{"type":"function","name":"web_search","parameters":{"type":"object"}}],
+			"input":[
+				{"type":"function_call","name":"tool_7","namespace":"web_search","call_id":"namespace_call","arguments":"{}"},
+				{"type":"function_call","name":"web_search","call_id":"client_call","arguments":"{}"}
+			],
+			"tool_choice":%s
+		}`, namespaceTool, choice))
+	}
+
+	exec := NewXAIExecutor(&config.Config{})
+	prepare := func(t *testing.T, choice string) *xaiPreparedRequest {
+		t.Helper()
+		prepared, err := exec.prepareResponsesRequest(context.Background(), cliproxyexecutor.Request{
+			Model:   "grok-4.6",
+			Payload: payload(choice),
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}, false)
+		if err != nil {
+			t.Fatalf("prepareResponsesRequest() error = %v", err)
+		}
+		return prepared
+	}
+
+	prepared := prepare(t, `{"type":"function","name":"web_search"}`)
+	if prepared.webSearchAlias != xaiClientWebSearchAlias {
+		t.Fatalf("webSearchAlias = %q, want %q", prepared.webSearchAlias, xaiClientWebSearchAlias)
+	}
+	tools := gjson.GetBytes(prepared.body, "tools").Array()
+	if len(tools) != 2 {
+		t.Fatalf("tools length = %d, want folded dispatcher plus client function; body=%s", len(tools), prepared.body)
+	}
+	if got := tools[0].Get("name").String(); got != "web_search" {
+		t.Fatalf("dispatcher name = %q, want web_search; body=%s", got, prepared.body)
+	}
+	if got := len(tools[0].Get("parameters.properties.name.enum").Array()); got != xaiMaxTools {
+		t.Fatalf("dispatcher child count = %d, want %d; body=%s", got, xaiMaxTools, prepared.body)
+	}
+	if got := tools[1].Get("name").String(); got != xaiClientWebSearchAlias {
+		t.Fatalf("client function name = %q, want %q; body=%s", got, xaiClientWebSearchAlias, prepared.body)
+	}
+	if got := gjson.GetBytes(prepared.body, "tool_choice.name").String(); got != xaiClientWebSearchAlias {
+		t.Fatalf("client tool_choice name = %q, want %q; body=%s", got, xaiClientWebSearchAlias, prepared.body)
+	}
+	if got := gjson.GetBytes(prepared.body, "input.0.name").String(); got != "web_search" {
+		t.Fatalf("folded namespace history name = %q, want dispatcher web_search; body=%s", got, prepared.body)
+	}
+	if got := gjson.GetBytes(prepared.body, "input.1.name").String(); got != xaiClientWebSearchAlias {
+		t.Fatalf("client history name = %q, want %q; body=%s", got, xaiClientWebSearchAlias, prepared.body)
+	}
+
+	namespaceChoice := prepare(t, `{"type":"function","name":"tool_7","namespace":"web_search"}`)
+	if got := gjson.GetBytes(namespaceChoice.body, "tool_choice.name").String(); got != "web_search" {
+		t.Fatalf("namespace tool_choice name = %q, want dispatcher web_search; body=%s", got, namespaceChoice.body)
+	}
+	if gjson.GetBytes(namespaceChoice.body, "tool_choice.namespace").Exists() {
+		t.Fatalf("namespace tool_choice namespace should be folded away; body=%s", namespaceChoice.body)
+	}
+
+	dispatcherEvent := []byte(`{"type":"response.output_item.done","item":{"type":"function_call","name":"web_search","call_id":"namespace_call","arguments":"{\"name\":\"tool_7\",\"arguments\":{}}"}}`)
+	restoredDispatcher := restoreXAINamespaceToolCalls(dispatcherEvent, prepared.namespaceTools)
+	if got := gjson.GetBytes(restoredDispatcher, "item.name").String(); got != "tool_7" {
+		t.Fatalf("restored dispatcher name = %q, want tool_7; event=%s", got, restoredDispatcher)
+	}
+	if got := gjson.GetBytes(restoredDispatcher, "item.namespace").String(); got != "web_search" {
+		t.Fatalf("restored dispatcher namespace = %q, want web_search; event=%s", got, restoredDispatcher)
+	}
+	clientEvent := []byte(`{"type":"response.output_item.done","item":{"type":"function_call","name":"clientfn_web_search","call_id":"client_call","arguments":"{}"}}`)
+	restoredClient := restoreXAIClientWebSearchName(clientEvent, prepared.webSearchAlias)
+	if got := gjson.GetBytes(restoredClient, "item.name").String(); got != "web_search" {
+		t.Fatalf("restored client name = %q, want web_search; event=%s", got, restoredClient)
+	}
+}
+
 func TestXAIExecutorPreservesHostedWebSearchToolType(t *testing.T) {
 	t.Parallel()
 
