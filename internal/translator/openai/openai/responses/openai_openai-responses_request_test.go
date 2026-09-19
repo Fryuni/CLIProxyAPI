@@ -167,6 +167,48 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReusedCallIDAcross
 	}
 }
 
+// An explicit output belonging to a later turn that reuses a call_id must not suppress ID
+// inference for the earlier turn's ID-less output: the earlier assistant tool call would
+// otherwise be left unmatched, which strict chat-completions upstreams reject.
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReusedCallIDDoesNotSuppressEarlierInference(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"one\"}"},
+			{"type":"function_call_output","output":"first result"},
+			{"type":"message","role":"assistant","content":"first done"},
+			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"two\"}"},
+			{"type":"function_call_output","call_id":"call_reused","output":"second result"}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5-codex", raw, false)
+	messages := gjson.GetBytes(out, "messages").Array()
+	results := []string{"first result", "second result"}
+	paired := 0
+	for i, message := range messages {
+		if !message.Get("tool_calls").Exists() {
+			continue
+		}
+		if paired >= len(results) || i+1 >= len(messages) {
+			t.Fatalf("unexpected tool-call group: %s", out)
+		}
+		result := messages[i+1]
+		if result.Get("role").String() != "tool" {
+			t.Fatalf("tool call is not followed by its result: %s", out)
+		}
+		if result.Get("tool_call_id").String() != message.Get("tool_calls.0.id").String() {
+			t.Fatalf("tool result is not bound to its owning call: %s", out)
+		}
+		if result.Get("content").String() != results[paired] {
+			t.Fatalf("tool result content = %q, want %q; output=%s", result.Get("content").String(), results[paired], out)
+		}
+		paired++
+	}
+	if paired != len(results) {
+		t.Fatalf("paired groups = %d, want %d; output=%s", paired, len(results), out)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringifiedToolOutputImages(t *testing.T) {
 	tests := []struct {
 		name         string

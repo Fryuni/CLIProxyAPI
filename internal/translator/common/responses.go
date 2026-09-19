@@ -47,9 +47,9 @@ func ExtractResponsesCallID(node gjson.Result) string {
 // NormalizeResponsesToolCallOutputs scans a slice of Responses input items,
 // pairs function_call_output / custom_tool_call_output with preceding pending tool calls,
 // and assigns missing call_ids to tool outputs using a multi-pass matching strategy:
-// 1. Exact explicit call ID match (reserving calls for outputs that explicitly reference them across the entire conversation).
-// 2. Function name match for outputs that omit a call ID (skipping pending calls reserved by future explicit outputs).
-// 3. FIFO queue fallback for remaining outputs that omit a call ID (skipping pending calls reserved by future explicit outputs).
+// 1. Exact explicit call ID match (reserving calls for outputs that explicitly reference them).
+// 2. Function name match for outputs that omit a call ID (skipping pending calls reserved by a later explicit output of their own).
+// 3. FIFO queue fallback for remaining outputs that omit a call ID (skipping pending calls reserved by a later explicit output of their own).
 // Outputs that already carry an explicit call ID that does not match any pending call
 // are never rewritten or stolen.
 func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
@@ -60,17 +60,31 @@ func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
 	normalized := make([]gjson.Result, len(items))
 	copy(normalized, items)
 
-	explicitOutputCounts := make(map[string]int)
-	for _, item := range items {
-		typ := item.Get("type").String()
-		if typ == "function_call_output" || typ == "custom_tool_call_output" {
-			if id := ExtractResponsesCallID(item); id != "" {
-				explicitOutputCounts[id]++
+	// A call reserves the nearest explicit output that follows it and carries its ID, so an
+	// ID-less output is never assigned to a call that already has one waiting. Pairing
+	// right-to-left keeps the reservation scoped to the owning call group: when a later turn
+	// reuses a call_id, that later call claims the explicit output, leaving an earlier call with
+	// the same ID free to take an ID-less output in its own group.
+	reservedExplicitOutput := make(map[int]bool)
+	unclaimedExplicitOutputs := make(map[string]int)
+	for idx := len(items) - 1; idx >= 0; idx-- {
+		id := ExtractResponsesCallID(items[idx])
+		if id == "" {
+			continue
+		}
+		switch items[idx].Get("type").String() {
+		case "function_call_output", "custom_tool_call_output":
+			unclaimedExplicitOutputs[id]++
+		case "function_call", "custom_tool_call":
+			if unclaimedExplicitOutputs[id] > 0 {
+				unclaimedExplicitOutputs[id]--
+				reservedExplicitOutput[idx] = true
 			}
 		}
 	}
 
 	var pendingCallIDs []string
+	var pendingReserved []bool
 	pendingCallNames := make(map[string]string)
 
 	i := 0
@@ -83,6 +97,7 @@ func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
 			callID := ExtractResponsesCallID(item)
 			if callID != "" {
 				pendingCallIDs = append(pendingCallIDs, callID)
+				pendingReserved = append(pendingReserved, reservedExplicitOutput[i])
 				name := item.Get("name").String()
 				pendingCallNames[callID] = name
 			}
@@ -108,7 +123,6 @@ func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
 						if !used[outIdx] && ExtractResponsesCallID(out) == pendingID {
 							used[outIdx] = true
 							matchedForPending[pendingIdx] = outIdx
-							explicitOutputCounts[pendingID]--
 							break
 						}
 					}
@@ -116,7 +130,7 @@ func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
 
 				// Pass 2: match by function name for outputs with no explicit call ID (skipping pending IDs reserved by future explicit outputs)
 				for pendingIdx, pendingID := range pendingCallIDs {
-					if matchedForPending[pendingIdx] >= 0 || explicitOutputCounts[pendingID] > 0 {
+					if matchedForPending[pendingIdx] >= 0 || pendingReserved[pendingIdx] {
 						continue
 					}
 					expectedName := pendingCallNames[pendingID]
@@ -137,7 +151,7 @@ func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
 				// Pass 3: FIFO fallback for outputs with no explicit call ID (skipping pending IDs reserved by future explicit outputs)
 				for pendingIdx := range pendingCallIDs {
 					pendingID := pendingCallIDs[pendingIdx]
-					if matchedForPending[pendingIdx] >= 0 || explicitOutputCounts[pendingID] > 0 {
+					if matchedForPending[pendingIdx] >= 0 || pendingReserved[pendingIdx] {
 						continue
 					}
 					for outIdx, out := range outputs {
@@ -155,10 +169,12 @@ func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
 
 				// Apply matched call_ids to outputs
 				var remainingPending []string
+				var remainingReserved []bool
 				for pendingIdx, pendingID := range pendingCallIDs {
 					outIdx := matchedForPending[pendingIdx]
 					if outIdx < 0 {
 						remainingPending = append(remainingPending, pendingID)
+						remainingReserved = append(remainingReserved, pendingReserved[pendingIdx])
 						continue
 					}
 					matchedOut := outputs[outIdx]
@@ -169,6 +185,7 @@ func NormalizeResponsesToolCallOutputs(items []gjson.Result) []gjson.Result {
 					}
 				}
 				pendingCallIDs = remainingPending
+				pendingReserved = remainingReserved
 			}
 
 		default:

@@ -634,16 +634,31 @@ func combineOpenAIResponsesReasoning(existing, incoming string) string {
 
 func unambiguousResponsesOutputInferences(items []gjson.Result) map[int]bool {
 	type pendingCall struct {
-		id   string
-		name string
+		id       string
+		name     string
+		reserved bool
 	}
 
-	explicitOutputCounts := make(map[string]int)
-	for _, item := range items {
-		itemType := item.Get("type").String()
-		if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
-			if callID := translatorcommon.ExtractResponsesCallID(item); callID != "" {
-				explicitOutputCounts[callID]++
+	// A call reserves the nearest explicit output that follows it and carries its ID; an ID-less
+	// output must not be inferred onto a call that already has one waiting. Pairing right-to-left
+	// keeps the reservation scoped to the owning call group: when a later turn reuses a call_id,
+	// that later call claims the explicit output, so an earlier call with the same ID stays free
+	// to take an otherwise unambiguous ID-less output in its own group.
+	reservedExplicitOutput := make(map[int]bool)
+	unclaimedExplicitOutputs := make(map[string]int)
+	for index := len(items) - 1; index >= 0; index-- {
+		item := items[index]
+		callID := translatorcommon.ExtractResponsesCallID(item)
+		if callID == "" {
+			continue
+		}
+		switch item.Get("type").String() {
+		case "function_call_output", "custom_tool_call_output":
+			unclaimedExplicitOutputs[callID]++
+		case "function_call", "custom_tool_call":
+			if unclaimedExplicitOutputs[callID] > 0 {
+				unclaimedExplicitOutputs[callID]--
+				reservedExplicitOutput[index] = true
 			}
 		}
 	}
@@ -655,7 +670,11 @@ func unambiguousResponsesOutputInferences(items []gjson.Result) map[int]bool {
 		itemType := item.Get("type").String()
 		if itemType == "function_call" || itemType == "custom_tool_call" {
 			if callID := translatorcommon.ExtractResponsesCallID(item); callID != "" {
-				pending = append(pending, pendingCall{id: callID, name: strings.TrimSpace(item.Get("name").String())})
+				pending = append(pending, pendingCall{
+					id:       callID,
+					name:     strings.TrimSpace(item.Get("name").String()),
+					reserved: reservedExplicitOutput[index],
+				})
 			}
 			index++
 			continue
@@ -680,7 +699,6 @@ func unambiguousResponsesOutputInferences(items []gjson.Result) map[int]bool {
 			if callID == "" {
 				continue
 			}
-			explicitOutputCounts[callID]--
 			for pendingIndex, call := range pending {
 				if !matchedPending[pendingIndex] && call.id == callID {
 					matchedPending[pendingIndex] = true
@@ -702,7 +720,7 @@ func unambiguousResponsesOutputInferences(items []gjson.Result) map[int]bool {
 					continue
 				}
 				for pendingIndex, call := range pending {
-					if matchedPending[pendingIndex] || explicitOutputCounts[call.id] > 0 {
+					if matchedPending[pendingIndex] || call.reserved {
 						continue
 					}
 					if outputName != "" && call.name != outputName {
