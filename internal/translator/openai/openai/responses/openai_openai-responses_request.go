@@ -33,6 +33,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	out := []byte(`{"model":"","messages":[],"stream":false}`)
 
 	root := gjson.ParseBytes(rawJSON)
+	toolIndex := newResponsesToolIndex(root)
 
 	messages := make([][]byte, 0)
 	appendMessage := func(message []byte) {
@@ -90,13 +91,51 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			inputItems[idx] = gjson.ParseBytes(raw)
 		}
 
+		hasReasoningInSession := false
+		if effortRes := root.Get("reasoning.effort"); effortRes.Exists() {
+			effort := strings.ToLower(strings.TrimSpace(effortRes.String()))
+			if effort != "" && effort != "none" && effort != "0" && effort != "false" {
+				hasReasoningInSession = true
+			}
+		} else if effortRes := root.Get("reasoning_effort"); effortRes.Exists() {
+			effort := strings.ToLower(strings.TrimSpace(effortRes.String()))
+			if effort != "" && effort != "none" && effort != "0" && effort != "false" {
+				hasReasoningInSession = true
+			}
+		} else if reasoningObj := root.Get("reasoning"); reasoningObj.Exists() {
+			reasoningRaw := strings.ToLower(strings.TrimSpace(reasoningObj.String()))
+			if reasoningRaw != "" && reasoningRaw != "none" && reasoningRaw != "false" && reasoningRaw != "{}" {
+				hasReasoningInSession = true
+			}
+		}
+		if !hasReasoningInSession {
+			for _, item := range rawInputArray {
+				itemType := item.Get("type").String()
+				if itemType == "reasoning" || item.Get("reasoning_content").Exists() {
+					hasReasoningInSession = true
+					break
+				}
+			}
+		}
+
 		pendingToolCalls := make([]interface{}, 0)
 		pendingToolCallIDs := make([]string, 0)
 		pendingReasoningContent := ""
+		latestReasoningContent := ""
 		awaitingToolOutputs := make(map[string]struct{})
 		outputCountsByPendingGroup := make(map[string]int)
 		toolCallAssistantByID := make(map[string]int)
 		mergeableAssistantIndex := -1
+
+		fallbackToolReasoning := func() string {
+			if latestReasoningContent != "" {
+				return latestReasoningContent
+			}
+			if hasReasoningInSession {
+				return "[reasoning unavailable]"
+			}
+			return ""
+		}
 
 		takePendingReasoningContent := func() string {
 			reasoningContent := pendingReasoningContent
@@ -118,6 +157,11 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					combinedReasoning := combineOpenAIResponsesReasoning(assistantMessage.Get("reasoning_content").String(), reasoningContent)
 					if combinedReasoning != "" {
 						updatedMessage, _ = sjson.SetBytes(updatedMessage, "reasoning_content", combinedReasoning)
+						if isUsableResponsesReasoning(combinedReasoning) {
+							latestReasoningContent = combinedReasoning
+						}
+					} else if fallback := fallbackToolReasoning(); fallback != "" {
+						updatedMessage, _ = sjson.SetBytes(updatedMessage, "reasoning_content", fallback)
 					}
 					messages[mergeableAssistantIndex] = updatedMessage
 					mergedIntoAssistant = true
@@ -128,6 +172,11 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				assistantMessage, _ = sjson.SetBytes(assistantMessage, "tool_calls", pendingToolCalls)
 				if reasoningContent != "" {
 					assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", reasoningContent)
+					if isUsableResponsesReasoning(reasoningContent) {
+						latestReasoningContent = reasoningContent
+					}
+				} else if fallback := fallbackToolReasoning(); fallback != "" {
+					assistantMessage, _ = sjson.SetBytes(assistantMessage, "reasoning_content", fallback)
 				}
 				appendMessage(assistantMessage)
 				assistantIndex = len(messages) - 1
@@ -154,6 +203,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if reasoningContent == "" {
 				return
 			}
+			if isUsableResponsesReasoning(reasoningContent) {
+				latestReasoningContent = reasoningContent
+			}
 			message := []byte(`{"role":"assistant","content":"","reasoning_content":""}`)
 			message, _ = sjson.SetBytes(message, "reasoning_content", reasoningContent)
 			appendRegularMessage(message)
@@ -178,6 +230,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				mergeableAssistantIndex = -1
 				if role != "assistant" {
 					appendPendingReasoningMessage()
+					latestReasoningContent = ""
 				}
 				message := []byte(`{"role":"","content":[]}`)
 				message, _ = sjson.SetBytes(message, "role", role)
@@ -195,6 +248,20 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 							text := contentItem.Get("text").String()
 							contentPart := []byte(`{"type":"text","text":""}`)
 							contentPart, _ = sjson.SetBytes(contentPart, "text", text)
+							contentItems = append(contentItems, contentPart)
+						case "input_video", "video_url":
+							contentPart := []byte(`{"type":"video_url","video_url":{}}`)
+							videoURL := contentItem.Get("video_url")
+							if videoURL.IsObject() {
+								contentPart, _ = sjson.SetRawBytes(contentPart, "video_url", []byte(videoURL.Raw))
+							} else if videoURL.Exists() {
+								contentPart, _ = sjson.SetRawBytes(contentPart, "video_url.url", []byte(videoURL.Raw))
+							}
+							if processing := contentItem.Get("processing"); processing.Exists() {
+								contentPart, _ = sjson.SetRawBytes(contentPart, "video_url.processing", []byte(processing.Raw))
+							}
+							// Preserve malformed video parts for upstream validation instead of
+							// silently turning a video request into a text-only request.
 							contentItems = append(contentItems, contentPart)
 						case "input_image":
 							imageURL := contentItem.Get("image_url").String()
@@ -216,6 +283,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					reasoningContent := combineOpenAIResponsesReasoning(takePendingReasoningContent(), item.Get("reasoning_content").String())
 					if reasoningContent != "" {
 						message, _ = sjson.SetBytes(message, "reasoning_content", reasoningContent)
+						if isUsableResponsesReasoning(reasoningContent) {
+							latestReasoningContent = reasoningContent
+						}
 					}
 				}
 
@@ -227,9 +297,16 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			case "reasoning":
 				reasoningContent := collectOpenAIResponsesReasoningContent(item)
 				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, reasoningContent)
+				if isUsableResponsesReasoning(reasoningContent) {
+					latestReasoningContent = reasoningContent
+				}
 
 			case "function_call":
-				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, item.Get("reasoning_content").String())
+				rc := item.Get("reasoning_content").String()
+				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, rc)
+				if isUsableResponsesReasoning(rc) {
+					latestReasoningContent = rc
+				}
 				// Buffer consecutive function calls and emit them as one assistant message.
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
@@ -240,9 +317,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if name := item.Get("name"); name.Exists() {
 					functionName := name.String()
 					if namespace := strings.TrimSpace(item.Get("namespace").String()); namespace != "" {
-						functionName = chatNameForResponsesNamespaceToolCall(inputRawJSON, namespace, functionName)
+						functionName = toolIndex.namespaceName(namespace, functionName)
 					} else {
-						functionName = canonicalResponsesToolName(inputRawJSON, functionName)
+						functionName = toolIndex.canonicalName(functionName)
 					}
 					toolCall, _ = sjson.SetBytes(toolCall, "function.name", functionName)
 				}
@@ -283,7 +360,11 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 			case "custom_tool_call":
-				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, item.Get("reasoning_content").String())
+				rc := item.Get("reasoning_content").String()
+				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, rc)
+				if isUsableResponsesReasoning(rc) {
+					latestReasoningContent = rc
+				}
 				// Codex freeform tool call replay: wrap the raw input so it
 				// matches the {"input": string} function shape used when
 				// converting custom tool definitions.
@@ -291,9 +372,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				toolCall, _ = sjson.SetBytes(toolCall, "id", translatorcommon.ExtractResponsesCallID(item))
 				functionName := item.Get("name").String()
 				if namespace := item.Get("namespace").String(); namespace != "" {
-					functionName = chatNameForResponsesNamespaceToolCall(inputRawJSON, namespace, functionName)
+					functionName = toolIndex.namespaceName(namespace, functionName)
 				} else {
-					functionName = canonicalResponsesToolName(inputRawJSON, functionName)
+					functionName = toolIndex.canonicalName(functionName)
 				}
 				toolCall, _ = sjson.SetBytes(toolCall, "function.name", functionName)
 				wrappedArgs, _ := sjson.SetBytes([]byte(`{"input":""}`), "input", item.Get("input").String())
@@ -351,7 +432,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	// "additional_tools" input item instead of the top-level "tools" field,
 	// so merge both sources.
 	var chatCompletionsTools []interface{}
-	for _, chatTool := range mergeResponsesRequestChatTools(root) {
+	for _, chatTool := range toolIndex.chatTools() {
 		chatCompletionsTools = append(chatCompletionsTools, gjson.ParseBytes(chatTool).Value())
 	}
 	if len(chatCompletionsTools) > 0 {
@@ -360,7 +441,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			out, _ = sjson.SetBytes(out, "parallel_tool_calls", parallelToolCalls.Bool())
 		}
 		if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
-			out, _ = sjson.SetRawBytes(out, "tool_choice", convertResponsesToolChoiceToChatCompletions(toolChoice, inputRawJSON))
+			out, _ = sjson.SetRawBytes(out, "tool_choice", convertResponsesToolChoiceWithIndex(toolChoice, toolIndex))
 		}
 	}
 
@@ -375,6 +456,10 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 }
 
 func convertResponsesToolChoiceToChatCompletions(toolChoice gjson.Result, inputRawJSON []byte) []byte {
+	return convertResponsesToolChoiceWithIndex(toolChoice, newResponsesToolIndex(gjson.ParseBytes(inputRawJSON)))
+}
+
+func convertResponsesToolChoiceWithIndex(toolChoice gjson.Result, toolIndex *responsesToolIndex) []byte {
 	if !toolChoice.IsObject() {
 		return []byte(toolChoice.Raw)
 	}
@@ -403,9 +488,9 @@ func convertResponsesToolChoiceToChatCompletions(toolChoice gjson.Result, inputR
 		namespace = strings.TrimSpace(toolChoice.Get("custom.namespace").String())
 	}
 	if namespace != "" {
-		name = chatNameForResponsesNamespaceToolCall(inputRawJSON, namespace, name)
+		name = toolIndex.namespaceName(namespace, name)
 	} else {
-		name = canonicalResponsesToolName(inputRawJSON, name)
+		name = toolIndex.canonicalName(name)
 	}
 
 	converted := []byte(`{"type":"function","function":{"name":""}}`)
@@ -751,4 +836,9 @@ func unambiguousResponsesOutputInferences(items []gjson.Result) map[int]bool {
 		pending = remainingPending
 	}
 	return unambiguous
+}
+
+func isUsableResponsesReasoning(reasoning string) bool {
+	trimmed := strings.TrimSpace(reasoning)
+	return trimmed != "" && trimmed != "[reasoning unavailable]"
 }
