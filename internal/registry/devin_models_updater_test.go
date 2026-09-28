@@ -80,11 +80,20 @@ func TestDevinModelRefreshNotifiesRegistrations(t *testing.T) {
 	// Startup changes must also be delivered if registration happens later.
 	tryRefreshDevinModels(context.Background(), "startup test")
 	var notifications [][]string
+	expectedModel := "devin/first"
+	assertCatalog := func() {
+		t.Helper()
+		var ids []string
+		for _, model := range GetDevinModels() {
+			ids = append(ids, model.ID)
+		}
+		if want := []string{expectedModel, devinBuiltinSWE16SlowID}; !reflect.DeepEqual(ids, want) {
+			t.Errorf("catalog = %v, want %v", ids, want)
+		}
+	}
 	SetModelRefreshCallback(func(providers []string) {
 		notifications = append(notifications, append([]string(nil), providers...))
-		if models := GetDevinModels(); len(models) != 1 {
-			t.Errorf("refresh callback saw %d models", len(models))
-		}
+		assertCatalog()
 	})
 	if !reflect.DeepEqual(notifications, [][]string{{"devin"}}) {
 		t.Fatalf("startup notifications = %v", notifications)
@@ -94,13 +103,12 @@ func TestDevinModelRefreshNotifiesRegistrations(t *testing.T) {
 		t.Fatalf("unchanged catalog triggered callback: %v", notifications)
 	}
 	data = `{"devin":[{"id":"devin/replacement"}]}`
+	expectedModel = "devin/replacement"
 	tryRefreshDevinModels(context.Background(), "changed test")
 	if !reflect.DeepEqual(notifications, [][]string{{"devin"}, {"devin"}}) {
 		t.Fatalf("changed catalog notifications = %v", notifications)
 	}
-	if models := GetDevinModels(); len(models) != 1 || models[0].ID != "devin/replacement" {
-		t.Fatalf("catalog = %v", models)
-	}
+	assertCatalog()
 	data = `invalid JSON`
 	tryRefreshDevinModels(context.Background(), "rejected test")
 	if len(notifications) != 2 {

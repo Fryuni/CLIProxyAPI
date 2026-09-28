@@ -4,18 +4,19 @@
 and returns the upstream transcription response. Use the same proxy API key
 and configured model IDs as other `/v1` endpoints.
 
-Configure a transcription model under `openai-compatibility`. For example, an
+Configure a transcription model under `api-keys.openai-compatibility`. For example, an
 OpenAI configuration can expose `whisper-1` as `speech`:
 
 ```yaml
-openai-compatibility:
-  - name: openai-audio
-    base-url: https://api.openai.com/v1
-    api-key-entries:
-      - api-key: YOUR_OPENAI_API_KEY
-    models:
-      - name: whisper-1
-        alias: speech
+api-keys:
+  openai-compatibility:
+    - name: openai-audio
+      base-url: https://api.openai.com/v1
+      keys:
+        - api-key: YOUR_OPENAI_API_KEY
+      models:
+        - name: whisper-1
+          alias: speech
 ```
 
 For OpenRouter or another compatible service, use its API base URL, API key,
