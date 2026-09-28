@@ -80,15 +80,21 @@ func fetchDevinModelsFromRemote(ctx context.Context) ([]byte, string) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			if errClose := resp.Body.Close(); errClose != nil {
+				log.Warnf("devin models updater: response close failed for %s: %v", sourceURL, errClose)
+			}
 			log.Warnf("devin models updater: unexpected status %d from %s", resp.StatusCode, sourceURL)
-			_ = resp.Body.Close()
 			continue
 		}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxDevinModelsSize))
-		_ = resp.Body.Close()
-		if err != nil {
-			log.Warnf("devin models updater: read failed from %s: %v", sourceURL, err)
+		body, errRead := io.ReadAll(io.LimitReader(resp.Body, maxDevinModelsSize))
+		errClose := resp.Body.Close()
+		if errRead != nil {
+			log.Warnf("devin models updater: read failed from %s: %v", sourceURL, errRead)
+			continue
+		}
+		if errClose != nil {
+			log.Warnf("devin models updater: response close failed for %s: %v", sourceURL, errClose)
 			continue
 		}
 
