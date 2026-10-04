@@ -83,6 +83,7 @@ type requestRetryAttempt struct {
 	modelErrors           map[string]*Error
 	modelCooldownApplied  map[string]bool
 	generation            uint64
+	registrationEpoch     uint64
 }
 
 func (attempt requestRetryAttempt) errorForModel(model string) *Error {
@@ -149,6 +150,7 @@ func withRequestRetryAttemptedAuths(ctx context.Context, attempted map[string]re
 			resultError:           cloneError(attempt.resultError),
 			resultCooldownApplied: attempt.resultCooldownApplied,
 			generation:            attempt.generation,
+			registrationEpoch:     attempt.registrationEpoch,
 		}
 		if len(attempt.modelCooldownApplied) > 0 {
 			attemptSnapshot.modelCooldownApplied = make(map[string]bool, len(attempt.modelCooldownApplied))
@@ -1080,6 +1082,9 @@ func (m *Manager) pickViaBuiltinCandidates(ctx context.Context, strategy schedul
 	}
 	key := strings.Join(normalized, ",") + ":" + canonicalModelKey(model)
 	m.pluginBuiltinMixedMu.Lock()
+	if _, ok := m.pluginBuiltinMixedOffsets[key]; !ok && len(m.pluginBuiltinMixedOffsets) >= 4096 {
+		m.pluginBuiltinMixedOffsets = make(map[string]int)
+	}
 	slot := m.pluginBuiltinMixedOffsets[key] % total
 	m.pluginBuiltinMixedOffsets[key] = slot + 1
 	m.pluginBuiltinMixedMu.Unlock()
@@ -1319,7 +1324,7 @@ func credentialRetryRoundStateEligible(lastErr *Error, quotaExceeded bool) bool 
 // server-error cooldown when this request recorded HTTP 500 for the auth.
 // The stored auth remains cooled for other requests.
 func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt requestRetryAttempt) *Auth {
-	if auth == nil || attempt.generation == 0 || auth.Generation != attempt.generation {
+	if auth == nil || attempt.generation == 0 || auth.Generation != attempt.generation || auth.RegistrationEpoch != attempt.registrationEpoch {
 		return auth
 	}
 	clone := auth.Clone()

@@ -1028,7 +1028,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if authSnapshot != nil {
-		recordAttemptedAuthResult(ctx, result, authSnapshot.Generation, resultCooldownApplied)
+		recordAttemptedAuthResult(ctx, result, authSnapshot.Generation, authSnapshot.RegistrationEpoch, resultCooldownApplied)
 	}
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -1959,6 +1960,22 @@ func TestManagerPluginSchedulerDelegateMixedRoundRobinDoesNotPreferWebsocketAuth
 		if counts[auth.ID] != 1 {
 			t.Fatalf("mixed websocket picks = %#v, want each candidate once", counts)
 		}
+	}
+}
+
+func TestManagerPluginBuiltinMixedOffsetsAreBounded(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	for index := 0; index < 4096; index++ {
+		manager.pluginBuiltinMixedOffsets["codex,gemini:model-"+strconv.Itoa(index)] = 1
+	}
+	candidates := []*Auth{{ID: "codex-a", Provider: "codex"}, {ID: "gemini-a", Provider: "gemini"}}
+
+	picked, errPick := manager.pickViaBuiltinCandidates(context.Background(), schedulerStrategyRoundRobin, "mixed", []string{"codex", "gemini"}, "new-model", cliproxyexecutor.Options{}, candidates)
+	if errPick != nil || picked == nil {
+		t.Fatalf("pickViaBuiltinCandidates() = (%#v, %v), want a candidate", picked, errPick)
+	}
+	if got := len(manager.pluginBuiltinMixedOffsets); got != 1 {
+		t.Fatalf("pluginBuiltinMixedOffsets size = %d, want reset to the new key only", got)
 	}
 }
 

@@ -1271,7 +1271,7 @@ func withAttemptedAuthResultTracker(ctx context.Context, attempted map[string]re
 	return context.WithValue(ctx, attemptedAuthResultTrackerContextKey{}, attempted)
 }
 
-func recordAttemptedAuthResult(ctx context.Context, result Result, generation uint64, cooldownApplied bool) {
+func recordAttemptedAuthResult(ctx context.Context, result Result, generation, registrationEpoch uint64, cooldownApplied bool) {
 	if ctx == nil || result.AuthID == "" || result.Success {
 		return
 	}
@@ -1283,6 +1283,7 @@ func recordAttemptedAuthResult(ctx context.Context, result Result, generation ui
 	attempt.resultError = cloneError(result.Error)
 	attempt.resultCooldownApplied = cooldownApplied
 	attempt.generation = generation
+	attempt.registrationEpoch = registrationEpoch
 	if model := canonicalModelKey(result.Model); model != "" {
 		if attempt.modelErrors == nil {
 			attempt.modelErrors = make(map[string]*Error)

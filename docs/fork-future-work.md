@@ -61,3 +61,14 @@ reviewers can see they were considered. Raise them upstream if they matter.
   (`internal/api/handlers/management/config_basic.go`, upstream `3be5fa44`):
   `WriteConfig` normalizes V8-layout YAML for both `/v8` and the deprecated
   `/v0` `PUT config.yaml` routes.
+- **Devin OAuth callback with TLS enabled**
+  (`internal/api/handlers/management/auth_files_devin_oauth.go`, upstream
+  `cca35aee`): the redirect URI is always plain `http://` loopback on the main
+  server port. When `tls.enable` is set, that port only serves HTTPS, so Devin
+  OAuth cannot complete. A dedicated plaintext loopback callback listener would
+  fix it. Flagged as high severity.
+- **Devin catalog refresh does not notify listeners**
+  (`internal/registry/devin_models_updater.go`): a periodic Devin catalog
+  update does not invoke the model-refresh callback. Registered models, and
+  therefore `/models` and routing, stay on the old catalog until the next
+  reload.
