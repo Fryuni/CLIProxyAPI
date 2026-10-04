@@ -122,6 +122,12 @@ reviewers can see they were considered. Raise them upstream if they matter.
   and flow into usage `TraceID`. The public docs on `usage.Record.TraceID`
   (`sdk/cliproxy/usage/manager.go`) and `pluginapi.UsageRecord.TraceID`
   (`sdk/pluginapi/types.go`) still say "8-character hex".
+- **Alias-specific `use-max-completion-tokens`**
+  (`ShouldUseMaxCompletionTokensForModel` in
+  `internal/runtime/executor/helps/openai_compat_max_tokens.go`): the upstream
+  model name is matched before the requested alias, and the first matching
+  entry wins. When several aliases share one upstream model, the first entry's
+  setting applies to all of them and overrides alias-specific values.
 - **Failed Interactions streams end with success events**
   (`internal/translator/interactions/claude` and
   `internal/translator/claude/interactions`): Interactions stream failures can
