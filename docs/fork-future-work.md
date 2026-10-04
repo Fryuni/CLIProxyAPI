@@ -45,20 +45,40 @@ The fork used to carry these fixes. The reset restored upstream's behavior.
 
 ## HTTP 500 retry follow-ups
 
-### Narrow the HTTP 500 bypass guard to the failing model
+### Tighten the HTTP 500 retry-round bypass guard
 
-- Where: `http500RetryRoundCandidate` in `sdk/cliproxy/auth/conductor_selection.go`.
-- Problem: the retry-round bypass applies only while the auth's `Generation`
-  still matches the value recorded for this request's HTTP 500. Every
-  `MarkResult` bumps `Generation`, so a concurrent result for a different
-  model on the same credential suppresses the bypass. The guard fails safe:
-  the request falls back to the regular cooldown behavior. But on busy
-  credentials the immediate retry happens less often than intended.
-- Fix: for model-scoped results, record the failing model state's cooldown
-  deadline and error with the attempt. Bypass only while that model state is
-  unchanged, plus the existing `RegistrationEpoch` check. Keep the
-  auth-wide generation check for auth-scoped results. Cover it with a test
-  that marks a concurrent result for another model between rounds.
+- Where: `recordAttemptedAuthResult` / `requestRetryAttempt` and
+  `http500RetryRoundCandidate` in `sdk/cliproxy/auth`, plus `MarkResult` in
+  `conductor_cooldown.go`.
+- Background: a request that got HTTP 500 may retry the same credential in its
+  next retry round. Selection uses a request-scoped clone that clears the
+  cooldown the 500 set. The stored credential stays cooled for other requests.
+  The guard is coarse, which leaves these concurrency gaps:
+  - **Unrelated results suppress the bypass.** The guard requires the auth-wide
+    `Generation` to match the recorded value. Every `MarkResult` bumps it, so a
+    concurrent result for another model on the same credential disables the
+    bypass. This fails safe (the request falls back to the regular cooldown
+    wait), but busy credentials retry immediately less often than intended.
+  - **Overlapping cooldowns are cleared together.** If a concurrent request
+    records a 503 and this request's 500 lands just after it with a later
+    deadline, the 500 is treated as the only cause of the cooldown. The bypass
+    then clears the whole deadline, including the still-active 503 cooldown.
+  - **Stale results after re-registration.** `MarkResult` resolves results by
+    auth ID only (upstream behavior), and the attempt records the epoch it
+    reads after the update. A request that selected registration epoch 1 and
+    finishes after the ID is re-registered (epoch 2) therefore marks epoch 2,
+    and its next round can bypass epoch 2's cooldown.
+- Impact: every gap is request-scoped and at worst causes one extra upstream
+  attempt against a credential that is cooling down for another reason.
+  Stored state and other requests are unaffected.
+- Fix: carry the selected credential's `RegistrationEpoch` through execution
+  into `Result`, and drop or ignore stale results in `MarkResult`. Record in the
+  attempt the model-state deadline this result set, plus any foreign cooldown
+  already active before it. Bypass only while the stored model state still
+  carries that deadline, and restore the foreign deadline instead of clearing
+  to zero. Keep the auth-wide check only for auth-scoped results. Add tests for
+  each gap: a concurrent other-model result, a 503 then a 500, and a stale
+  result after re-registration.
 
 ## Upstream behavior flagged in review
 
