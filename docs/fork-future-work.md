@@ -109,3 +109,14 @@ reviewers can see they were considered. Raise them upstream if they matter.
   update does not invoke the model-refresh callback. Registered models, and
   therefore `/models` and routing, stay on the old catalog until the next
   reload.
+- **Devin catalog fetch timeout** (`fetchDevinModelsFromRemote` in
+  `internal/registry/devin_models_updater.go`): the client and request
+  deadlines stay active while the catalog body is read. AGENTS.md limits
+  timeouts to credential acquisition and the listed exceptions, and model
+  catalog refresh is not one of them.
+- **Failed Interactions streams end with success events**
+  (`internal/translator/interactions/claude` and
+  `internal/translator/claude/interactions`): Interactions stream failures can
+  be translated into Claude terminal events that signal success. Per
+  AGENTS.md, translator fixes should land alongside broader changes or
+  upstream.
