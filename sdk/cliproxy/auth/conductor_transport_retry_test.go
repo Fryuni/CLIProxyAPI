@@ -364,6 +364,30 @@ func TestHTTP500RetryRoundBypassesAuthCooldownWithUnrelatedModelState(t *testing
 	}
 }
 
+func TestHTTP500RetryRoundBypassRequiresRecordedRegistrationEpoch(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:                "re-registered-http-500",
+		Provider:          "codex",
+		Status:            StatusError,
+		Generation:        2,
+		RegistrationEpoch: 2,
+		Unavailable:       true,
+		NextRetryAfter:    now.Add(time.Minute),
+		LastError:         &Error{HTTPStatus: http.StatusInternalServerError, Message: "replacement failure"},
+	}
+	attempt := requestRetryAttempt{
+		resultError:           &Error{HTTPStatus: http.StatusInternalServerError, Message: "stale request failure"},
+		resultCooldownApplied: true,
+		generation:            auth.Generation,
+		registrationEpoch:     1,
+	}
+
+	if candidate := http500RetryRoundCandidate(auth, "", now, attempt); candidate != auth {
+		t.Fatalf("http500RetryRoundCandidate() = %#v, want stored auth for a stale registration epoch", candidate)
+	}
+}
+
 func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
@@ -416,8 +440,8 @@ func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
 		-1,
 		1,
 		map[string]requestRetryAttempt{
-			http500AuthID:     {resultError: &Error{HTTPStatus: http.StatusInternalServerError}, resultCooldownApplied: true, generation: http500Auth.Generation},
-			rateLimitedAuthID: {resultError: rateLimitErr, generation: rateLimitedAuth.Generation},
+			http500AuthID:     {resultError: &Error{HTTPStatus: http.StatusInternalServerError}, resultCooldownApplied: true, generation: http500Auth.Generation, registrationEpoch: http500Auth.RegistrationEpoch},
+			rateLimitedAuthID: {resultError: rateLimitErr, generation: rateLimitedAuth.Generation, registrationEpoch: rateLimitedAuth.RegistrationEpoch},
 		},
 	)
 	if !shouldRetry || wait != 0 {
@@ -532,6 +556,7 @@ func TestHTTP500RetryBypassRequiresRecordedGeneration(t *testing.T) {
 					modelErrors:          map[string]*Error{model: {HTTPStatus: tc.requestStatus, Message: "this request failure"}},
 					modelCooldownApplied: map[string]bool{model: true},
 					generation:           requestAuth.Generation,
+					registrationEpoch:    requestAuth.RegistrationEpoch,
 				},
 			}
 			selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)

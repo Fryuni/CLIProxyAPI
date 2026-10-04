@@ -61,21 +61,23 @@ func tryRefreshDevinModels(ctx context.Context, label string) {
 		return
 	}
 	log.Infof("%s completed from %s, catalog updated", label, sourceURL)
-	notifyModelRefresh([]string{"devin"})
 }
 
 func fetchDevinModelsFromRemote(ctx context.Context) ([]byte, string) {
-	client := &http.Client{}
+	client := &http.Client{Timeout: modelsFetchTimeout}
 	for _, sourceURL := range devinModelsURLs {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
-		if err != nil {
-			log.Warnf("devin models updater: invalid request for %s: %v", sourceURL, err)
+		reqCtx, cancel := context.WithTimeout(ctx, modelsFetchTimeout)
+		req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, sourceURL, nil)
+		if errReq != nil {
+			cancel()
+			log.Warnf("devin models updater: invalid request for %s: %v", sourceURL, errReq)
 			continue
 		}
 
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Warnf("devin models updater: fetch failed from %s: %v", sourceURL, err)
+		resp, errDo := client.Do(req)
+		if errDo != nil {
+			cancel()
+			log.Warnf("devin models updater: fetch failed from %s: %v", sourceURL, errDo)
 			continue
 		}
 
@@ -83,12 +85,14 @@ func fetchDevinModelsFromRemote(ctx context.Context) ([]byte, string) {
 			if errClose := resp.Body.Close(); errClose != nil {
 				log.Warnf("devin models updater: response close failed for %s: %v", sourceURL, errClose)
 			}
+			cancel()
 			log.Warnf("devin models updater: unexpected status %d from %s", resp.StatusCode, sourceURL)
 			continue
 		}
 
 		body, errRead := io.ReadAll(io.LimitReader(resp.Body, maxDevinModelsSize))
 		errClose := resp.Body.Close()
+		cancel()
 		if errRead != nil {
 			log.Warnf("devin models updater: read failed from %s: %v", sourceURL, errRead)
 			continue

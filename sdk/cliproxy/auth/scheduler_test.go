@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -1959,6 +1960,55 @@ func TestManagerPluginSchedulerDelegateMixedRoundRobinDoesNotPreferWebsocketAuth
 		if counts[auth.ID] != 1 {
 			t.Fatalf("mixed websocket picks = %#v, want each candidate once", counts)
 		}
+	}
+}
+
+func TestManagerPluginSchedulerDelegateMixedHonorsGlobalPriority(t *testing.T) {
+	for _, strategy := range []string{pluginapi.SchedulerBuiltinRoundRobin, pluginapi.SchedulerBuiltinFillFirst} {
+		t.Run(strategy, func(t *testing.T) {
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.executors["codex"] = schedulerTestExecutor{}
+			manager.executors["gemini"] = schedulerTestExecutor{}
+			for _, auth := range []*Auth{
+				{ID: "a-codex-low", Provider: "codex", Attributes: map[string]string{"priority": "5"}},
+				{ID: "b-gemini-high", Provider: "gemini", Attributes: map[string]string{"priority": "10"}},
+			} {
+				if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+					t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+				}
+			}
+			manager.SetPluginScheduler(&fakePluginScheduler{
+				acrossPriorities: true,
+				resp:             pluginapi.SchedulerPickResponse{Handled: true, DelegateBuiltin: strategy},
+				handled:          true,
+			})
+
+			for index := 0; index < 2; index++ {
+				picked, _, _, errPick := manager.pickNextMixed(context.Background(), []string{"codex", "gemini"}, "", cliproxyexecutor.Options{}, nil)
+				if errPick != nil {
+					t.Fatalf("pickNextMixed() #%d error = %v", index, errPick)
+				}
+				if picked == nil || picked.ID != "b-gemini-high" {
+					t.Fatalf("pickNextMixed() #%d = %#v, want highest priority auth b-gemini-high", index, picked)
+				}
+			}
+		})
+	}
+}
+
+func TestManagerPluginBuiltinMixedOffsetsAreBounded(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	for index := 0; index < 4096; index++ {
+		manager.pluginBuiltinMixedOffsets["codex,gemini:model-"+strconv.Itoa(index)] = 1
+	}
+	candidates := []*Auth{{ID: "codex-a", Provider: "codex"}, {ID: "gemini-a", Provider: "gemini"}}
+
+	picked, errPick := manager.pickViaBuiltinCandidates(context.Background(), schedulerStrategyRoundRobin, "mixed", []string{"codex", "gemini"}, "new-model", cliproxyexecutor.Options{}, candidates)
+	if errPick != nil || picked == nil {
+		t.Fatalf("pickViaBuiltinCandidates() = (%#v, %v), want a candidate", picked, errPick)
+	}
+	if got := len(manager.pluginBuiltinMixedOffsets); got != 1 {
+		t.Fatalf("pluginBuiltinMixedOffsets size = %d, want reset to the new key only", got)
 	}
 }
 

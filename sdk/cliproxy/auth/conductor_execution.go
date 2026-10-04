@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -128,13 +129,6 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	if m.HomeEnabled() {
 		resp, errHome := m.executeHome(ctx, normalized, req, opts, false)
 		return resp, unwrapExecutionBoundaryError(errHome)
-	}
-
-	if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
-		normalized = m.transcriptionProviders(normalized)
-		if len(normalized) == 0 {
-			return cliproxyexecutor.Response{}, transcriptionUnsupportedError(req.Model)
-		}
 	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
@@ -366,6 +360,14 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		req.Payload = bytes.Clone(resp.Body)
 		opts.OriginalRequest = bytes.Clone(resp.Body)
 	}
+	if path := strings.TrimSpace(resp.Path); path != "" {
+		if opts.Metadata == nil {
+			opts.Metadata = make(map[string]any, 1)
+		} else {
+			opts.Metadata = maps.Clone(opts.Metadata)
+		}
+		opts.Metadata[cliproxyexecutor.RequestPathMetadataKey] = path
+	}
 	if resp.Terminate {
 		return req, opts, &cliproxyexecutor.RequestTerminatedError{
 			HTTPStatus: resp.StatusCode,
@@ -417,7 +419,7 @@ func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexe
 		}
 	}
 	source := opts.SourceFormat.String()
-	if source == "openai-image" || source == "openai-video" || opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
+	if source == "openai-image" || source == "openai-video" {
 		return opts.SourceFormat
 	}
 	if opts.Alt == "responses/compact" && !opts.Stream {
@@ -614,7 +616,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				refreshCtx := newUpstreamAttemptContext(execCtx)
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized || opts.SourceFormat == cliproxyexecutor.TranscriptionFormat); okRefresh {
+				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
 					execCtx = newUpstreamAttemptContext(execCtx)
@@ -650,13 +652,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				action, okAction := matchRequestScopedErrorAction(auth, errExec, m.runtimeConfigSnapshot())
 				applyRequestScopedActionToResult(action, okAction, &result)
-				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) || (!okAction && isTranscriptionRequestFault(execOpts, errExec)) {
+				if isResponsesCompactAvailabilityNeutralError(execOpts, errExec, result.Error) {
 					m.recordAvailabilityNeutralResult(execCtx, result)
 				} else {
 					m.MarkResult(execCtx, result)
-				}
-				if opts.SourceFormat == cliproxyexecutor.TranscriptionFormat {
-					return cliproxyexecutor.Response{}, wrapRequestStopError(errExec)
 				}
 				if okAction {
 					if isRequestScopedStop(action, okAction) {
@@ -1140,7 +1139,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		execReq := sanitizeDownstreamWebsocketFallbackRequest(execCtx, auth, req)
 		if selection != nil && !restoreExecutionModel {
-			execReq = attachResolvedHomeModelInfo(execReq, selection.modelInfo, selection.configurationUpdateSupport)
+			execReq = attachResolvedHomeModelInfo(execReq, auth, routeModel, selection.modelInfo, selection.configurationUpdateSupport)
 		}
 		streamExecutionModel := ""
 		if restoreExecutionModel {
@@ -1272,7 +1271,7 @@ func withAttemptedAuthResultTracker(ctx context.Context, attempted map[string]re
 	return context.WithValue(ctx, attemptedAuthResultTrackerContextKey{}, attempted)
 }
 
-func recordAttemptedAuthResult(ctx context.Context, result Result, generation uint64, cooldownApplied bool) {
+func recordAttemptedAuthResult(ctx context.Context, result Result, generation, registrationEpoch uint64, cooldownApplied bool) {
 	if ctx == nil || result.AuthID == "" || result.Success {
 		return
 	}
@@ -1284,6 +1283,7 @@ func recordAttemptedAuthResult(ctx context.Context, result Result, generation ui
 	attempt.resultError = cloneError(result.Error)
 	attempt.resultCooldownApplied = cooldownApplied
 	attempt.generation = generation
+	attempt.registrationEpoch = registrationEpoch
 	if model := canonicalModelKey(result.Model); model != "" {
 		if attempt.modelErrors == nil {
 			attempt.modelErrors = make(map[string]*Error)

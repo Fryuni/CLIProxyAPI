@@ -70,15 +70,6 @@ func (e *pluginRefreshCompatExecutor) Identifier() string {
 	return ""
 }
 
-// SupportsTranscription preserves the optional capability of the native executor.
-func (e *pluginRefreshCompatExecutor) SupportsTranscription() bool {
-	if e == nil {
-		return false
-	}
-	support, ok := e.inner.(cliproxyexecutor.TranscriptionSupport)
-	return ok && support.SupportsTranscription()
-}
-
 func (e pluginRefreshCompatExecutor) ForAPIKey() coreauth.ProviderExecutor {
 	if scoped, ok := e.inner.(coreauth.APIKeyConfigExecutor); ok {
 		e.inner = scoped.ForAPIKey()
@@ -167,4 +158,13 @@ func authHasRefreshToken(auth *coreauth.Auth) bool {
 		return true
 	}
 	return false
+}
+
+// SupportsApplyPatch delegates only the inner executor's optional contract.
+func (e *pluginRefreshCompatExecutor) SupportsApplyPatch() bool {
+	if e == nil || e.inner == nil {
+		return false
+	}
+	support, okSupport := e.inner.(coreauth.ApplyPatchSupport)
+	return okSupport && support.SupportsApplyPatch()
 }

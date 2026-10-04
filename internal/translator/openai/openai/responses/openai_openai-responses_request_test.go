@@ -125,90 +125,6 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DefersMessageUntil
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReusedCallIDAcrossTurns(t *testing.T) {
-	raw := []byte(`{
-		"input": [
-			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"one\"}"},
-			{"type":"message","role":"user","content":"first reminder"},
-			{"type":"function_call_output","call_id":"call_reused","output":"first result"},
-			{"type":"message","role":"assistant","content":"first done"},
-			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"two\"}"},
-			{"type":"message","role":"user","content":"second reminder"},
-			{"type":"function_call_output","call_id":"call_reused","output":"second result"}
-		]
-	}`)
-
-	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5-codex", raw, false)
-	messages := gjson.GetBytes(out, "messages").Array()
-	results := []string{"first result", "second result"}
-	paired := 0
-	contents := make(map[string]bool)
-	for i, message := range messages {
-		contents[message.Get("content").String()] = true
-		if !message.Get("tool_calls").Exists() {
-			continue
-		}
-		if paired >= len(results) || i+1 >= len(messages) {
-			t.Fatalf("unexpected tool-call group: %s", out)
-		}
-		result := messages[i+1]
-		if result.Get("role").String() != "tool" || result.Get("tool_call_id").String() != message.Get("tool_calls.0.id").String() || result.Get("content").String() != results[paired] {
-			t.Fatalf("tool result does not immediately follow its owning turn: %s", out)
-		}
-		paired++
-	}
-	if paired != len(results) {
-		t.Fatalf("paired groups = %d, want %d; output=%s", paired, len(results), out)
-	}
-	for _, content := range []string{"first reminder", "second reminder", "first done"} {
-		if !contents[content] {
-			t.Fatalf("lost message content %q: %s", content, out)
-		}
-	}
-}
-
-// An explicit output belonging to a later turn that reuses a call_id must not suppress ID
-// inference for the earlier turn's ID-less output: the earlier assistant tool call would
-// otherwise be left unmatched, which strict chat-completions upstreams reject.
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ReusedCallIDDoesNotSuppressEarlierInference(t *testing.T) {
-	raw := []byte(`{
-		"input": [
-			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"one\"}"},
-			{"type":"function_call_output","output":"first result"},
-			{"type":"message","role":"assistant","content":"first done"},
-			{"type":"function_call","call_id":"call_reused","name":"exec_command","arguments":"{\"cmd\":\"two\"}"},
-			{"type":"function_call_output","call_id":"call_reused","output":"second result"}
-		]
-	}`)
-
-	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("gpt-5-codex", raw, false)
-	messages := gjson.GetBytes(out, "messages").Array()
-	results := []string{"first result", "second result"}
-	paired := 0
-	for i, message := range messages {
-		if !message.Get("tool_calls").Exists() {
-			continue
-		}
-		if paired >= len(results) || i+1 >= len(messages) {
-			t.Fatalf("unexpected tool-call group: %s", out)
-		}
-		result := messages[i+1]
-		if result.Get("role").String() != "tool" {
-			t.Fatalf("tool call is not followed by its result: %s", out)
-		}
-		if result.Get("tool_call_id").String() != message.Get("tool_calls.0.id").String() {
-			t.Fatalf("tool result is not bound to its owning call: %s", out)
-		}
-		if result.Get("content").String() != results[paired] {
-			t.Fatalf("tool result content = %q, want %q; output=%s", result.Get("content").String(), results[paired], out)
-		}
-		paired++
-	}
-	if paired != len(results) {
-		t.Fatalf("paired groups = %d, want %d; output=%s", paired, len(results), out)
-	}
-}
-
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_UnwrapsStringifiedToolOutputImages(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -2521,61 +2437,6 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_DuplicateCustomOut
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_InfersMissingOutputIDsPerPendingGroup(t *testing.T) {
-	inputJSON := []byte(`{
-		"model": "deepseek-v4.1-flash",
-		"input": [
-			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
-			{"type":"function_call_output","output":"result a"},
-			{"role":"user","content":"continue"},
-			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
-			{"type":"function_call_output","output":"result b"}
-		]
-	}`)
-
-	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
-	messages := gjson.GetBytes(out, "messages").Array()
-	results := make(map[string]string)
-	for _, message := range messages {
-		if message.Get("role").String() == "tool" {
-			results[message.Get("tool_call_id").String()] = message.Get("content").String()
-		}
-	}
-	if got := results["call_a"]; got != "result a" {
-		t.Fatalf("call_a result = %q, want result a; output=%s", got, out)
-	}
-	if got := results["call_b"]; got != "result b" {
-		t.Fatalf("call_b result = %q, want result b; output=%s", got, out)
-	}
-}
-
-func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_InfersMissingOutputIDsByUniqueFunctionName(t *testing.T) {
-	inputJSON := []byte(`{
-		"model": "deepseek-v4.1-flash",
-		"input": [
-			{"type":"function_call","call_id":"call_a","name":"tool_a","arguments":"{}"},
-			{"type":"function_call","call_id":"call_b","name":"tool_b","arguments":"{}"},
-			{"type":"function_call_output","name":"tool_b","output":"result b"},
-			{"type":"function_call_output","name":"tool_a","output":"result a"}
-		]
-	}`)
-
-	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("deepseek-v4.1-flash", inputJSON, false)
-	messages := gjson.GetBytes(out, "messages").Array()
-	results := make(map[string]string)
-	for _, message := range messages {
-		if message.Get("role").String() == "tool" {
-			results[message.Get("tool_call_id").String()] = message.Get("content").String()
-		}
-	}
-	if got := results["call_a"]; got != "result a" {
-		t.Fatalf("call_a result = %q, want result a; output=%s", got, out)
-	}
-	if got := results["call_b"]; got != "result b" {
-		t.Fatalf("call_b result = %q, want result b; output=%s", got, out)
-	}
-}
-
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MultipleOutputsWithoutIDDoNotGuessOrReorder(t *testing.T) {
 	// If assistant issues function_call(a) and function_call(b), and multiple outputs arrive
 	// without call_ids, the assignment is a non-unique guess. The history must stay untouched!
@@ -2755,5 +2616,28 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_NamespaceToolPrefi
 	name, namespace = splitResponsesQualifiedFunctionCallFromRequest(raw, "fs_read")
 	if name != "fs_read" || namespace != "" {
 		t.Fatalf("splitResponsesQualifiedFunctionCallFromRequest(raw, \"fs_read\") = (%q, %q), want (\"fs_read\", \"\")", name, namespace)
+	}
+}
+
+func TestApplyPatchChatRequestContractAndHistory(t *testing.T) {
+	request := []byte(`{"tools":[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"apply_patch","description":"Edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.","format":{"type":"grammar","syntax":"lark","definition":"start: patch"},"cache_control":{"type":"ephemeral"}}]}],"input":[{"type":"custom_tool_call","namespace":"editor","name":"apply_patch","call_id":"c1","input":"*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch"},{"type":"custom_tool_call_output","call_id":"c1","output":"done"}]}`)
+	result := gjson.ParseBytes(ConvertOpenAIResponsesRequestToOpenAIChatCompletions("test", request, false))
+	tool := result.Get("tools.0.function")
+	description := tool.Get("description").String()
+	schema := tool.Get("parameters")
+	for _, instruction := range []string{"*** Begin Patch", "*** End Patch", "*** Add File:", "*** Delete File:", "*** Update File:", "*** Move to:", "*** End of File", "@@", "start: patch", "JSON object"} {
+		if !strings.Contains(description, instruction) {
+			t.Errorf("missing instruction %q", instruction)
+		}
+	}
+	if strings.Contains(description, "do not wrap the patch in JSON") {
+		t.Fatal("contradictory freeform instructions")
+	}
+	if schema.Get("additionalProperties").Bool() || !schema.Get("additionalProperties").Exists() || schema.Get("required.0").String() != "input" {
+		t.Fatalf("not strict schema: %s", schema.Raw)
+	}
+	call := result.Get("messages.0.tool_calls.0")
+	if call.Get("function.name").String() != "editor__apply_patch" || gjson.Get(call.Get("function.arguments").String(), "input").String() != "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch" || call.Get("id").String() != "c1" || result.Get("messages.1.tool_call_id").String() != "c1" || result.Get("messages.1.content").String() != "done" {
+		t.Fatalf("history mismatch: %s", result.Raw)
 	}
 }

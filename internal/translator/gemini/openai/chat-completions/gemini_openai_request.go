@@ -239,12 +239,10 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(tc.Get("function.arguments").String()))
 						part, _ = sjson.SetBytes(part, "thoughtSignature", openAIToolCallGeminiThoughtSignature(tc))
 						partItems = append(partItems, part)
-						if functionID != "" {
-							toolCalls = append(toolCalls, assistantToolCall{
-								id:   functionID,
-								name: functionName,
-							})
-						}
+						toolCalls = append(toolCalls, assistantToolCall{
+							id:   functionID,
+							name: functionName,
+						})
 					}
 					if len(partItems) > 0 {
 						contentItems = append(contentItems, geminiContentNode("model", partItems))
@@ -260,12 +258,8 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						if nextRole == "tool" {
 							callID := arr[j].Get("tool_call_id").String()
 							if callID != "" {
-								content := arr[j].Get("content")
-								if content.Type == gjson.String {
-									turnToolResponses[callID] = content.String()
-								} else {
-									turnToolResponses[callID] = content.Raw
-								}
+								c := arr[j].Get("content")
+								turnToolResponses[callID] = c.Raw
 							}
 						}
 					}
@@ -279,11 +273,7 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						if response == "" {
 							response = "{}"
 						}
-						if gjson.Valid(response) {
-							part, _ = sjson.SetRawBytes(part, "functionResponse.response.result", []byte(response))
-						} else {
-							part, _ = sjson.SetBytes(part, "functionResponse.response.result", response)
-						}
+						part, _ = sjson.SetBytes(part, "functionResponse.response.result", []byte(response))
 						responseParts = append(responseParts, part)
 					}
 					if len(responseParts) > 0 {

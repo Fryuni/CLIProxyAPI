@@ -23,6 +23,7 @@ import (
 )
 
 type xaiPreparedRequest struct {
+	applyPatch            *helps.ApplyPatchResponsesState
 	baseModel             string
 	from                  sdktranslator.Format
 	responseFormat        sdktranslator.Format
@@ -69,9 +70,9 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
+	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibilityForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, baseModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
 	originalTranslated = preserveXAIResponsesOutputControls(originalTranslated, originalPayload, from)
-	body, updatesChanged := helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntent(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), stream, helps.APIKeyModelIsCompat(req))
+	body, updatesChanged := helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntentForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, baseModel, bytes.Clone(req.Payload), stream, helps.APIKeyModelIsCompat(req))
 	body = preserveXAIResponsesOutputControls(body, req.Payload, from)
 
 	var err error
@@ -82,7 +83,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = helps.ApplyPayloadConfigWithRequestForExecutor(e.cfg, e.Identifier(), baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -90,9 +91,20 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = helps.RewriteCodexMultiAgentV2Input(ctx, opts.Headers, body, e.cfg)
+	applyPatch := helps.NewApplyPatchResponsesState(from, originalPayload, originalTranslated)
+	var errNormalizePatch error
+	body, errNormalizePatch = helps.NormalizeApplyPatchResponsesRequest(body, originalPayload)
+	if errNormalizePatch != nil {
+		return nil, errNormalizePatch
+	}
 	willInjectXSearch := e.cfg != nil && e.cfg.XAI.InjectXSearch
 	shouldFold := xaiShouldFoldNamespaceTools(body, willInjectXSearch)
 	namespaceTools := collectXAINamespaceToolRefsWithFold(body, shouldFold)
+	for name, ref := range namespaceTools {
+		if ref.isDispatcher {
+			applyPatch.AddDispatcher(name, ref.namespace)
+		}
+	}
 	// Collect before normalizeXAITools flattens namespace wrappers so keys match
 	// the post-restore (namespace, short-name) shape used by the response filter.
 	clientDeclaredTools := collectXAIClientDeclaredToolKeys(body)
@@ -146,6 +158,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	}
 
 	return &xaiPreparedRequest{
+		applyPatch:            applyPatch,
 		baseModel:             baseModel,
 		from:                  from,
 		responseFormat:        responseFormat,
@@ -680,8 +693,7 @@ func ensureXAINativeXSearchAllowedTools(body []byte) []byte {
 }
 
 // xaiHasClientWebSearchFunction reports whether body declares a client function
-// or custom tool named "web_search" (without namespace), excluding the specific
-// generated declaration used by a folded namespace dispatcher.
+// or custom tool named "web_search" (without namespace), excluding folded namespace dispatchers.
 func xaiHasClientWebSearchFunction(body []byte, namespaceTools map[string]xaiNamespaceToolRef) bool {
 	if !gjson.ValidBytes(body) {
 		return false
@@ -694,33 +706,13 @@ func xaiHasClientWebSearchFunction(body []byte, namespaceTools map[string]xaiNam
 		toolType := strings.TrimSpace(tool.Get("type").String())
 		name := strings.TrimSpace(tool.Get("name").String())
 		if (toolType == xaiFunctionToolType || toolType == xaiCustomToolType) && name == xaiWebSearchToolType {
-			if xaiIsFoldedNamespaceDispatcherTool(tool, namespaceTools) {
+			if _, isNamespace := namespaceTools[name]; isNamespace {
 				continue
 			}
 			return true
 		}
 	}
 	return false
-}
-
-func xaiIsFoldedNamespaceDispatcherTool(tool gjson.Result, namespaceTools map[string]xaiNamespaceToolRef) bool {
-	ref, ok := namespaceTools[strings.TrimSpace(tool.Get("name").String())]
-	if !ok || !ref.isDispatcher || strings.TrimSpace(tool.Get("name").String()) != ref.namespace {
-		return false
-	}
-	nameSelector := tool.Get("parameters.properties.name")
-	enum := nameSelector.Get("enum").Array()
-	if !nameSelector.IsObject() || strings.TrimSpace(nameSelector.Get("type").String()) != "string" || len(enum) == 0 {
-		return false
-	}
-	for _, candidate := range enum {
-		qualifiedName := qualifyXAINamespaceToolName(ref.namespace, candidate.String())
-		childRef, exists := namespaceTools[qualifiedName]
-		if !exists || childRef.isDispatcher || childRef.namespace != ref.namespace {
-			return false
-		}
-	}
-	return true
 }
 
 // xaiBodyHasToolNamed reports whether any tool in tools or input has the given name.
@@ -767,10 +759,12 @@ func xaiResolveClientWebSearchAlias(body []byte) string {
 }
 
 // aliasXAIClientWebSearchInput renames client-declared function calls named
-// "web_search" to alias in replayed input history. Folded dispatcher calls are
-// recognized by their wrapped child-tool arguments and remain untouched.
+// "web_search" to alias in replayed input history.
 func aliasXAIClientWebSearchInput(body []byte, alias string, namespaceTools map[string]xaiNamespaceToolRef) []byte {
 	if !gjson.ValidBytes(body) || alias == "" {
+		return body
+	}
+	if _, isNamespace := namespaceTools[xaiWebSearchToolType]; isNamespace {
 		return body
 	}
 	input := gjson.GetBytes(body, "input")
@@ -782,44 +776,29 @@ func aliasXAIClientWebSearchInput(body []byte, alias string, namespaceTools map[
 		itemName := strings.TrimSpace(item.Get("name").String())
 		itemNamespace := strings.TrimSpace(item.Get("namespace").String())
 		if (itemType == "function_call" || itemType == "custom_tool_call" || itemType == "function_call_output") &&
-			itemName == xaiWebSearchToolType && itemNamespace == "" &&
-			!xaiIsFoldedNamespaceDispatcherCall(item, namespaceTools) {
+			itemName == xaiWebSearchToolType && itemNamespace == "" {
 			body, _ = sjson.SetBytes(body, fmt.Sprintf("input.%d.name", idx), alias)
 		}
 	}
 	return body
 }
 
-func xaiIsFoldedNamespaceDispatcherCall(item gjson.Result, namespaceTools map[string]xaiNamespaceToolRef) bool {
-	ref, ok := namespaceTools[strings.TrimSpace(item.Get("name").String())]
-	if !ok || !ref.isDispatcher {
-		return false
-	}
-	arguments := gjson.Parse(item.Get("arguments").String())
-	childName := strings.TrimSpace(arguments.Get("name").String())
-	if childName == "" {
-		return false
-	}
-	childRef, ok := namespaceTools[qualifyXAINamespaceToolName(ref.namespace, childName)]
-	return ok && !childRef.isDispatcher && childRef.namespace == ref.namespace
-}
-
 // aliasXAIClientWebSearchFunction renames client-declared function tools named
 // "web_search" to a non-colliding alias in tools declarations, tool_choice,
 // and replayed input history to prevent xAI from hijacking them into hosted
-// server-side search. Only the generated folded dispatcher declaration is kept.
+// server-side search. Namespace dispatcher tools named "web_search" are untouched.
 func aliasXAIClientWebSearchFunction(body []byte, alias string, namespaceTools map[string]xaiNamespaceToolRef) []byte {
 	if !gjson.ValidBytes(body) || alias == "" {
 		return body
 	}
-	// 1. Alias in tools (excluding the generated namespace dispatcher)
+	// 1. Alias in tools (excluding namespace dispatchers)
 	tools := gjson.GetBytes(body, "tools")
 	if tools.IsArray() {
 		for idx, tool := range tools.Array() {
 			toolType := strings.TrimSpace(tool.Get("type").String())
 			name := strings.TrimSpace(tool.Get("name").String())
 			if (toolType == xaiFunctionToolType || toolType == xaiCustomToolType) && name == xaiWebSearchToolType {
-				if xaiIsFoldedNamespaceDispatcherTool(tool, namespaceTools) {
+				if _, isNamespace := namespaceTools[name]; isNamespace {
 					continue
 				}
 				body, _ = sjson.SetBytes(body, fmt.Sprintf("tools.%d.name", idx), alias)
@@ -827,22 +806,32 @@ func aliasXAIClientWebSearchFunction(body []byte, alias string, namespaceTools m
 		}
 	}
 
-	// 2. Alias unnamespaced client choices. A namespace choice still carries its
-	// namespace here and is rewritten to the dispatcher later.
+	// 2. Alias in tool_choice (only when unnamespaced and not a namespace dispatcher)
 	choice := gjson.GetBytes(body, "tool_choice")
 	if choice.IsObject() {
-		if fnName := choice.Get("function.name"); fnName.Exists() && strings.TrimSpace(fnName.String()) == xaiWebSearchToolType && strings.TrimSpace(choice.Get("function.namespace").String()) == "" {
-			body, _ = sjson.SetBytes(body, "tool_choice.function.name", alias)
+		if fnName := choice.Get("function.name"); fnName.Exists() && strings.TrimSpace(fnName.String()) == xaiWebSearchToolType {
+			if strings.TrimSpace(choice.Get("function.namespace").String()) == "" {
+				if _, isNamespace := namespaceTools[xaiWebSearchToolType]; !isNamespace {
+					body, _ = sjson.SetBytes(body, "tool_choice.function.name", alias)
+				}
+			}
 		}
-		if name := choice.Get("name"); name.Exists() && strings.TrimSpace(name.String()) == xaiWebSearchToolType && strings.TrimSpace(choice.Get("namespace").String()) == "" {
-			choiceType := strings.TrimSpace(choice.Get("type").String())
-			if choiceType == xaiFunctionToolType || choiceType == "tool" {
-				body, _ = sjson.SetBytes(body, "tool_choice.name", alias)
+		if name := choice.Get("name"); name.Exists() && strings.TrimSpace(name.String()) == xaiWebSearchToolType {
+			if strings.TrimSpace(choice.Get("namespace").String()) == "" {
+				choiceType := strings.TrimSpace(choice.Get("type").String())
+				if choiceType == xaiFunctionToolType || choiceType == "tool" {
+					if _, isNamespace := namespaceTools[xaiWebSearchToolType]; !isNamespace {
+						body, _ = sjson.SetBytes(body, "tool_choice.name", alias)
+					}
+				}
 			}
 		}
 		if allowed := choice.Get("tools"); allowed.IsArray() {
 			for idx, allowedTool := range allowed.Array() {
 				if strings.TrimSpace(allowedTool.Get("namespace").String()) != "" {
+					continue
+				}
+				if _, isNamespace := namespaceTools[xaiWebSearchToolType]; isNamespace {
 					continue
 				}
 				allowedType := strings.TrimSpace(allowedTool.Get("type").String())
@@ -856,6 +845,7 @@ func aliasXAIClientWebSearchFunction(body []byte, alias string, namespaceTools m
 		}
 	}
 
+	// 3. Alias in input (conversation history, only when unnamespaced)
 	return aliasXAIClientWebSearchInput(body, alias, namespaceTools)
 }
 
@@ -1575,9 +1565,6 @@ func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGenerati
 		return nil, true, true
 	}
 	if toolType == xaiImageGenerationToolType && !keepImageGeneration {
-		return nil, true, true
-	}
-	if toolType == xaiCustomToolType && tool.Get("name").String() == "apply_patch" {
 		return nil, true, true
 	}
 
