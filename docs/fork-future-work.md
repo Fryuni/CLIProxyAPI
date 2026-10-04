@@ -29,11 +29,14 @@ The fork used to carry these fixes. The reset restored upstream's behavior.
 
 - Where: `PutClaudeKeys` in `internal/api/handlers/management/config_lists.go`.
 - Problem: an omitted `cloak` and `"cloak": null` both decode to a nil pointer.
-  The handler then restores the existing mode, so clients cannot clear
-  cloaking through PUT.
+  For both, the handler rebuilds a cloak that holds only the old `mode`. That
+  means clients cannot clear cloaking through PUT, and omitting the field
+  silently drops the other cloak settings (`strict-mode`, `sensitive-words`,
+  `cache-user-id`).
 - Fix: decode the raw `cloak` field per item to tell omission from an
-  explicit `null`. Preserve the existing cloak only when the field is omitted.
-  The fork previously carried this in `e42552a5`.
+  explicit `null`. When the field is omitted, clone the complete existing cloak
+  config. When it is `null`, leave cloaking cleared. The fork previously
+  carried this in `e42552a5`.
 
 ### Translate non-English test comments
 
@@ -114,6 +117,11 @@ reviewers can see they were considered. Raise them upstream if they matter.
   deadlines stay active while the catalog body is read. AGENTS.md limits
   timeouts to credential acquisition and the listed exceptions, and model
   catalog refresh is not one of them.
+- **`TraceID` contract after the UUIDv7 request-ID change**
+  (`internal/logging/requestid.go`): request IDs are now full UUIDv7 strings
+  and flow into usage `TraceID`. The public docs on `usage.Record.TraceID`
+  (`sdk/cliproxy/usage/manager.go`) and `pluginapi.UsageRecord.TraceID`
+  (`sdk/pluginapi/types.go`) still say "8-character hex".
 - **Failed Interactions streams end with success events**
   (`internal/translator/interactions/claude` and
   `internal/translator/claude/interactions`): Interactions stream failures can
