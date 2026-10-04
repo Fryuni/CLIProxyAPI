@@ -24,6 +24,7 @@ type openAICompatPoolExecutor struct {
 	streamModels      []string
 	executePayloads   map[string][]byte
 	executeErrors     map[string]error
+	executeFailures   map[string]int
 	countErrors       map[string]error
 	streamFirstErrors map[string]error
 	streamAttempts    map[string]bool
@@ -40,6 +41,13 @@ func (e *openAICompatPoolExecutor) Execute(ctx context.Context, auth *Auth, req 
 	e.executeModels = append(e.executeModels, req.Model)
 	payload := append([]byte(nil), e.executePayloads[req.Model]...)
 	err := e.executeErrors[req.Model]
+	if remaining, limited := e.executeFailures[req.Model]; limited {
+		if remaining > 0 {
+			e.executeFailures[req.Model] = remaining - 1
+		} else {
+			err = nil
+		}
+	}
 	e.mu.Unlock()
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
@@ -303,6 +311,42 @@ func TestManagerExecute_OpenAICompatAliasPoolRotatesWithinAuth(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("execute call %d model = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestManagerExecute_OpenAICompatAliasPoolRetriesConcreteHTTP500Models(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	alias := "claude-opus-4.66"
+	serverErr := &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream failure"}
+	executor := &openAICompatPoolExecutor{
+		id: openAICompatPoolProviderKey,
+		executeErrors: map[string]error{
+			"deepseek-v3.1": serverErr,
+			"glm-5":         serverErr,
+		},
+		executeFailures: map[string]int{
+			"deepseek-v3.1": 1,
+			"glm-5":         1,
+		},
+	}
+	manager := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "deepseek-v3.1", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+	manager.SetRetryConfig(1, 0, 0)
+
+	resp, errExecute := manager.Execute(context.Background(), []string{openAICompatPoolProviderKey}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v, want concrete pool member retried", errExecute)
+	}
+	if len(resp.Payload) == 0 {
+		t.Fatal("Execute() returned empty payload after retry")
+	}
+	if calls := executor.ExecuteModels(); len(calls) != 3 {
+		t.Fatalf("execute calls = %v, want both pool failures and one retry", calls)
 	}
 }
 
