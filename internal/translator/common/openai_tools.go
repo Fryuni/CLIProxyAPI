@@ -2,17 +2,16 @@ package common
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/tidwall/gjson"
 )
 
 // AlignOpenAIToolCallMessages reorders tool result messages to immediately follow
 // the assistant message that issued their matching tool_calls by tool_call_id.
-// Ambiguous IDs are scoped by assistant message index so call IDs may be safely
-// reused in later turns. It preserves original message order, content parts,
-// reasoning fields, and numeric precision, while leaving ambiguous, orphan, and
-// incomplete histories untouched.
-func AlignOpenAIToolCallMessages(messages [][]byte, ambiguousByAssistant map[int]map[string]bool) [][]byte {
+// It preserves original message order, content parts, reasoning fields, and numeric
+// precision, while leaving ambiguous, orphan, and incomplete histories untouched.
+func AlignOpenAIToolCallMessages(messages [][]byte, extraAmbiguousIDs ...string) [][]byte {
 	if len(messages) <= 1 {
 		return messages
 	}
@@ -21,46 +20,64 @@ func AlignOpenAIToolCallMessages(messages [][]byte, ambiguousByAssistant map[int
 		msgIndex            int
 		callIDs             []string
 		hasInvalidOrEmptyID bool
-		ambiguousCallIDs    map[string]bool
 	}
 
 	assistants := make([]assistantRecord, 0)
+	assistantByCallID := make(map[string]int)
+	ambiguousCallIDs := make(map[string]bool)
+	for _, id := range extraAmbiguousIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed != "" {
+			ambiguousCallIDs[trimmed] = true
+		}
+	}
+	toolMsgIndicesByCallID := make(map[string][]int)
 
 	for i, raw := range messages {
-		if gjson.GetBytes(raw, "role").String() != "assistant" {
-			continue
-		}
-		toolCalls := gjson.GetBytes(raw, "tool_calls")
-		if !toolCalls.Exists() || !toolCalls.IsArray() {
-			continue
-		}
-		rawCalls := toolCalls.Array()
-		if len(rawCalls) == 0 {
-			continue
-		}
+		role := gjson.GetBytes(raw, "role").String()
+		switch role {
+		case "assistant":
+			toolCalls := gjson.GetBytes(raw, "tool_calls")
+			if toolCalls.Exists() && toolCalls.IsArray() {
+				rawCalls := toolCalls.Array()
+				if len(rawCalls) > 0 {
+					callIDs := make([]string, 0, len(rawCalls))
+					hasEmptyCallID := false
+					for _, tc := range rawCalls {
+						callID := tc.Get("id").String()
+						if callID == "" {
+							// Empty tool_call_id cannot be safely matched.
+							ambiguousCallIDs[""] = true
+							hasEmptyCallID = true
+							continue
+						}
+						if _, exists := assistantByCallID[callID]; exists {
+							ambiguousCallIDs[callID] = true
+						}
+						assistantByCallID[callID] = i
+						callIDs = append(callIDs, callID)
+					}
+					if len(callIDs) > 0 || hasEmptyCallID {
+						assistants = append(assistants, assistantRecord{
+							msgIndex:            i,
+							callIDs:             callIDs,
+							hasInvalidOrEmptyID: hasEmptyCallID,
+						})
+					}
+				}
+			}
 
-		callIDs := make([]string, 0, len(rawCalls))
-		hasEmptyCallID := false
-		seenCallIDs := make(map[string]bool)
-		ambiguousCallIDs := make(map[string]bool)
-		for _, tc := range rawCalls {
-			callID := tc.Get("id").String()
+		case "tool":
+			callID := gjson.GetBytes(raw, "tool_call_id").String()
 			if callID == "" {
-				hasEmptyCallID = true
-				continue
+				ambiguousCallIDs[""] = true
+			} else {
+				toolMsgIndicesByCallID[callID] = append(toolMsgIndicesByCallID[callID], i)
+				if len(toolMsgIndicesByCallID[callID]) > 1 {
+					ambiguousCallIDs[callID] = true
+				}
 			}
-			if seenCallIDs[callID] {
-				ambiguousCallIDs[callID] = true
-			}
-			seenCallIDs[callID] = true
-			callIDs = append(callIDs, callID)
 		}
-		assistants = append(assistants, assistantRecord{
-			msgIndex:            i,
-			callIDs:             callIDs,
-			hasInvalidOrEmptyID: hasEmptyCallID,
-			ambiguousCallIDs:    ambiguousCallIDs,
-		})
 	}
 
 	if len(assistants) == 0 {
@@ -75,42 +92,32 @@ func AlignOpenAIToolCallMessages(messages [][]byte, ambiguousByAssistant map[int
 	groups := make([]reorderGroup, 0)
 	needsReorder := false
 
-	for assistantIdx, ast := range assistants {
+	for _, ast := range assistants {
 		if ast.hasInvalidOrEmptyID {
 			continue
 		}
-		groupEnd := len(messages)
-		if assistantIdx+1 < len(assistants) {
-			groupEnd = assistants[assistantIdx+1].msgIndex
-		}
-		toolMsgIndicesByCallID := make(map[string][]int)
-		for msgIdx := ast.msgIndex + 1; msgIdx < groupEnd; msgIdx++ {
-			raw := messages[msgIdx]
-			if gjson.GetBytes(raw, "role").String() != "tool" {
-				continue
-			}
-			callID := gjson.GetBytes(raw, "tool_call_id").String()
-			if callID != "" {
-				toolMsgIndicesByCallID[callID] = append(toolMsgIndicesByCallID[callID], msgIdx)
-			}
-		}
-
-		// Verify completeness and ambiguity within this assistant group.
+		// Verify completeness and ambiguity for this assistant.
 		isEligible := true
 		matchedToolIndices := make([]int, 0, len(ast.callIDs))
 
 		for _, callID := range ast.callIDs {
-			if ambiguousByAssistant[ast.msgIndex][callID] || ast.ambiguousCallIDs[callID] {
+			if ambiguousCallIDs[callID] {
 				isEligible = false
 				break
 			}
 			indices := toolMsgIndicesByCallID[callID]
 			if len(indices) != 1 {
-				// Incomplete or ambiguous: exactly one tool message must match.
+				// Incomplete or orphan: exactly one tool message must match.
 				isEligible = false
 				break
 			}
-			matchedToolIndices = append(matchedToolIndices, indices[0])
+			toolIdx := indices[0]
+			if toolIdx <= ast.msgIndex {
+				// Causal order violation: tool result before assistant.
+				isEligible = false
+				break
+			}
+			matchedToolIndices = append(matchedToolIndices, toolIdx)
 		}
 
 		if !isEligible {

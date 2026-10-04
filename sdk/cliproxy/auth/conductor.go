@@ -171,9 +171,6 @@ type Manager struct {
 	homeSessionAliases    homeSessionAliasCache
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets             map[string]int
-	pluginBuiltinRoundRobin     RoundRobinSelector
-	pluginBuiltinMixedMu        sync.Mutex
-	pluginBuiltinMixedOffsets   map[string]int
 	homeDispatchBundle          atomic.Pointer[HomeDispatchBundle]
 	homeInFlightPublisherConfig atomic.Pointer[HomeInFlightPublisherConfig]
 
@@ -201,6 +198,8 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+	// refreshJobs retains queued and running jobs across loop restarts under m.mu.
+	refreshJobs map[string]*authRefreshJob
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
@@ -219,18 +218,17 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:                     store,
-		executors:                 make(map[string]ProviderExecutor),
-		selector:                  selector,
-		hook:                      hook,
-		auths:                     make(map[string]*Auth),
-		authEpochs:                make(map[string]uint64),
-		homeRuntimeAuths:          make(map[string]map[string]*Auth),
-		homeRuntimeAuthOwners:     make(map[string]map[string]*HomeDispatchSelection),
-		homeSessionSelections:     make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
-		providerOffsets:           make(map[string]int),
-		pluginBuiltinMixedOffsets: make(map[string]int),
-		modelPoolOffsets:          make(map[string]int),
+		store:                 store,
+		executors:             make(map[string]ProviderExecutor),
+		selector:              selector,
+		hook:                  hook,
+		auths:                 make(map[string]*Auth),
+		authEpochs:            make(map[string]uint64),
+		homeRuntimeAuths:      make(map[string]map[string]*Auth),
+		homeRuntimeAuthOwners: make(map[string]map[string]*HomeDispatchSelection),
+		homeSessionSelections: make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
+		providerOffsets:       make(map[string]int),
+		modelPoolOffsets:      make(map[string]int),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})

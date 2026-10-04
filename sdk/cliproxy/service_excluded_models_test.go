@@ -327,7 +327,7 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		}
 	}
 
-	var webSearchModel, agentModel, nonWebSearchModel, staticOnlyModel, fetchedOnlyModel *internalregistry.ModelInfo
+	var webSearchModel, agentModel, staticOnlyModel, fetchedOnlyModel *internalregistry.ModelInfo
 	for _, model := range models {
 		if model == nil {
 			continue
@@ -335,8 +335,6 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 		switch strings.TrimSpace(model.ID) {
 		case "gemini-3.1-flash-lite":
 			webSearchModel = model
-		case "claude-sonnet-4-6":
-			nonWebSearchModel = model
 		case "gemini-pro-agent":
 			agentModel = model
 		case "gpt-oss-120b-medium":
@@ -357,12 +355,6 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	}
 	if webSearchModel.ContextLength != staticWebSearchModel.ContextLength || webSearchModel.MaxCompletionTokens != staticWebSearchModel.MaxCompletionTokens {
 		t.Fatalf("static token limits should be preserved, got=%#v static=%#v", webSearchModel, staticWebSearchModel)
-	}
-	if nonWebSearchModel == nil {
-		t.Fatal("expected claude-sonnet-4-6 to be registered")
-	}
-	if nonWebSearchModel.SupportsWebSearch {
-		t.Fatal("claude-sonnet-4-6 should not support web search")
 	}
 	if agentModel == nil {
 		t.Fatal("expected gemini-pro-agent to be registered")

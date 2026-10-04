@@ -357,7 +357,7 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 		return false
 	}
 	auth := m.auths[authID]
-	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || m.cooldownDisabledForAuth(auth) {
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || m.cooldownDisabledForAuth(auth) || hasUnauthorizedAuthFailure(auth) {
 		return false
 	}
 	updatedAt := record.UpdatedAt
@@ -404,6 +404,9 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 
 func clearCooldownStateForAuth(auth *Auth, now time.Time) bool {
 	if auth == nil {
+		return false
+	}
+	if hasUnauthorizedAuthFailure(auth) {
 		return false
 	}
 	changed := false
@@ -508,9 +511,11 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	models = dedupeStrings(models)
 
 	if !auth.Disabled && auth.Status != StatusDisabled && !hasModelError(auth, now) {
-		auth.LastError = nil
-		auth.StatusMessage = ""
-		auth.Status = StatusActive
+		if !hasUnauthorizedAuthFailure(auth) {
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+		}
 	}
 	auth.Generation++
 	auth.UpdatedAt = now
@@ -759,7 +764,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	var authSnapshot *Auth
 	cooldownStateChanged := false
-	resultCooldownApplied := false
 	now := time.Now()
 
 	m.mu.Lock()
@@ -786,9 +790,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			auth.Failed++
 		}
+		wasTerminalUnauthorized := hasUnauthorizedAuthFailure(auth)
 
 		if result.Success {
-			if auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+			if wasTerminalUnauthorized {
+				if modelKey != "" {
+					state := ensureModelState(auth, modelKey)
+					modelState = state
+					resetModelState(state, now)
+				}
+			} else if auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 				// Retain active credential-scoped cooldown
 			} else if modelKey != "" {
 				state := ensureModelState(auth, modelKey)
@@ -819,8 +830,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					if result.Error != nil {
 						state.LastError = cloneError(result.Error)
 						state.StatusMessage = result.Error.Message
-						auth.LastError = cloneError(result.Error)
-						auth.StatusMessage = result.Error.Message
+						if !wasTerminalUnauthorized {
+							auth.LastError = cloneError(result.Error)
+							auth.StatusMessage = result.Error.Message
+						}
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
@@ -837,7 +850,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
 						state.NextRetryAfter = next
 						state.StatusMessage = "cloudflare challenge"
-						if auth.LastError != nil {
+						if auth.LastError != nil && !wasTerminalUnauthorized {
 							auth.StatusMessage = "cloudflare challenge"
 						}
 						applyCooldownFields(&state.Quota, QuotaState{
@@ -935,17 +948,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 										})
 									}
 								}
-								auth.Unavailable = true
-								authNext := credentialNext
-								if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" &&
-									auth.Quota.NextRecoverAt.After(authNext) {
-									authNext = auth.Quota.NextRecoverAt
+								if !wasTerminalUnauthorized {
+									auth.Unavailable = true
+									authNext := credentialNext
+									if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" &&
+										auth.Quota.NextRecoverAt.After(authNext) {
+										authNext = auth.Quota.NextRecoverAt
+									}
+									auth.Quota.Exceeded = true
+									auth.Quota.Reason = "credential_quota"
+									auth.Quota.NextRecoverAt = authNext
+									auth.Quota.BackoffLevel = backoffLevel
+									auth.NextRetryAfter = authNext
 								}
-								auth.Quota.Exceeded = true
-								auth.Quota.Reason = "credential_quota"
-								auth.Quota.NextRecoverAt = authNext
-								auth.Quota.BackoffLevel = backoffLevel
-								auth.NextRetryAfter = authNext
 							}
 						case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
 							state.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, result.RetryAfter, disableCooling)
@@ -967,21 +982,28 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					// A later failure only extends a still-live cooldown; it never
 					// shortens one. A deliberate zero write (disableCooling) still
 					// clears the deadline.
-					retainedPreviousCooldown := !state.NextRetryAfter.IsZero() && prevModelRetryAfter.After(state.NextRetryAfter) && prevModelRetryAfter.After(now)
-					if retainedPreviousCooldown {
+					if !state.NextRetryAfter.IsZero() && prevModelRetryAfter.After(state.NextRetryAfter) && prevModelRetryAfter.After(now) {
 						state.NextRetryAfter = prevModelRetryAfter
 					}
 					auth.Status = StatusError
 					updateAggregatedAvailability(auth, now)
-					resultCooldownApplied = !retainedPreviousCooldown && state.Unavailable && state.NextRetryAfter.After(now)
 				}
-			} else if !shouldSkipCredentialCooldown(result.Error) {
+			} else {
 				disableCooling := m.cooldownDisabledForAuth(auth)
 				if result.Error != nil && result.Error.Code == ErrorCodeForceCooldown {
 					disableCooling = false
 				}
-				resultCooldownApplied = applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				if !wasTerminalUnauthorized {
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				}
 			}
+		}
+
+		if wasTerminalUnauthorized {
+			auth.Unavailable = true
+			auth.Status = StatusError
+			auth.NextRefreshAfter = time.Time{}
+			auth.NextRetryAfter = time.Time{}
 		}
 
 		auth.Generation++
@@ -1002,9 +1024,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 	}
 	m.mu.Unlock()
-	if authSnapshot != nil {
-		recordAttemptedAuthResult(ctx, result, authSnapshot.Generation, resultCooldownApplied)
-	}
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
 		if !result.CredentialScope && modelKey != "" {
@@ -1075,6 +1094,7 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	if result.AuthID == "" {
 		return
 	}
+
 	var authSnapshot *Auth
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -1310,6 +1330,12 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
+	// A terminal unauthorized credential stays blocked until its tokens change.
+	// Model-level results must not make it selectable again.
+	if hasUnauthorizedAuthFailure(auth) {
+		auth.Unavailable = true
+		return
+	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 		auth.Unavailable = true
 		return
@@ -1417,6 +1443,10 @@ func hasModelError(auth *Auth, now time.Time) bool {
 
 func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	if auth == nil {
+		return
+	}
+	if hasUnauthorizedAuthFailure(auth) {
+		auth.Unavailable = true
 		return
 	}
 	auth.Unavailable = false
@@ -1587,10 +1617,9 @@ func isTransientTransportError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// A closed local socket can be wrapped by an upstream gateway as HTTP 500.
-	// It remains a transport-path failure and must not cool the credential.
-	if status := statusCodeFromError(err); status != 0 {
-		return status == http.StatusInternalServerError && isClosedNetworkConnectionMessage(err.Error())
+	// HTTP-status failures stay on the credential/status retry path.
+	if statusCodeFromError(err) != 0 {
+		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
@@ -1619,9 +1648,6 @@ func isTransientTransportError(err error) bool {
 func isTransientTransportResultError(err *Error) bool {
 	if err == nil {
 		return false
-	}
-	if statusCodeFromResult(err) == http.StatusInternalServerError && isClosedNetworkConnectionMessage(err.Message) {
-		return true
 	}
 	if err.Code == transientTransportErrorCode {
 		return true
@@ -1652,8 +1678,7 @@ func isTransientTransportMessage(message string) bool {
 		return false
 	}
 	switch {
-	case isClosedNetworkConnectionMessage(lower),
-		strings.Contains(lower, "tls: tls handshake"),
+	case strings.Contains(lower, "tls: tls handshake"),
 		strings.Contains(lower, "tls handshake timeout"),
 		strings.Contains(lower, "wsarecv"),
 		strings.Contains(lower, "wsasend"),
@@ -1675,10 +1700,6 @@ func isTransientTransportMessage(message string) bool {
 	}
 }
 
-func isClosedNetworkConnectionMessage(message string) bool {
-	return strings.Contains(strings.ToLower(message), "use of closed network connection")
-}
-
 func isUnauthorizedError(err error) bool {
 	if err == nil {
 		return false
@@ -1694,7 +1715,7 @@ func hasUnauthorizedAuthFailure(auth *Auth) bool {
 	if auth == nil || auth.LastError == nil {
 		return false
 	}
-	if auth.Unavailable && auth.Status == StatusError && auth.NextRefreshAfter.IsZero() &&
+	if auth.Unavailable && auth.Status == StatusError && auth.NextRefreshAfter.IsZero() && auth.NextRetryAfter.IsZero() &&
 		(auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(auth.LastError.Code, "unauthorized")) {
 		return true
 	}
@@ -2214,13 +2235,13 @@ func isRequestInvalidError(err error) bool {
 	return false
 }
 
-func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) bool {
+func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time, disableCooling bool) {
 	if auth == nil {
-		return false
+		return
 	}
 	prevAuthRetryAfter := auth.NextRetryAfter
 	if shouldSkipCredentialCooldown(resultErr) {
-		return false
+		return
 	}
 	defer func() {
 		if disableCooling && auth.NextRetryAfter.IsZero() && auth.Quota.NextRecoverAt.IsZero() {
@@ -2315,15 +2336,13 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	// A later failure only extends a still-live credential cooldown; a
 	// deliberate zero write (disableCooling) still clears it.
-	retainedPreviousCooldown := !auth.NextRetryAfter.IsZero() && prevAuthRetryAfter.After(auth.NextRetryAfter) && prevAuthRetryAfter.After(now)
-	if retainedPreviousCooldown {
+	if !auth.NextRetryAfter.IsZero() && prevAuthRetryAfter.After(auth.NextRetryAfter) && prevAuthRetryAfter.After(now) {
 		auth.NextRetryAfter = prevAuthRetryAfter
 	}
 	if resultErr != nil && resultErr.Code == ErrorCodeForceCooldown && auth.NextRetryAfter.IsZero() {
 		auth.NextRetryAfter = now.Add(transientErrorCooldown)
 		auth.Unavailable = true
 	}
-	return !retainedPreviousCooldown && auth.Unavailable && auth.NextRetryAfter.After(now)
 }
 
 // quotaCooldownAfterFailure returns the recovery deadline and backoff level for
