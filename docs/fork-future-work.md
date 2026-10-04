@@ -43,6 +43,23 @@ The fork used to carry these fixes. The reset restored upstream's behavior.
 - Fix: replace `拆包` with "split chunks" and `合包` with "coalesced chunks".
   The fork previously carried this in `607b76cb`.
 
+## HTTP 500 retry follow-ups
+
+### Narrow the HTTP 500 bypass guard to the failing model
+
+- Where: `http500RetryRoundCandidate` in `sdk/cliproxy/auth/conductor_selection.go`.
+- Problem: the retry-round bypass applies only while the auth's `Generation`
+  still matches the value recorded for this request's HTTP 500. Every
+  `MarkResult` bumps `Generation`, so a concurrent result for a different
+  model on the same credential suppresses the bypass. The guard fails safe:
+  the request falls back to the regular cooldown behavior. But on busy
+  credentials the immediate retry happens less often than intended.
+- Fix: for model-scoped results, record the failing model state's cooldown
+  deadline and error with the attempt. Bypass only while that model state is
+  unchanged, plus the existing `RegistrationEpoch` check. Keep the
+  auth-wide generation check for auth-scoped results. Cover it with a test
+  that marks a concurrent result for another model between rounds.
+
 ## Upstream behavior flagged in review
 
 These are upstream design choices, not fork changes. They are recorded so
