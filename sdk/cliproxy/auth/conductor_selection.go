@@ -1046,15 +1046,18 @@ func (m *Manager) pickViaBuiltinCandidates(ctx context.Context, strategy schedul
 	}
 
 	normalized := normalizeProviderKeys(providers)
-	byProvider := make(map[string][]*Auth, len(normalized))
+	eligible := make([]*Auth, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate == nil {
-			continue
+		if candidate != nil && containsProvider(normalized, executorKeyFromAuth(candidate)) {
+			eligible = append(eligible, candidate)
 		}
+	}
+	// Built-in strategies use the global highest priority tier, even when an
+	// across-priorities plugin scheduler received every tier.
+	byProvider := make(map[string][]*Auth, len(normalized))
+	for _, candidate := range highestPriorityAuths(eligible) {
 		providerKey := executorKeyFromAuth(candidate)
-		if containsProvider(normalized, providerKey) {
-			byProvider[providerKey] = append(byProvider[providerKey], candidate)
-		}
+		byProvider[providerKey] = append(byProvider[providerKey], candidate)
 	}
 	if len(normalized) == 1 {
 		providerKey := normalized[0]
