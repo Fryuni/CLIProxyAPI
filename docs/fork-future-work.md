@@ -1,5 +1,11 @@
 # Fork Future Work
 
+This is the historical deferred-work snapshot from fork main `6b763383`.
+See the [ADR index](adr/README.md) for its decision history and current versus
+superseded fork policy. New work is tracked using
+[local ticket files](agents/issue-tracker.md); the retry-provenance redesign
+below is also tracked in [its local follow-up ticket](../.scratch/fork-history-review/issues/01-http-500-retry-provenance.md).
+
 This fork tracks upstream (`router-for-me/CLIProxyAPI`) and carries only two
 fork-specific changes: the minimal CI workflow (`.github/workflows/test.yml`)
 and HTTP 500 retries within request retry rounds (`sdk/cliproxy/auth`).

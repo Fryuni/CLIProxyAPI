@@ -1,0 +1,5 @@
+# Track fork issues locally and document every change
+
+This repository is a fork of CLIProxyAPI, and its maintainer wants fork work tracked alongside the code instead of in GitHub Issues. Issues and specs therefore live under `.scratch/<feature>/`, using the standard triage labels, and every fork change must be covered by an ADR under `docs/adr/` so its rationale remains available during reviews and upstream syncs. The engineering skills use a single-context domain layout with a lazily created root `GLOSSARY.md`; `AGENTS.md` directs agents to these conventions, and Git ignore exceptions keep the skills configuration and ADRs versionable.
+
+Existing fork decisions are backfilled from pinned Git history, with a [complete commit coverage index](README.md) and explicit supersession markers so historical corrections cannot be mistaken for current fork policy. The backfill records review follow-ups as local tickets and keeps historical evidence distinct from undocumented maintainer motivation.
