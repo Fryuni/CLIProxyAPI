@@ -41,7 +41,7 @@ The runtime tree at the pinned fork main differs from its last shared upstream b
 
 ## Changes after the backfill
 
-The commit tables below cover the pinned backfill snapshot only. Later fork changes each cite their ADR directly: [ADR-0022](0022-sync-upstream-0d18d3b3.md) merges upstream `0d18d3b3` into fork main `1b4e7ca1`. It adds upstream implementation notes to ADR-0005, ADR-0006, ADR-0009, ADR-0011, and ADR-0021, and extends ADR-0004 with the policy for upstream tests that fork CI exposes.
+The commit tables below cover the pinned backfill snapshot only. Later fork changes each cite their ADR directly: [ADR-0022](0022-sync-upstream-0d18d3b3.md) merges upstream `0d18d3b3` into fork main `1b4e7ca1` in merge commit `2a0f473b`. It adds upstream implementation notes to ADR-0005, ADR-0006, ADR-0009, ADR-0011, and ADR-0021, and extends ADR-0004 with the policy for upstream tests that fork CI exposes.
 
 ## Superseded fork decisions
 
