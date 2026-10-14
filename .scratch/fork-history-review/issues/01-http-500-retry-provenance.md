@@ -11,7 +11,7 @@ This is the consolidated follow-up already identified in `docs/fork-future-work.
 
 - Every result changes auth-wide generation, so a result for another model can invalidate an otherwise eligible immediate retry, potentially preventing it when cooldown exceeds maximum wait.
 - A 500 that extends a still-active 503 deadline is treated as applying its own cooldown; clearing the selection clone loses the independent 503 contribution.
-- An in-flight result selected before re-registration is resolved by auth ID against the replacement, then records the replacement's epoch, defeating the later epoch comparison.
+- ~~An in-flight result selected before re-registration is resolved by auth ID against the replacement, then records the replacement's epoch, defeating the later epoch comparison.~~ Resolved upstream; see the comment below.
 
 Stored cooldown state is not cleared by the clone bypass. The stale-result attribution issue occurs before cloning, in result recording.
 
@@ -34,3 +34,4 @@ History: `ad5cc00f`, `0d829550`, `8a63e962`.
 
 Backfilled from the October 4 review; no runtime fix is included in the ADR backfill.
 
+Upstream sync `0d18d3b3` ([ADR-0022](../../../docs/adr/0022-sync-upstream-0d18d3b3.md)): upstream `6920ed5d` stamps every execution `Result` with the selected credential's `CredentialVersion` and `RegistrationEpoch`, and `MarkResult` now returns before updating state when `isStaleExecutionResult` reports a superseded version or an earlier epoch. The fork records the attempt only after a non-stale update, so an epoch-1 result arriving after epoch-2 registration is no longer attributed to the replacement. `TestHTTP500RetryRoundIgnoresResultFromPreviousRegistrationEpoch` covers that acceptance criterion. The fork keeps upstream's implementation. The other-model generation gap and the overlapping 503/500 deadline gap remain open.

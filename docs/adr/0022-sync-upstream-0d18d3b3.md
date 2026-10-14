@@ -1,0 +1,20 @@
+---
+status: accepted
+---
+
+# Sync upstream 0d18d3b3 while keeping the retry delta
+
+Fork main `1b4e7ca1` merges 170 upstream commits, from `d7914afd` to `0d18d3b3`. The fork keeps its CI ([ADR-0004](0004-minimal-fork-ci.md)) and its HTTP 500 retry-round behavior ([ADR-0005](0005-request-scoped-http-500-retry-rounds.md), [ADR-0006](0006-closed-network-errors-are-transport-failures.md), [ADR-0007](0007-select-prepared-candidates-for-delegated-strategies.md)). Everything else is upstream's, following [ADR-0003](0003-minimize-fork-divergence.md). Conflicts kept upstream's structure, and the fork logic was re-attached at the equivalent points:
+
+- `MarkResult` now takes upstream's per-auth mutation lock and rejects stale results. The fork records the request-local attempt after the lock is released, and only for results that updated state.
+- `pickNextMixedLegacy` collects upstream's session-affinity rebind candidates from stored credentials before filtering `tried`. The fork substitutes its selection-only HTTP 500 clones only for untried candidates. This is equivalent, because for a stored credential and its clone, rebind classification resolves through the same retained `LastError`; clearing the deadline does not change the result.
+- `NewManager` adds the fork's delegated mixed-offset map next to upstream's new `authLoadGate`.
+- `conductor_transport_retry_test.go` keeps both upstream's HTTP/2 retry test and the fork's retry tests.
+
+Where fork code had become redundant with upstream, upstream's version won with no behavior change. The duplicate closed-network message case was dropped, and so was a `shouldSkipCredentialCooldown` guard that `applyAuthFailureState` already applies. Upstream's stale-result rejection resolves one documented retry limitation. ADR-0005 and the provenance ticket record this, and a new regression test covers it. Upstream also now implements the superseded Devin catalog decision ([ADR-0011](0011-devin-catalog-request-lifecycle-and-refresh-notifications.md)) and part of the upload limits ([ADR-0009](0009-bound-transcription-upload-and-decoder-memory.md)). Those ADRs, ADR-0006, and [ADR-0021](0021-defer-review-findings-without-expanding-the-fork.md) now carry upstream implementation notes. Every other superseded decision and deferred finding was checked and is unchanged upstream.
+
+Under ADR-0004's test policy, the fork repairs three upstream tests that fail on clean upstream. Two used models that upstream `f62d4d28` removed from the embedded catalog; each now uses the remaining model with identical thinking capability for the same provider. `TestResponsesInterruptStopsHTTPUpstream` read a flag set asynchronously after the handler's reply; it now waits for the cancellation. `TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559` exposes a real watcher race in upstream runtime code, so the runtime is unchanged and [a local ticket](../../.scratch/config-reload-hash-race/issues/01-record-applied-config-hash.md) records the fix.
+
+## Evidence
+
+Upstream [`6920ed5d`](https://github.com/router-for-me/CLIProxyAPI/commit/6920ed5d), [`8a01bc02`](https://github.com/router-for-me/CLIProxyAPI/commit/8a01bc02), [`56eee6a4`](https://github.com/router-for-me/CLIProxyAPI/commit/56eee6a4), [`7a687f42`](https://github.com/router-for-me/CLIProxyAPI/commit/7a687f42), [`f62d4d28`](https://github.com/router-for-me/CLIProxyAPI/commit/f62d4d28), [`6331b38b`](https://github.com/router-for-me/CLIProxyAPI/commit/6331b38b), [`1672be5d`](https://github.com/router-for-me/CLIProxyAPI/commit/1672be5d), and [`dd7b4334`](https://github.com/router-for-me/CLIProxyAPI/commit/dd7b4334). On a clean `0d18d3b3` checkout, the two catalog tests failed on every run, and the interrupt and `Issue6559` tests each failed in roughly a third or more of 40 runs.

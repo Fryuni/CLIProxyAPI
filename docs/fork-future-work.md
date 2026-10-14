@@ -6,6 +6,11 @@ superseded fork policy. New work is tracked using
 [local ticket files](agents/issue-tracker.md); the retry-provenance redesign
 below is also tracked in [its local follow-up ticket](../.scratch/fork-history-review/issues/01-http-500-retry-provenance.md).
 
+Since this snapshot, upstream `0d18d3b3` ([ADR-0022](adr/0022-sync-upstream-0d18d3b3.md))
+resolved the stale-results-after-re-registration retry gap and both Devin
+catalog findings (refresh notification and fetch timeout). Entries below are
+left as recorded.
+
 This fork tracks upstream (`router-for-me/CLIProxyAPI`) and carries only two
 fork-specific changes: the minimal CI workflow (`.github/workflows/test.yml`)
 and HTTP 500 retries within request retry rounds (`sdk/cliproxy/auth`).
