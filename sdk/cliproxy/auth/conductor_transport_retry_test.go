@@ -64,6 +64,8 @@ func TestManager_ShouldRetryAfterError_RetriesPreHTTPTransportFailure(t *testing
 		{name: "windows tls handshake", err: windowsCodexTLSHandshakeError(), want: true},
 		{name: "dial refused", err: dialRefusedError(), want: true},
 		{name: "unexpected eof", err: io.ErrUnexpectedEOF, want: true},
+		{name: "http2 force closed", err: errors.New("http2: client connection force closed via ClientConn.Close"), want: true},
+		{name: "http2 conn closed", err: &url.Error{Op: "Post", URL: "https://example.com", Err: errors.New("http2: client conn is closed")}, want: true},
 		{name: "unauthorized", err: &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}, want: false},
 		{name: "canceled", err: context.Canceled, want: false},
 		{name: "certificate", err: &url.Error{Op: "Post", URL: "https://chatgpt.com/backend-api/codex/responses", Err: x509.UnknownAuthorityError{}}, want: false},
@@ -386,6 +388,47 @@ func TestHTTP500RetryRoundBypassRequiresRecordedRegistrationEpoch(t *testing.T) 
 	if candidate := http500RetryRoundCandidate(auth, "", now, attempt); candidate != auth {
 		t.Fatalf("http500RetryRoundCandidate() = %#v, want stored auth for a stale registration epoch", candidate)
 	}
+}
+
+func TestHTTP500RetryRoundIgnoresResultFromPreviousRegistrationEpoch(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "stale-epoch-http-500-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	registered, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"})
+	if errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	selectedEpoch := registered.RegistrationEpoch
+	manager.Remove(context.Background(), authID)
+	replacement, errReRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"})
+	if errReRegister != nil {
+		t.Fatalf("re-register auth: %v", errReRegister)
+	}
+	if replacement.RegistrationEpoch <= selectedEpoch {
+		t.Fatalf("replacement epoch = %d, want greater than %d", replacement.RegistrationEpoch, selectedEpoch)
+	}
+
+	attempted := map[string]requestRetryAttempt{authID: {}}
+	ctx := withAttemptedAuthResultTracker(context.Background(), attempted)
+	manager.MarkResult(ctx, Result{
+		AuthID:            authID,
+		Provider:          "codex",
+		Model:             model,
+		Success:           false,
+		RegistrationEpoch: selectedEpoch,
+		Error:             &Error{HTTPStatus: http.StatusInternalServerError, Message: "stale request failure"},
+	})
+
+	if attempt := attempted[authID]; attempt.resultError != nil || attempt.generation != 0 || attempt.registrationEpoch != 0 {
+		t.Fatalf("attempt = %#v, want stale result left unrecorded", attempt)
+	}
+	assertNoCooldown(t, manager, authID, model)
 }
 
 func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
@@ -763,6 +806,74 @@ func TestExecuteClosedNetworkHTTP500ExhaustionDoesNotCooldown(t *testing.T) {
 	}
 	if calls := executor.callCount(); calls != 3 {
 		t.Fatalf("executor calls after second request = %d, want 3", calls)
+	}
+}
+
+func TestManager_HTTP2ClosedConnectionRespectsRequestRetry(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	for _, message := range []string{
+		"http2: client connection force closed via ClientConn.Close",
+		"http2: client conn is closed",
+	} {
+		for _, kind := range []string{"execute", "stream", "count"} {
+			for _, retries := range []int{0, 1} {
+				t.Run(fmt.Sprintf("%s/%s/retries=%d", message, kind, retries), func(t *testing.T) {
+					m := NewManager(nil, nil, nil)
+					m.SetRetryConfig(retries, 0, 0)
+					executor := &transportThenSuccessExecutor{identifier: "openai-compatibility", fail: errors.New(message)}
+					m.RegisterExecutor(executor)
+					model := "http2-retry-" + uuid.NewString()
+					authID := "http2-auth-" + uuid.NewString()
+					registry.GetGlobalRegistry().RegisterClient(authID, executor.Identifier(), []*registry.ModelInfo{{ID: model}})
+					t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+					if _, errRegister := m.Register(context.Background(), &Auth{ID: authID, Provider: executor.Identifier()}); errRegister != nil {
+						t.Fatalf("register auth: %v", errRegister)
+					}
+					call := func() error {
+						providers := []string{executor.Identifier()}
+						req := cliproxyexecutor.Request{Model: model}
+						switch kind {
+						case "execute":
+							_, errExecute := m.Execute(context.Background(), providers, req, cliproxyexecutor.Options{})
+							return errExecute
+						case "stream":
+							stream, errStream := m.ExecuteStream(context.Background(), providers, req, cliproxyexecutor.Options{})
+							if errStream != nil {
+								return errStream
+							}
+							for chunk := range stream.Chunks {
+								if chunk.Err != nil {
+									return chunk.Err
+								}
+							}
+							return nil
+						default:
+							_, errCount := m.ExecuteCount(context.Background(), providers, req, cliproxyexecutor.Options{})
+							return errCount
+						}
+					}
+					errCall := call()
+					assertNoCooldown(t, m, authID, model)
+					if retries == 0 {
+						if !errors.Is(errCall, executor.fail) || executor.callCount() != 1 {
+							t.Fatalf("retry disabled: error = %v, calls = %d; want original error and one call", errCall, executor.callCount())
+						}
+						if errNext := call(); errNext != nil {
+							t.Fatalf("next request on the same credential: %v", errNext)
+						}
+					} else if errCall != nil {
+						t.Fatalf("request failed instead of using its retry round: %v", errCall)
+					}
+					if executor.callCount() != 2 {
+						t.Fatalf("executor calls = %d, want 2", executor.callCount())
+					}
+					assertNoCooldown(t, m, authID, model)
+				})
+			}
+		}
 	}
 }
 

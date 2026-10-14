@@ -35,8 +35,13 @@ The retry branch's final tree `5ac127ac` exactly equals its main squash `0c7dd79
 - [ADR-0006: Treat closed-network HTTP 500 errors as transport failures](0006-closed-network-errors-are-transport-failures.md)
 - [ADR-0007: Select prepared candidates when delegating to built-in strategies](0007-select-prepared-candidates-for-delegated-strategies.md)
 - [ADR-0021: Record deferred review findings without expanding the runtime fork](0021-defer-review-findings-without-expanding-the-fork.md)
+- [ADR-0022: Sync upstream 0d18d3b3 while keeping the retry delta](0022-sync-upstream-0d18d3b3.md)
 
 The runtime tree at the pinned fork main differs from its last shared upstream baseline only in CI, the retry/auth-selection changes and their tests, and the historical future-work document. The local tracker and ADR files are documentation additions made after that tree.
+
+## Changes after the backfill
+
+The commit tables below cover the pinned backfill snapshot only. Later fork changes each cite their ADR directly: [ADR-0022](0022-sync-upstream-0d18d3b3.md) merges upstream `0d18d3b3` into fork main `1b4e7ca1` in merge commit `2a0f473b`. It adds upstream implementation notes to ADR-0005, ADR-0006, ADR-0009, ADR-0011, and ADR-0021, and extends ADR-0004 with the policy for upstream tests that fork CI exposes.
 
 ## Superseded fork decisions
 
