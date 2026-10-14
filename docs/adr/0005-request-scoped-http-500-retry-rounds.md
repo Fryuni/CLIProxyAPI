@@ -1,0 +1,17 @@
+---
+status: accepted
+---
+
+# Retry HTTP 500 within the current request's retry rounds
+
+Ordinary HTTP 500 failures cool credentials for later requests, but that cooldown would also prevent the failing request from using its configured retry rounds. Track each round's attempted credentials and per-model results, then allow a selection-only clone to bypass a cooldown applied by that request's recorded HTTP 500; the stored credential stays cooled for other requests and execution remains bounded by `request-retry`, credential limits, and existing error policies.
+
+Apply the tracking to execution, token counting, and stream establishment, preserve terminal-unauthorized protections, and exclude quota and explicit force-cooldown states from the bypass. Match the recorded auth generation and registration epoch so intervening updates or replacements normally invalidate a retry snapshot; the epoch check was added because replacement resets generation.
+
+The original review rounds narrowed a broad stored-error bypass to credentials attempted by the preceding round, tracked each concrete alias-pool model separately, preserved 429 cooldown floors, and required proof the 500 actually installed a cooldown rather than retaining a longer prior deadline. An intermediate policy in `09d0aab6` allowed a request's recorded 500 to bypass a concurrent 503 overwrite; `f9d92bae` explicitly abandoned it by recording generation after the result update and requiring an exact match. Credential-level bypass still works when unrelated model states exist, without clearing those model states.
+
+The first implementation was removed by [ADR-0003](0003-minimize-fork-divergence.md) and then reapplied. This design has three known concurrency limitations: unrelated results can suppress the bypass, an overlapping independent cooldown can disappear from the clone, and a stale result can be attributed to a replacement credential before the guard runs. The deferred redesign is recorded in [the local follow-up ticket](../../.scratch/fork-history-review/issues/01-http-500-retry-provenance.md); these are limitations, not intended guarantees.
+
+## Evidence
+
+[72b82af1](https://github.com/Fryuni/CLIProxyAPI/commit/72b82af1d3753b09bba789f4463fac2af514ec38), [bd312a1f](https://github.com/Fryuni/CLIProxyAPI/commit/bd312a1f1d3d89de1e7bb0bb9ca483b6ef6477a0), [675f7ac2](https://github.com/Fryuni/CLIProxyAPI/commit/675f7ac2c5eda4e4b9a4978ffaf178aed5af1763), [09d0aab6](https://github.com/Fryuni/CLIProxyAPI/commit/09d0aab671cdf4c1ca1675624e21e3a424a2ebf4), [cd1df863](https://github.com/Fryuni/CLIProxyAPI/commit/cd1df863debf5b72c2a1c47ddcf774efc8f35b0c), [f9d92bae](https://github.com/Fryuni/CLIProxyAPI/commit/f9d92bae6a2e263b3f5b6ff71497c716eec1fc43), [cc091700](https://github.com/Fryuni/CLIProxyAPI/commit/cc09170012118ff93a4475f10a5b382dcedf9e72), [b13568f6](https://github.com/Fryuni/CLIProxyAPI/commit/b13568f651fc0b9fd6f9d1904ce75255473b90dd), [5ac127ac](https://github.com/Fryuni/CLIProxyAPI/commit/5ac127ac12f2fe7c6e04c15286dfa32c54a1b3a8), [0c7dd79d](https://github.com/Fryuni/CLIProxyAPI/commit/0c7dd79de2200742e765b7a30b66207a4e4f2772), [a0135cde](https://github.com/Fryuni/CLIProxyAPI/commit/a0135cde35f77c757b59f3c5a4b995062293be3a), [ad5cc00f](https://github.com/Fryuni/CLIProxyAPI/commit/ad5cc00fb5392d1f9f771d00385658be422ee7ce), [0d829550](https://github.com/Fryuni/CLIProxyAPI/commit/0d829550ef5e192d5426ba48590a53a882a00efb), [8a63e962](https://github.com/Fryuni/CLIProxyAPI/commit/8a63e96239f853902c7a897de88469d24a91676e).
