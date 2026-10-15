@@ -29,6 +29,7 @@ var corsExposedResponseHeaders = []string{
 	"Location",
 	"Retry-After",
 	"X-Request-Id",
+	"X-Quota-Fetched-At",
 	"OpenAI-Request-Id",
 }
 

@@ -61,6 +61,9 @@ type Handler struct {
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
+	quotas                  quotaCache
+	quotaCtx                context.Context
+	stopQuotaRefresher      context.CancelFunc
 }
 
 type configReloadSnapshot struct {
@@ -83,6 +86,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
+	h.startQuotaRefresher()
 	return h
 }
 
