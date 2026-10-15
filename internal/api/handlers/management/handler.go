@@ -62,6 +62,7 @@ type Handler struct {
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
 	quotas                  quotaCache
+	quotaCtx                context.Context
 	stopQuotaRefresher      context.CancelFunc
 }
 

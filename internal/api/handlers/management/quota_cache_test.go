@@ -6,9 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -23,6 +23,8 @@ type scriptedQuota struct {
 	remaining float64
 	err       error
 	calls     map[string]int
+	// gate, when set, holds every fetch until it is closed.
+	gate chan struct{}
 }
 
 func (s *scriptedQuota) set(remaining float64, err error) {
@@ -39,6 +41,9 @@ func (s *scriptedQuota) callsFor(authID string) int {
 }
 
 func (s *scriptedQuota) fetch(_ context.Context, req pluginapi.QuotaFetchRequest) (pluginapi.QuotaFetchResponse, error) {
+	if s.gate != nil {
+		<-s.gate
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.calls == nil {
@@ -55,6 +60,12 @@ func (s *scriptedQuota) fetch(_ context.Context, req pluginapi.QuotaFetchRequest
 }
 
 func newQuotaCacheTestHandler(t *testing.T, quota *scriptedQuota, auths ...*coreauth.Auth) *Handler {
+	t.Helper()
+	h, _ := newQuotaCacheTestHandlerWithManager(t, quota, auths...)
+	return h
+}
+
+func newQuotaCacheTestHandlerWithManager(t *testing.T, quota *scriptedQuota, auths ...*coreauth.Auth) (*Handler, *coreauth.Manager) {
 	t.Helper()
 	manager := coreauth.NewManager(nil, nil, nil)
 	for _, auth := range auths {
@@ -73,16 +84,27 @@ func newQuotaCacheTestHandler(t *testing.T, quota *scriptedQuota, auths ...*core
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
 	t.Cleanup(h.Close)
 	h.SetPluginHost(host)
-	return h
+	return h, manager
 }
 
-func getPluginQuota(t *testing.T, h *Handler, authIndex string) (*httptest.ResponseRecorder, float64) {
-	t.Helper()
+// requestPluginQuota performs a v8 quota read without asserting, so goroutines may call it.
+func requestPluginQuota(h *Handler, authIndex string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
 	ctx.Params = gin.Params{{Key: "id", Value: "cloud-plugin"}}
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/v8/management/plugins/cloud-plugin/quota?auth_index="+authIndex, nil)
+	ctx.Set(ConfigV8ContextKey, true)
 	h.GetPluginQuota(ctx)
+	return rec
+}
+
+func getPluginQuota(t *testing.T, h *Handler, authIndex string) (*httptest.ResponseRecorder, float64) {
+	t.Helper()
+	return decodePluginQuota(t, requestPluginQuota(h, authIndex))
+}
+
+func decodePluginQuota(t *testing.T, rec *httptest.ResponseRecorder) (*httptest.ResponseRecorder, float64) {
+	t.Helper()
 	if rec.Code != http.StatusOK {
 		return rec, 0
 	}
@@ -189,27 +211,106 @@ func TestQuotaCacheRejectsFetchesOlderThanStateTheyRace(t *testing.T) {
 	key := quotaCacheKey{pluginID: "cloud-plugin", authID: "cloud-a"}
 	older := cache.begin()
 	newer := cache.begin()
-	cache.store(key, newer, pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 2}, time.Time{})
-	cache.store(key, older, pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 1}, time.Time{})
-	if entry, _ := cache.get(key); entry.resp.ServerTimeOffsetMs != 2 {
+	cache.store(key, quotaCacheEntry{seq: newer, resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 2}})
+	cache.store(key, quotaCacheEntry{seq: older, resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 1}})
+	if entry, _ := cache.get(key, credentialStamp{}); entry.resp.ServerTimeOffsetMs != 2 {
 		t.Fatalf("older fetch replaced newer value: %+v", entry.resp)
 	}
 
 	inFlight := cache.begin()
 	cache.invalidate(key.authID)
-	cache.store(key, inFlight, pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 3}, time.Time{})
-	if _, ok := cache.get(key); ok {
+	cache.store(key, quotaCacheEntry{seq: inFlight, resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 3}})
+	if _, ok := cache.get(key, credentialStamp{}); ok {
 		t.Fatal("fetch started before invalidation must not repopulate the cache")
 	}
-	cache.store(key, cache.begin(), pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 4}, time.Time{})
-	if entry, _ := cache.get(key); entry.resp.ServerTimeOffsetMs != 4 {
+	cache.store(key, quotaCacheEntry{seq: cache.begin(), resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 4}})
+	if entry, _ := cache.get(key, credentialStamp{}); entry.resp.ServerTimeOffsetMs != 4 {
 		t.Fatalf("fetch started after invalidation should be cached: %+v", entry.resp)
 	}
 
 	if keys := cache.retain(map[string]*coreauth.Auth{}); len(keys) != 0 {
 		t.Fatalf("removed credentials should be pruned, got %v", keys)
 	}
-	if _, ok := cache.get(key); ok {
+	if _, ok := cache.get(key, credentialStamp{}); ok {
 		t.Fatal("pruned entry still cached")
+	}
+}
+
+func TestPluginQuotaV0RoutesStillFetchLive(t *testing.T) {
+	quota := &scriptedQuota{remaining: 0.8}
+	auth := &coreauth.Auth{ID: "cloud-a", FileName: "cloud-a.json", Provider: "cloud"}
+	h := newQuotaCacheTestHandler(t, quota, auth)
+
+	for call := 1; call <= 2; call++ {
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Params = gin.Params{{Key: "id", Value: "cloud-plugin"}}
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/plugins/cloud-plugin/quota?auth_index="+auth.Index, nil)
+		h.GetPluginQuota(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("v0 call %d: status=%d body=%s", call, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get(quotaFetchedAtHeader); got != "" {
+			t.Fatalf("v0 response must not carry %s, got %q", quotaFetchedAtHeader, got)
+		}
+		if calls := quota.callsFor(auth.ID); calls != call {
+			t.Fatalf("v0 call %d should fetch live; calls=%d", call, calls)
+		}
+	}
+	if _, ok := h.quotas.get(quotaCacheKey{pluginID: "cloud-plugin", authID: auth.ID}, credentialStampOf(auth)); ok {
+		t.Fatal("v0 fetch must not populate the v8 cache")
+	}
+}
+
+func TestPluginQuotaIgnoresValueCachedForReplacedCredential(t *testing.T) {
+	quota := &scriptedQuota{remaining: 0.8}
+	auth := &coreauth.Auth{ID: "cloud-a", FileName: "cloud-a.json", Provider: "cloud"}
+	h, manager := newQuotaCacheTestHandlerWithManager(t, quota, auth)
+	getPluginQuota(t, h, auth.Index)
+
+	replacement := &coreauth.Auth{ID: auth.ID, FileName: auth.FileName, Provider: "cloud", Metadata: map[string]any{"access_token": "new"}}
+	if _, errRegister := manager.Register(context.Background(), replacement); errRegister != nil {
+		t.Fatalf("replace auth: %v", errRegister)
+	}
+	quota.set(0.2, nil)
+	if rec, remaining := getPluginQuota(t, h, auth.Index); rec.Code != http.StatusOK || remaining != 0.2 {
+		t.Fatalf("replaced credential must not reuse the old quota: status=%d remaining=%v", rec.Code, remaining)
+	}
+	if calls := quota.callsFor(auth.ID); calls != 2 {
+		t.Fatalf("replaced credential should be fetched again; calls=%d", calls)
+	}
+}
+
+func TestPluginQuotaCoalescesConcurrentUncachedFetches(t *testing.T) {
+	quota := &scriptedQuota{remaining: 0.6, gate: make(chan struct{})}
+	auth := &coreauth.Auth{ID: "cloud-a", FileName: "cloud-a.json", Provider: "cloud"}
+	h := newQuotaCacheTestHandler(t, quota, auth)
+
+	const callers = 4
+	results := make(chan *httptest.ResponseRecorder, callers)
+	for range callers {
+		go func() { results <- requestPluginQuota(h, auth.Index) }()
+	}
+	// Release the upstream fetch only once every other caller is waiting on it.
+	for {
+		h.quotas.mu.Lock()
+		waiting := 0
+		for _, flight := range h.quotas.flights {
+			waiting += flight.waiters
+		}
+		h.quotas.mu.Unlock()
+		if waiting == callers-1 {
+			break
+		}
+		runtime.Gosched()
+	}
+	close(quota.gate)
+	for range callers {
+		if rec, remaining := decodePluginQuota(t, <-results); rec.Code != http.StatusOK || remaining != 0.6 {
+			t.Fatalf("caller got status=%d remaining=%v body=%s", rec.Code, remaining, rec.Body.String())
+		}
+	}
+	if calls := quota.callsFor(auth.ID); calls != 1 {
+		t.Fatalf("concurrent uncached reads should share one upstream fetch; calls=%d", calls)
 	}
 }

@@ -282,8 +282,29 @@ func (h *Handler) fetchQuotaForPlugin(c *gin.Context, pluginID, authIndex string
 		return
 	}
 
+	// The deprecated v0 routes keep fetching live; the cache only backs the v8 contract.
+	if !c.GetBool(ConfigV8ContextKey) {
+		quotaResp, handled, errFetch := host.FetchQuotaByPlugin(c.Request.Context(), pluginID, pluginapi.QuotaFetchRequest{
+			AuthIndex:  auth.Index,
+			AuthID:     auth.ID,
+			Provider:   auth.Provider,
+			Metadata:   auth.Metadata,
+			Attributes: auth.Attributes,
+		})
+		if !handled {
+			c.JSON(http.StatusNotFound, gin.H{"error": "quota provider not found for plugin"})
+			return
+		}
+		if errFetch != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errFetch)})
+			return
+		}
+		c.JSON(http.StatusOK, quotaResp)
+		return
+	}
+
 	// Serve the background-refreshed value; only an uncached credential is fetched live.
-	if entry, ok := h.quotas.get(quotaCacheKey{pluginID: pluginID, authID: auth.ID}); ok {
+	if entry, ok := h.quotas.get(quotaCacheKey{pluginID: pluginID, authID: auth.ID}, credentialStampOf(auth)); ok {
 		writeCachedQuota(c, entry)
 		return
 	}
