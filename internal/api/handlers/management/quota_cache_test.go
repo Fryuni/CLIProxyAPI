@@ -213,25 +213,25 @@ func TestQuotaCacheRejectsFetchesOlderThanStateTheyRace(t *testing.T) {
 	newer := cache.begin()
 	cache.store(key, quotaCacheEntry{seq: newer, resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 2}})
 	cache.store(key, quotaCacheEntry{seq: older, resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 1}})
-	if entry, _ := cache.get(key, credentialStamp{}); entry.resp.ServerTimeOffsetMs != 2 {
+	if entry, _ := cache.get(key, ""); entry.resp.ServerTimeOffsetMs != 2 {
 		t.Fatalf("older fetch replaced newer value: %+v", entry.resp)
 	}
 
 	inFlight := cache.begin()
 	cache.invalidate(key.authID)
 	cache.store(key, quotaCacheEntry{seq: inFlight, resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 3}})
-	if _, ok := cache.get(key, credentialStamp{}); ok {
+	if _, ok := cache.get(key, ""); ok {
 		t.Fatal("fetch started before invalidation must not repopulate the cache")
 	}
 	cache.store(key, quotaCacheEntry{seq: cache.begin(), resp: pluginapi.QuotaFetchResponse{ServerTimeOffsetMs: 4}})
-	if entry, _ := cache.get(key, credentialStamp{}); entry.resp.ServerTimeOffsetMs != 4 {
+	if entry, _ := cache.get(key, ""); entry.resp.ServerTimeOffsetMs != 4 {
 		t.Fatalf("fetch started after invalidation should be cached: %+v", entry.resp)
 	}
 
 	if keys := cache.retain(map[string]*coreauth.Auth{}); len(keys) != 0 {
 		t.Fatalf("removed credentials should be pruned, got %v", keys)
 	}
-	if _, ok := cache.get(key, credentialStamp{}); ok {
+	if _, ok := cache.get(key, ""); ok {
 		t.Fatal("pruned entry still cached")
 	}
 }
@@ -262,22 +262,65 @@ func TestPluginQuotaV0RoutesStillFetchLive(t *testing.T) {
 	}
 }
 
-func TestPluginQuotaIgnoresValueCachedForReplacedCredential(t *testing.T) {
+func TestPluginQuotaIgnoresValueCachedForAnotherAccount(t *testing.T) {
 	quota := &scriptedQuota{remaining: 0.8}
-	auth := &coreauth.Auth{ID: "cloud-a", FileName: "cloud-a.json", Provider: "cloud"}
+	auth := &coreauth.Auth{ID: "cloud-a", FileName: "cloud-a.json", Provider: "cloud", Metadata: map[string]any{"email": "old@example.com", "project_id": "p1"}}
 	h, manager := newQuotaCacheTestHandlerWithManager(t, quota, auth)
 	getPluginQuota(t, h, auth.Index)
 
-	replacement := &coreauth.Auth{ID: auth.ID, FileName: auth.FileName, Provider: "cloud", Metadata: map[string]any{"access_token": "new"}}
+	replacement := &coreauth.Auth{ID: auth.ID, FileName: auth.FileName, Provider: "cloud", Metadata: map[string]any{"email": "old@example.com", "project_id": "p2"}}
 	if _, errRegister := manager.Register(context.Background(), replacement); errRegister != nil {
 		t.Fatalf("replace auth: %v", errRegister)
 	}
 	quota.set(0.2, nil)
 	if rec, remaining := getPluginQuota(t, h, auth.Index); rec.Code != http.StatusOK || remaining != 0.2 {
-		t.Fatalf("replaced credential must not reuse the old quota: status=%d remaining=%v", rec.Code, remaining)
+		t.Fatalf("another account must not reuse the old quota: status=%d remaining=%v", rec.Code, remaining)
 	}
 	if calls := quota.callsFor(auth.ID); calls != 2 {
-		t.Fatalf("replaced credential should be fetched again; calls=%d", calls)
+		t.Fatalf("another account should be fetched again; calls=%d", calls)
+	}
+}
+
+func TestPluginQuotaKeepsCachedValueAcrossTokenRefresh(t *testing.T) {
+	quota := &scriptedQuota{remaining: 0.8}
+	auth := &coreauth.Auth{ID: "cloud-a", FileName: "cloud-a.json", Provider: "cloud", Metadata: map[string]any{
+		"email": "user@example.com",
+		"token": map[string]any{"access_token": "old", "refresh_token": "r1", "expiry": "2026-10-15T20:00:00Z"},
+	}}
+	h, manager := newQuotaCacheTestHandlerWithManager(t, quota, auth)
+	getPluginQuota(t, h, auth.Index)
+
+	refreshed := &coreauth.Auth{ID: auth.ID, FileName: auth.FileName, Provider: "cloud", Metadata: map[string]any{
+		"email": "user@example.com",
+		"token": map[string]any{"access_token": "new", "refresh_token": "r2", "expiry": "2026-10-15T21:00:00Z"},
+	}}
+	if _, errRegister := manager.Register(context.Background(), refreshed); errRegister != nil {
+		t.Fatalf("refresh auth: %v", errRegister)
+	}
+	quota.set(0, errors.New("429 rate limited"))
+	if rec, remaining := getPluginQuota(t, h, auth.Index); rec.Code != http.StatusOK || remaining != 0.8 {
+		t.Fatalf("token refresh must keep the cached quota: status=%d remaining=%v body=%s", rec.Code, remaining, rec.Body.String())
+	}
+	if calls := quota.callsFor(auth.ID); calls != 1 {
+		t.Fatalf("token refresh should not force a live fetch; calls=%d", calls)
+	}
+}
+
+func TestQuotaCacheResetDetachesInFlightFetches(t *testing.T) {
+	var cache quotaCache
+	key := quotaFlightKey{quotaCacheKey: quotaCacheKey{pluginID: "cloud-plugin", authID: "cloud-a"}, stamp: "s"}
+	preReset, leader := cache.join(key)
+	if !leader {
+		t.Fatal("first caller should lead the fetch")
+	}
+	cache.invalidate(key.authID)
+	postReset, leader := cache.join(key)
+	if !leader || postReset == preReset {
+		t.Fatal("a read after reset must start its own fetch instead of joining the pre-reset one")
+	}
+	cache.finish(key, preReset)
+	if joined, leader := cache.join(key); leader || joined != postReset {
+		t.Fatal("finishing the pre-reset fetch must not detach the post-reset one")
 	}
 }
 

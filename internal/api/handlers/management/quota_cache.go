@@ -2,6 +2,9 @@ package management
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -26,15 +29,59 @@ type quotaCacheKey struct {
 	authID   string
 }
 
-// credentialStamp identifies one registration of one credential's secret material,
-// so a quota fetched for replaced credentials is never served for their successor.
-type credentialStamp struct {
-	registrationEpoch uint64
-	credentialVersion uint64
+// quotaRotatingFields are token fields that a routine refresh rewrites for the same
+// account. They are left out of the fingerprint so a refresh keeps the cached quota.
+var quotaRotatingFields = map[string]struct{}{
+	"access_token": {}, "accessToken": {},
+	"refresh_token": {}, "refreshToken": {},
+	"id_token": {}, "idToken": {},
+	"expiry": {}, "expired": {}, "expires_at": {}, "expiresAt": {}, "expires_in": {}, "expiresIn": {},
+	"last_refresh": {}, "lastRefresh": {}, "timestamp": {},
 }
 
+// credentialStamp fingerprints the quota request inputs of a credential, so a value
+// fetched for another account, project, or key is never served after they change.
+type credentialStamp string
+
 func credentialStampOf(auth *coreauth.Auth) credentialStamp {
-	return credentialStamp{registrationEpoch: auth.RegistrationEpoch, credentialVersion: auth.CredentialVersion}
+	attributes := make(map[string]string, len(auth.Attributes))
+	for key, value := range auth.Attributes {
+		if _, rotating := quotaRotatingFields[key]; !rotating {
+			attributes[key] = value
+		}
+	}
+	inputs := map[string]any{
+		"provider":   auth.Provider,
+		"metadata":   withoutRotatingFields(auth.Metadata),
+		"attributes": attributes,
+	}
+	raw, errMarshal := json.Marshal(inputs)
+	if errMarshal != nil {
+		raw = []byte(fmt.Sprintf("%#v", inputs))
+	}
+	sum := sha256.Sum256(raw)
+	return credentialStamp(hex.EncodeToString(sum[:]))
+}
+
+func withoutRotatingFields(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, nested := range typed {
+			if _, rotating := quotaRotatingFields[key]; !rotating {
+				out[key] = withoutRotatingFields(nested)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for index, nested := range typed {
+			out[index] = withoutRotatingFields(nested)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 type quotaCacheEntry struct {
@@ -42,6 +89,11 @@ type quotaCacheEntry struct {
 	fetchedAt time.Time
 	stamp     credentialStamp
 	seq       uint64
+}
+
+type quotaFlightKey struct {
+	quotaCacheKey
+	stamp credentialStamp
 }
 
 // quotaFlight is one upstream fetch shared by every caller asking for the same quota.
@@ -60,7 +112,7 @@ type quotaCache struct {
 	seq         uint64
 	entries     map[quotaCacheKey]quotaCacheEntry
 	invalidated map[string]uint64 // auth ID -> last sequence issued before invalidation
-	flights     map[string]*quotaFlight
+	flights     map[quotaFlightKey]*quotaFlight
 }
 
 // begin returns the ordering token for a fetch that starts now.
@@ -99,13 +151,19 @@ func (c *quotaCache) store(key quotaCacheKey, entry quotaCacheEntry) {
 	c.entries[key] = entry
 }
 
-// invalidate drops every cached quota for a credential, and rejects fetches already in flight.
+// invalidate drops every cached quota for a credential, and detaches fetches already
+// in flight so neither the cache nor later readers receive their results.
 func (c *quotaCache) invalidate(authID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key := range c.entries {
 		if key.authID == authID {
 			delete(c.entries, key)
+		}
+	}
+	for key := range c.flights {
+		if key.authID == authID {
+			delete(c.flights, key)
 		}
 	}
 	if c.invalidated == nil {
@@ -137,7 +195,7 @@ func (c *quotaCache) retain(live map[string]*coreauth.Auth) []quotaCacheKey {
 }
 
 // join returns the in-flight fetch for key, and whether the caller must run it.
-func (c *quotaCache) join(key string) (*quotaFlight, bool) {
+func (c *quotaCache) join(key quotaFlightKey) (*quotaFlight, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if flight, ok := c.flights[key]; ok {
@@ -145,16 +203,18 @@ func (c *quotaCache) join(key string) (*quotaFlight, bool) {
 		return flight, false
 	}
 	if c.flights == nil {
-		c.flights = make(map[string]*quotaFlight)
+		c.flights = make(map[quotaFlightKey]*quotaFlight)
 	}
 	flight := &quotaFlight{done: make(chan struct{})}
 	c.flights[key] = flight
 	return flight, true
 }
 
-func (c *quotaCache) finish(key string, flight *quotaFlight) {
+func (c *quotaCache) finish(key quotaFlightKey, flight *quotaFlight) {
 	c.mu.Lock()
-	delete(c.flights, key)
+	if c.flights[key] == flight {
+		delete(c.flights, key)
+	}
 	c.mu.Unlock()
 	close(flight.done)
 }
@@ -234,7 +294,7 @@ func (h *Handler) refreshQuotas(ctx context.Context) {
 func (h *Handler) fetchAndCacheQuota(ctx context.Context, host *pluginhost.Host, pluginID string, auth *coreauth.Auth) (quotaCacheEntry, bool, error) {
 	key := quotaCacheKey{pluginID: pluginID, authID: auth.ID}
 	stamp := credentialStampOf(auth)
-	flightKey := fmt.Sprintf("%s\x00%s\x00%d\x00%d", pluginID, auth.ID, stamp.registrationEpoch, stamp.credentialVersion)
+	flightKey := quotaFlightKey{quotaCacheKey: key, stamp: stamp}
 	flight, leader := h.quotas.join(flightKey)
 	if leader {
 		fetchCtx := h.quotaCtx
