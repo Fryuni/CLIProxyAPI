@@ -1,6 +1,6 @@
 # Record the hash of the config that a reload actually applied
 
-Status: needs-triage
+Status: resolved
 Type: task
 
 ## Context
@@ -28,3 +28,5 @@ Disabling only the post-reload re-read lowered the failure rate from about 15 in
 ## Comments
 
 Recorded during the upstream `0d18d3b3` sync. Until this is fixed upstream or here, a failure of this test in fork CI is a known upstream flake, not a sync regression.
+
+Upstream sync `911f49cb` ([ADR-0024](../../../docs/adr/0024-sync-upstream-911f49cb.md)): upstream `1631875b` implements the intended fix. `reloadConfigIfChanged` holds `configApplyMu` for the whole reload, and it records `SourceHash`, the hash of the bytes that `LoadConfig` parsed, instead of re-reading the file. Management saves are fenced against stale reloads as well. The fork keeps upstream's implementation. The acceptance run still fails occasionally, but no longer for this defect: across 500 runs on the merged tree and clean upstream, every failure was at the test's final-prefix assertion, and the stale openai-compatibility configuration did not recur. [A follow-up ticket](../../auth-file-patch-lost-update/issues/01-fence-watcher-auth-updates-against-management-writes.md) records the remaining causes. This ticket is resolved.
