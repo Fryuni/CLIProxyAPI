@@ -329,35 +329,45 @@ func TestExecutionPathsRetryHTTP500WithoutForwardingFailure(t *testing.T) {
 		},
 	}
 
-	for _, path := range paths {
-		t.Run(path.name, func(t *testing.T) {
-			manager := NewManager(nil, nil, nil)
-			manager.SetRetryConfig(1, 0, 0)
-			executor := &transportThenSuccessExecutor{
-				identifier: "codex",
-				fail: &Error{
-					HTTPStatus: http.StatusInternalServerError,
-					Message:    "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection",
-				},
-			}
-			manager.RegisterExecutor(executor)
+	failures := []struct {
+		name    string
+		message string
+	}{
+		{name: "closed-network", message: "read tcp [2001:db8::1]:54514->[2001:db8::2]:443: use of closed network connection"},
+		// An ordinary HTTP 500 cools the credential. The retry round bypasses that
+		// cooldown, and its success, dispatched after the cooldown was recorded,
+		// must clear it despite the stale-success guard.
+		{name: "server-error", message: "upstream server error"},
+	}
 
-			model := "gpt-6-astra-" + uuid.NewString()
-			authID := "codex-http-500-" + uuid.NewString()
-			registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
-			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
-			if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
-				t.Fatalf("register auth: %v", errRegister)
-			}
+	for _, failure := range failures {
+		for _, path := range paths {
+			t.Run(failure.name+"/"+path.name, func(t *testing.T) {
+				manager := NewManager(nil, nil, nil)
+				manager.SetRetryConfig(1, 0, 0)
+				executor := &transportThenSuccessExecutor{
+					identifier: "codex",
+					fail:       &Error{HTTPStatus: http.StatusInternalServerError, Message: failure.message},
+				}
+				manager.RegisterExecutor(executor)
 
-			if errExecute := path.invoke(manager, cliproxyexecutor.Request{Model: model}); errExecute != nil {
-				t.Fatalf("execution error = %v, want success after HTTP 500 retry", errExecute)
-			}
-			if calls := executor.callCount(); calls != 2 {
-				t.Fatalf("executor calls = %d, want 2", calls)
-			}
-			assertNoCooldown(t, manager, authID, model)
-		})
+				model := "gpt-6-astra-" + uuid.NewString()
+				authID := "codex-http-500-" + uuid.NewString()
+				registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+				if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+					t.Fatalf("register auth: %v", errRegister)
+				}
+
+				if errExecute := path.invoke(manager, cliproxyexecutor.Request{Model: model}); errExecute != nil {
+					t.Fatalf("execution error = %v, want success after HTTP 500 retry", errExecute)
+				}
+				if calls := executor.callCount(); calls != 2 {
+					t.Fatalf("executor calls = %d, want 2", calls)
+				}
+				assertNoCooldown(t, manager, authID, model)
+			})
+		}
 	}
 }
 
@@ -546,6 +556,53 @@ func TestHTTP500RetryRoundIgnoresResultFromPreviousRegistrationEpoch(t *testing.
 		t.Fatalf("attempt = %#v, want stale result left unrecorded", attempt)
 	}
 	assertNoCooldown(t, manager, authID, model)
+}
+
+func TestHTTP500RetryRoundDoesNotBypassCredentialQuotaWrap(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	quotaModel := "gpt-6-astra-quota-" + uuid.NewString()
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "credential-quota-http-500-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: quotaModel}, {ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), Result{
+		AuthID:          authID,
+		Provider:        "codex",
+		Model:           quotaModel,
+		Success:         false,
+		CredentialScope: true,
+		Error:           &Error{HTTPStatus: http.StatusTooManyRequests, Message: "credential quota exhausted"},
+	})
+
+	// The 500 lands on the model's independent layer beneath the credential
+	// quota, so the presented state stays quota-exceeded.
+	attempted := map[string]requestRetryAttempt{authID: {}}
+	ctx := withAttemptedAuthResultTracker(context.Background(), attempted)
+	manager.MarkResult(ctx, Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream server error"},
+	})
+
+	stored, ok := manager.GetByID(authID)
+	if !ok || stored == nil {
+		t.Fatal("expected auth to be present")
+	}
+	if state := stored.ModelStates[model]; state == nil || !state.Quota.Exceeded || state.Quota.Reason != "credential_quota" {
+		t.Fatalf("model state = %#v, want credential quota wrap", state)
+	}
+	if candidate := http500RetryRoundCandidate(stored, model, time.Now(), attempted[authID]); candidate != stored {
+		t.Fatalf("http500RetryRoundCandidate() = %#v, want credential quota wrap kept", candidate)
+	}
 }
 
 func TestHTTP500RetryWaitUsesEachAttemptedCredentialFailure(t *testing.T) {
