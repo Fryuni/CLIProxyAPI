@@ -18,9 +18,13 @@ Upstream also implements work the fork had recorded. `a19a8ecd` makes the same t
 Under ADR-0004's test policy, two upstream tests that fork CI runs fail intermittently on clean upstream. Both have runtime causes, so each is recorded as a local ticket and neither the runtime nor the test is patched:
 
 - `TestResponsesLateInterruptDoesNotPoisonNextCreate`: an interrupt sent right after a turn's terminal event can be misrouted to the local HTTP interrupt path ([ticket](../../.scratch/responses-late-interrupt-race/issues/01-reject-interrupts-after-terminal-event.md)).
-- `TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559`: a watcher auth reload can revert a newer management PATCH, and the test asserts before asynchronous model registration completes ([ticket](../../.scratch/auth-file-patch-lost-update/issues/01-fence-watcher-auth-updates-against-management-writes.md)).
+- `TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559`: a watcher auth reload can revert a newer management PATCH, and the test asserts before asynchronous model registration completes ([ticket](../../.scratch/auth-file-patch-lost-update/issues/01-fence-watcher-auth-updates-against-management-writes.md)). In one CI run, both management requests also returned 404, probably because a reload applied a partially written config without its secret key ([ticket](../../.scratch/config-write-atomicity/issues/01-write-config-atomically.md)).
 
-Automated review of the merged upstream diff found one defect in upstream code. It is recorded as a local ticket for the same reason, without patching the translator: Gemini-to-Claude tool-use IDs come from a process-local counter, so they can repeat after a restart or across replicas ([ticket](../../.scratch/gemini-claude-tool-id-restart/issues/01-make-generated-tool-ids-unique-across-processes.md)).
+Automated review of the merged upstream diff found three defects in upstream code. Each is recorded as a local ticket for the same reason, without patching the runtime or the translator:
+
+- Gemini-to-Claude tool-use IDs come from a process-local counter, so they can repeat after a restart or across replicas ([ticket](../../.scratch/gemini-claude-tool-id-restart/issues/01-make-generated-tool-ids-unique-across-processes.md)).
+- A re-created plugin auth file that parses to zero auths suppresses the queued delete, leaving the old credential active ([ticket](../../.scratch/auth-file-empty-snapshot-delete/issues/01-treat-empty-auth-snapshots-as-definitive.md)).
+- Model-registration fences ignore credential state, so a stale plugin update can roll back refreshed tokens ([ticket](../../.scratch/registration-fence-credential-version/issues/01-fence-plugin-registration-on-credential-state.md)).
 
 `TestCodexClientModelsApplyPatchRouting` also fails, but only when its package runs more than once in one process (`-count` above 1). An earlier iteration's WebSocket test leaves a `gpt-5.4` registration behind. Fork CI runs each test once, so this is not recorded.
 

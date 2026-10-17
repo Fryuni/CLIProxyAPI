@@ -24,4 +24,6 @@ The test passes 300 consecutive runs (`go test -count=300 -run '^TestPutOpenAICo
 
 ## Comments
 
+Fork CI on PR #13 also saw a third failure mode, where both management requests returned 404. It is recorded separately in [the config-write ticket](../../config-write-atomicity/issues/01-write-config-atomically.md).
+
 Recorded during the upstream `911f49cb` sync. The test is unchanged as well: a test-only wait would still leave the runtime lost update. Until this is fixed upstream or here, a failure of this test in fork CI is a known upstream flake, not a sync regression.
