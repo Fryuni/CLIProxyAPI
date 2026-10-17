@@ -19,6 +19,10 @@ Under ADR-0004's test policy, the fork repairs four upstream tests that fail on 
 - Pre-first-token keepalives can commit response headers before upstream headers resolve ([ticket](../../.scratch/keepalive-upstream-headers/issues/01-preserve-headers-after-pre-token-keepalive.md)).
 - Claude payload rules cannot affect `prompt_cache_options` ([ticket](../../.scratch/claude-prompt-cache-payload-rules/issues/01-let-payload-rules-reach-prompt-cache-options.md)).
 
+## Upstream implementation notes
+
+Upstream `a19a8ecd`, merged by [ADR-0024](0024-sync-upstream-911f49cb.md), moves the same two catalog tests to the same replacement models, so the fork no longer carries those repairs. The interrupt and WebSocket retry-bind repairs remain fork-only. Upstream `1631875b` implements the config-reload ticket's intended fix: reloads are serialized and record the hash of the bytes they parsed. That ticket is resolved. `TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559` still fails occasionally for other reasons, which [a follow-up ticket](../../.scratch/auth-file-patch-lost-update/issues/01-fence-watcher-auth-updates-against-management-writes.md) records. The three review-finding tickets above are unchanged upstream.
+
 ## Evidence
 
 Upstream [`6920ed5d`](https://github.com/router-for-me/CLIProxyAPI/commit/6920ed5d), [`8a01bc02`](https://github.com/router-for-me/CLIProxyAPI/commit/8a01bc02), [`56eee6a4`](https://github.com/router-for-me/CLIProxyAPI/commit/56eee6a4), [`7a687f42`](https://github.com/router-for-me/CLIProxyAPI/commit/7a687f42), [`f62d4d28`](https://github.com/router-for-me/CLIProxyAPI/commit/f62d4d28), [`6331b38b`](https://github.com/router-for-me/CLIProxyAPI/commit/6331b38b), [`1672be5d`](https://github.com/router-for-me/CLIProxyAPI/commit/1672be5d), and [`dd7b4334`](https://github.com/router-for-me/CLIProxyAPI/commit/dd7b4334). On a clean `0d18d3b3` checkout, the two catalog tests failed on every run, and the interrupt and `Issue6559` tests each failed in roughly a third or more of 40 runs. The WebSocket retry-bind test failed only under CPU contention, in dozens of 3,600 runs, and in none of 7,200 after the repair.
