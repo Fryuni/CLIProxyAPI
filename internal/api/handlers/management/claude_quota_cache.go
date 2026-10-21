@@ -10,13 +10,27 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
 const claudeQuotaSource = "builtin:claude:"
 const claudeQuotaBaseURL = "https://api.anthropic.com/api/oauth/"
+
+// claudeQuotaHeaders matches the built-in management card, independently of
+// executor device defaults. Matching and probing must use the same representation.
+func claudeQuotaHeaders(resource, token string) http.Header {
+	headers := http.Header{
+		"Authorization":  {"Bearer " + token},
+		"Content-Type":   {"application/json"},
+		"Anthropic-Beta": {"oauth-2025-04-20"},
+		"User-Agent":     {"claude-cli/2.1.280 (external, cli)"},
+	}
+	if resource == "usage" {
+		headers.Set("Accept", "application/json")
+	}
+	return headers
+}
 
 func isClaudeQuotaCredential(auth *coreauth.Auth) bool {
 	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") &&
@@ -51,34 +65,16 @@ func (h *Handler) serveClaudeQuotaAPICall(c *gin.Context, body apiCallRequest, a
 	}
 	// Never serve this credential's cached response for caller-supplied credentials,
 	// host overrides, or headers that may select a different upstream representation.
+	canonical := claudeQuotaHeaders(resource, "$TOKEN$")
 	seen := make(map[string]bool, len(body.Header))
 	for key, value := range body.Header {
-		name := strings.ToLower(key)
-		seen[name] = true
-		switch name {
-		case "authorization":
-			if value != "Bearer $TOKEN$" {
-				return false
-			}
-		case "accept", "content-type":
-			if value != "application/json" {
-				return false
-			}
-		case "anthropic-beta":
-			if value != "oauth-2025-04-20" {
-				return false
-			}
-		case "user-agent":
-			if strings.TrimSpace(value) == "" {
-				return false
-			}
-		default:
+		name := http.CanonicalHeaderKey(key)
+		if seen[name] || canonical.Get(name) == "" || value != canonical.Get(name) {
 			return false
 		}
+		seen[name] = true
 	}
-	// The panel includes Accept on usage reads, but omits it on profile reads.
-	if !seen["authorization"] || !seen["anthropic-beta"] || !seen["content-type"] || !seen["user-agent"] ||
-		(resource == "usage" && !seen["accept"]) || (resource == "profile" && seen["accept"]) {
+	if len(seen) != len(canonical) {
 		return false
 	}
 	key := claudeQuotaKey(auth.ID, resource)
@@ -109,12 +105,8 @@ func (h *Handler) startClaudeQuotaFetch(auth *coreauth.Auth, resource string, re
 		if errRequest != nil {
 			return quotaCacheEntry{}, true, errRequest
 		}
-		req.Header.Set("Authorization", "Bearer "+tokenValueFromMetadata(auth.Metadata))
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+		req.Header = claudeQuotaHeaders(resource, tokenValueFromMetadata(auth.Metadata))
 		h.mu.Lock()
-		req.Header.Set("User-Agent", "claude-cli/"+helps.DefaultClaudeVersion(h.cfg)+" (external, cli)")
 		transport := h.apiCallTransport(auth, "")
 		h.mu.Unlock()
 		client := &http.Client{Transport: transport}

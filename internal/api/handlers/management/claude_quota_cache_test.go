@@ -218,6 +218,9 @@ func TestClaudeQuotaAPICallLeavesOtherRequestsLive(t *testing.T) {
 		{name: "missing content type", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "Content-Type") }},
 		{name: "missing usage accept", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "Accept") }},
 		{name: "missing user agent", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "User-Agent") }},
+		{name: "custom user agent", v8: true, mutate: func(r *apiCallRequest) { r.Header["User-Agent"] = "custom-client/1.0" }},
+		{name: "different CLI version", v8: true, mutate: func(r *apiCallRequest) { r.Header["User-Agent"] = "claude-cli/2.2.0 (external, cli)" }},
+		{name: "duplicate header case", v8: true, mutate: func(r *apiCallRequest) { r.Header["user-agent"] = r.Header["User-Agent"] }},
 		{name: "extra profile accept", resource: "profile", v8: true, mutate: func(r *apiCallRequest) { r.Header["Accept"] = "application/json" }},
 	}
 	for _, tc := range cases {
@@ -240,6 +243,44 @@ func TestClaudeQuotaAPICallLeavesOtherRequestsLive(t *testing.T) {
 				t.Fatalf("unrelated APICall was cached: calls=%d response=%+v", calls.Load(), response)
 			}
 		})
+	}
+}
+
+func TestClaudeQuotaProbesPreserveCanonicalHeaders(t *testing.T) {
+	type observation struct {
+		path    string
+		headers http.Header
+	}
+	observed := make(chan observation, 4)
+	auth := claudeQuotaTestAuth("claude-a")
+	h, _, advance := newClaudeQuotaHTTPTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		observed <- observation{path: r.URL.Path, headers: r.Header.Clone()}
+		_, _ = w.Write([]byte(`{"account":{"has_claude_pro":true}}`))
+	}, auth)
+	// Executor header defaults must not change the management card's request.
+	h.cfg.ClaudeHeaderDefaults.UserAgent = "claude-cli/2.2.0 (external, cli)"
+	for _, resource := range []string{"usage", "profile"} {
+		requestClaudeQuotaAPICall(t, h, auth, resource, true, nil)
+	}
+	advance(quotaRefreshInterval)
+	refreshQuotasAndWait(h)
+	for range 4 {
+		got := <-observed
+		wantAccept := ""
+		if got.path == "/api/oauth/usage" {
+			wantAccept = "application/json"
+		}
+		for name, want := range map[string]string{
+			"Authorization":  "Bearer test-token-claude-a",
+			"Content-Type":   "application/json",
+			"anthropic-beta": "oauth-2025-04-20",
+			"User-Agent":     "claude-cli/2.1.280 (external, cli)",
+			"Accept":         wantAccept,
+		} {
+			if value := got.headers.Get(name); value != want {
+				t.Errorf("%s probe header %s=%q, want %q", got.path, name, value, want)
+			}
+		}
 	}
 }
 
