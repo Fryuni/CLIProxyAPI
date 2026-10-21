@@ -135,6 +135,9 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	authIndex := firstNonEmptyString(body.AuthIndexSnake, body.AuthIndexCamel, body.AuthIndexPascal)
 	auth := h.authByIndex(authIndex)
+	if h.serveClaudeQuotaAPICall(c, body, auth) {
+		return
+	}
 
 	reqHeaders := body.Header
 	if reqHeaders == nil {

@@ -64,6 +64,7 @@ type Handler struct {
 	quotas                  quotaCache
 	quotaCtx                context.Context
 	stopQuotaRefresher      context.CancelFunc
+	quotaRefreshRequests    chan struct{}
 }
 
 type configReloadSnapshot struct {
@@ -73,6 +74,10 @@ type configReloadSnapshot struct {
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
+	return newHandler(cfg, configFilePath, manager, true)
+}
+
+func newHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager, refreshQuotas bool) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
 
@@ -86,7 +91,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
-	h.startQuotaRefresher()
+	if refreshQuotas {
+		h.startQuotaRefresher()
+	}
 	return h
 }
 
@@ -123,6 +130,12 @@ func (h *Handler) purgeStaleAttempts() {
 // NewHandler creates a new management handler instance.
 func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager) *Handler {
 	return NewHandler(cfg, "", manager)
+}
+
+// NewTokenRequestHandler creates a handler for the SDK's token-only interface,
+// which exposes neither quota endpoints nor a background-work lifecycle.
+func NewTokenRequestHandler(cfg *config.Config, manager *coreauth.Manager) *Handler {
+	return newHandler(cfg, "", manager, false)
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.
@@ -166,6 +179,7 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 		h.authManager = manager
 	}
 	h.mu.Unlock()
+	h.requestQuotaRefresh()
 }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.
@@ -178,6 +192,7 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 		h.pluginHost = host
 	}
 	h.mu.Unlock()
+	h.requestQuotaRefresh()
 }
 
 // SetConfigReloadHook updates the callback used after management saves config changes.
