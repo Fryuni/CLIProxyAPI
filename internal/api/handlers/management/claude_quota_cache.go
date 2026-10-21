@@ -51,14 +51,15 @@ func (h *Handler) serveClaudeQuotaAPICall(c *gin.Context, body apiCallRequest, a
 	}
 	// Never serve this credential's cached response for caller-supplied credentials,
 	// host overrides, or headers that may select a different upstream representation.
-	authorized := false
+	seen := make(map[string]bool, len(body.Header))
 	for key, value := range body.Header {
-		switch strings.ToLower(key) {
+		name := strings.ToLower(key)
+		seen[name] = true
+		switch name {
 		case "authorization":
 			if value != "Bearer $TOKEN$" {
 				return false
 			}
-			authorized = true
 		case "accept", "content-type":
 			if value != "application/json" {
 				return false
@@ -68,11 +69,16 @@ func (h *Handler) serveClaudeQuotaAPICall(c *gin.Context, body apiCallRequest, a
 				return false
 			}
 		case "user-agent":
+			if strings.TrimSpace(value) == "" {
+				return false
+			}
 		default:
 			return false
 		}
 	}
-	if !authorized {
+	// The panel includes Accept on usage reads, but omits it on profile reads.
+	if !seen["authorization"] || !seen["anthropic-beta"] || !seen["content-type"] || !seen["user-agent"] ||
+		(resource == "usage" && !seen["accept"]) {
 		return false
 	}
 	key := claudeQuotaKey(auth.ID, resource)

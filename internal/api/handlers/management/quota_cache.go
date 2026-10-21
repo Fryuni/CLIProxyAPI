@@ -99,13 +99,17 @@ type quotaFlightKey struct {
 
 // quotaFlight is one upstream fetch shared by every caller asking for the same quota.
 type quotaFlight struct {
-	done    chan struct{}
-	waiters int
-	entry   quotaCacheEntry
-	handled bool
-	err     error
-	seq     uint64
-	retryAt time.Time
+	done     chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
+	replaced chan struct{}
+	next     *quotaFlight
+	waiters  int
+	entry    quotaCacheEntry
+	handled  bool
+	err      error
+	seq      uint64
+	retryAt  time.Time
 }
 
 // quotaCache keeps the last successful quota fetch per source and credential,
@@ -150,6 +154,10 @@ func (c *quotaCache) get(key quotaCacheKey, stamp credentialStamp) (quotaCacheEn
 func (c *quotaCache) store(key quotaCacheKey, entry quotaCacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.storeLocked(key, entry)
+}
+
+func (c *quotaCache) storeLocked(key quotaCacheKey, entry quotaCacheEntry) {
 	if entry.seq <= c.invalidated[key.authID] {
 		return
 	}
@@ -160,6 +168,14 @@ func (c *quotaCache) store(key quotaCacheKey, entry quotaCacheEntry) {
 		c.entries = make(map[quotaCacheKey]quotaCacheEntry)
 	}
 	c.entries[key] = entry
+}
+
+func (c *quotaCache) storeFlight(key quotaFlightKey, flight *quotaFlight, entry quotaCacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.flights[key] == flight {
+		c.storeLocked(key.quotaCacheKey, entry)
+	}
 }
 
 // invalidate drops every cached quota for a credential, and detaches fetches already
@@ -213,12 +229,13 @@ func (c *quotaCache) retain(live map[string]*coreauth.Auth) []quotaCacheKey {
 
 // join returns the in-flight fetch for key, and whether the caller must run it.
 func (c *quotaCache) join(key quotaFlightKey) (*quotaFlight, bool) {
-	return c.joinFetch(key, false)
+	return c.joinFetch(context.Background(), key, false)
 }
 
-func (c *quotaCache) joinFetch(key quotaFlightKey, refresh bool) (*quotaFlight, bool) {
+func (c *quotaCache) joinFetch(ctx context.Context, key quotaFlightKey, refresh bool) (*quotaFlight, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var superseded *quotaFlight
 	if flight, ok := c.flights[key]; ok {
 		completed := false
 		select {
@@ -226,21 +243,33 @@ func (c *quotaCache) joinFetch(key quotaFlightKey, refresh bool) (*quotaFlight, 
 			completed = true
 		default:
 		}
-		if !completed || (!refresh && c.now().Before(flight.retryAt)) {
+		if !refresh && (!completed || c.now().Before(flight.retryAt)) {
 			flight.waiters++
 			return flight, false
+		}
+		if !completed {
+			superseded = flight
 		}
 	}
 	if c.flights == nil {
 		c.flights = make(map[quotaFlightKey]*quotaFlight)
 	}
 	c.seq++
-	flight := &quotaFlight{done: make(chan struct{}), seq: c.seq}
+	fetchCtx, cancel := context.WithCancel(ctx)
+	flight := &quotaFlight{done: make(chan struct{}), replaced: make(chan struct{}), ctx: fetchCtx, cancel: cancel, seq: c.seq}
 	c.flights[key] = flight
+	if superseded != nil {
+		// A scheduled refresh owns a new observation. Redirect readers before
+		// canceling obsolete work; this is supersession, not a network deadline.
+		superseded.next = flight
+		close(superseded.replaced)
+		superseded.cancel()
+	}
 	return flight, true
 }
 
 func (c *quotaCache) finish(key quotaFlightKey, flight *quotaFlight) {
+	flight.cancel()
 	c.mu.Lock()
 	if c.flights[key] == flight && flight.retryAt.IsZero() {
 		delete(c.flights, key)
@@ -365,16 +394,16 @@ func (h *Handler) startPluginQuotaFetch(host *pluginhost.Host, pluginID string, 
 func (h *Handler) startQuotaFetch(key quotaCacheKey, auth *coreauth.Auth, retryInterval time.Duration, refresh bool, fetch func(context.Context) (quotaCacheEntry, bool, error)) *quotaFlight {
 	stamp := credentialStampOf(auth)
 	flightKey := quotaFlightKey{quotaCacheKey: key, stamp: stamp}
-	flight, leader := h.quotas.joinFetch(flightKey, refresh)
+	fetchCtx := h.quotaCtx
+	if fetchCtx == nil {
+		fetchCtx = context.Background()
+	}
+	flight, leader := h.quotas.joinFetch(fetchCtx, flightKey, refresh)
 	if leader {
-		fetchCtx := h.quotaCtx
-		if fetchCtx == nil {
-			fetchCtx = context.Background()
-		}
 		startedAt := h.quotas.now()
 		go func() {
 			defer h.quotas.finish(flightKey, flight)
-			entry, handled, errFetch := fetch(fetchCtx)
+			entry, handled, errFetch := fetch(flight.ctx)
 			flight.entry, flight.handled, flight.err = entry, handled, errFetch
 			if retryInterval > 0 {
 				h.quotas.mu.Lock()
@@ -382,25 +411,35 @@ func (h *Handler) startQuotaFetch(key quotaCacheKey, auth *coreauth.Auth, retryI
 				h.quotas.mu.Unlock()
 			}
 			if !handled || errFetch != nil {
-				if errFetch != nil && fetchCtx.Err() == nil {
+				if errFetch != nil && flight.ctx.Err() == nil {
 					log.WithFields(log.Fields{"auth_index": auth.Index, "quota_source": key.pluginID, "upstream_status": entry.apiResp.StatusCode}).Warn("quota refresh failed; keeping latest available value")
 				}
 				return
 			}
 			entry.fetchedAt, entry.stamp, entry.seq = h.quotas.now().UTC(), stamp, flight.seq
 			flight.entry = entry
-			h.quotas.store(key, flight.entry)
+			h.quotas.storeFlight(flightKey, flight, flight.entry)
 		}()
 	}
 	return flight
 }
 
 func waitQuotaFlight(ctx context.Context, flight *quotaFlight) (quotaCacheEntry, bool, error) {
-	select {
-	case <-flight.done:
-		return flight.entry, flight.handled, flight.err
-	case <-ctx.Done():
-		return quotaCacheEntry{}, true, ctx.Err()
+	for {
+		select {
+		case <-flight.done:
+			select {
+			case <-flight.replaced:
+				flight = flight.next
+				continue
+			default:
+				return flight.entry, flight.handled, flight.err
+			}
+		case <-flight.replaced:
+			flight = flight.next
+		case <-ctx.Done():
+			return quotaCacheEntry{}, true, ctx.Err()
+		}
 	}
 }
 

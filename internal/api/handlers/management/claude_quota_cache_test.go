@@ -3,10 +3,12 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -207,6 +209,11 @@ func TestClaudeQuotaAPICallLeavesOtherRequestsLive(t *testing.T) {
 		{name: "method", v8: true, mutate: func(r *apiCallRequest) { r.Method = http.MethodPost }},
 		{name: "body", v8: true, mutate: func(r *apiCallRequest) { r.Data = "{}" }},
 		{name: "request proxy", v8: true, mutate: func(r *apiCallRequest) { r.ProxyURL = "direct" }},
+		{name: "authorization only", v8: true, mutate: func(r *apiCallRequest) { r.Header = map[string]string{"Authorization": "Bearer $TOKEN$"} }},
+		{name: "missing beta", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "anthropic-beta") }},
+		{name: "missing content type", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "Content-Type") }},
+		{name: "missing usage accept", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "Accept") }},
+		{name: "missing user agent", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "User-Agent") }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -298,5 +305,90 @@ func TestClaudeQuotaSlowProbeDoesNotBlockOtherCredentials(t *testing.T) {
 	_, response := requestClaudeQuotaAPICall(t, h, authB, "usage", true, nil)
 	if response.StatusCode != http.StatusOK {
 		t.Fatal("slow first credential blocked the second credential's quota")
+	}
+}
+
+func TestClaudeQuotaRefreshReplacesStalledProbeAndRedirectsWaitingReader(t *testing.T) {
+	var calls atomic.Int32
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFirst := func() { releaseOnce.Do(func() { close(release) }) }
+	auth := claudeQuotaTestAuth("claude-a")
+	h, _, advance := newClaudeQuotaHTTPTestHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			close(blocked)
+			<-release
+			_, _ = w.Write([]byte(`{"five_hour":{"utilization":10}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":60}}`))
+	}, auth)
+	t.Cleanup(releaseFirst)
+	first := h.startClaudeQuotaFetch(auth, "usage", false)
+	<-blocked
+	advance(quotaRefreshInterval)
+	replacement := h.startClaudeQuotaFetch(auth, "usage", true)
+	if replacement == first {
+		releaseFirst()
+		<-first.done
+		t.Fatal("scheduled refresh rejoined the stalled Claude probe instead of replacing it")
+	}
+	entry, _, errFetch := waitQuotaFlight(context.Background(), first)
+	if errFetch != nil || !strings.Contains(entry.apiResp.Body, `"utilization":60`) {
+		t.Fatalf("waiting reader did not follow replacement: err=%v body=%s", errFetch, entry.apiResp.Body)
+	}
+	releaseFirst()
+	<-first.done
+	_, response := requestClaudeQuotaAPICall(t, h, auth, "usage", true, nil)
+	if calls.Load() != 2 || !strings.Contains(response.Body, `"utilization":60`) {
+		t.Fatalf("obsolete probe replaced latest quota: calls=%d body=%s", calls.Load(), response.Body)
+	}
+}
+
+func TestClaudeQuotaProfileCanonicalRequestWithoutAcceptUsesCache(t *testing.T) {
+	var calls atomic.Int32
+	auth := claudeQuotaTestAuth("claude-a")
+	h, _, _ := newClaudeQuotaHTTPTestHandler(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"account":{"has_claude_pro":true}}`))
+	}, auth)
+	for range 2 {
+		requestClaudeQuotaAPICall(t, h, auth, "profile", true, func(r *apiCallRequest) { delete(r.Header, "Accept") })
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("canonical profile request without Accept bypassed the cache: calls=%d", calls.Load())
+	}
+}
+
+func TestClaudeQuotaSupersededSuccessCannotReplaceFallbackAfterNewProbeFails(t *testing.T) {
+	auth := claudeQuotaTestAuth("claude-a")
+	h := &Handler{quotaCtx: context.Background()}
+	key := claudeQuotaKey(auth.ID, "usage")
+	stamp := credentialStampOf(auth)
+	h.quotas.store(key, quotaCacheEntry{apiResp: apiCallResponse{Body: "last-known-good"}, stamp: stamp, seq: h.quotas.begin()})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	first := h.startQuotaFetch(key, auth, quotaRefreshInterval, false, func(context.Context) (quotaCacheEntry, bool, error) {
+		close(started)
+		// Deliberately finish after cancellation to test the publication fence.
+		<-release
+		return quotaCacheEntry{apiResp: apiCallResponse{Body: "obsolete-success"}}, true, nil
+	})
+	<-started
+	replacement := h.startQuotaFetch(key, auth, quotaRefreshInterval, true, func(context.Context) (quotaCacheEntry, bool, error) {
+		return quotaCacheEntry{}, true, errors.New("replacement rate limited")
+	})
+	<-replacement.done
+	select {
+	case <-first.ctx.Done():
+	default:
+		t.Error("superseded probe was not canceled")
+	}
+	close(release)
+	<-first.done
+	entry, ok := h.quotas.get(key, stamp)
+	if !ok || entry.apiResp.Body != "last-known-good" {
+		t.Fatalf("obsolete result replaced the fallback after a failed refresh: %+v", entry.apiResp)
 	}
 }
