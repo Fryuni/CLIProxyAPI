@@ -78,7 +78,7 @@ func (h *Handler) serveClaudeQuotaAPICall(c *gin.Context, body apiCallRequest, a
 	}
 	// The panel includes Accept on usage reads, but omits it on profile reads.
 	if !seen["authorization"] || !seen["anthropic-beta"] || !seen["content-type"] || !seen["user-agent"] ||
-		(resource == "usage" && !seen["accept"]) {
+		(resource == "usage" && !seen["accept"]) || (resource == "profile" && seen["accept"]) {
 		return false
 	}
 	key := claudeQuotaKey(auth.ID, resource)

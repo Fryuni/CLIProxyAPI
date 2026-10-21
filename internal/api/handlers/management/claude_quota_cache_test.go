@@ -57,6 +57,9 @@ func requestClaudeQuotaAPICall(t *testing.T, h *Handler, auth *coreauth.Auth, re
 	body := apiCallRequest{AuthIndexCamel: &auth.Index, Method: http.MethodGet, URL: claudeQuotaBaseURL + resource, Header: map[string]string{
 		"Authorization": "Bearer $TOKEN$", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli/2.1.280 (external, cli)", "Accept": "application/json", "Content-Type": "application/json",
 	}}
+	if resource == "profile" {
+		delete(body.Header, "Accept")
+	}
 	if mutate != nil {
 		mutate(&body)
 	}
@@ -198,9 +201,10 @@ func TestClaudeQuotaSurvivesTokenRotationButNotAccountReplacement(t *testing.T) 
 
 func TestClaudeQuotaAPICallLeavesOtherRequestsLive(t *testing.T) {
 	cases := []struct {
-		name   string
-		v8     bool
-		mutate func(*apiCallRequest)
+		name     string
+		resource string
+		v8       bool
+		mutate   func(*apiCallRequest)
 	}{
 		{name: "deprecated v0", v8: false},
 		{name: "explicit authorization", v8: true, mutate: func(r *apiCallRequest) { r.Header["Authorization"] = "Bearer explicit-token" }},
@@ -214,9 +218,14 @@ func TestClaudeQuotaAPICallLeavesOtherRequestsLive(t *testing.T) {
 		{name: "missing content type", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "Content-Type") }},
 		{name: "missing usage accept", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "Accept") }},
 		{name: "missing user agent", v8: true, mutate: func(r *apiCallRequest) { delete(r.Header, "User-Agent") }},
+		{name: "extra profile accept", resource: "profile", v8: true, mutate: func(r *apiCallRequest) { r.Header["Accept"] = "application/json" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			resource := tc.resource
+			if resource == "" {
+				resource = "usage"
+			}
 			var calls atomic.Int32
 			auth := claudeQuotaTestAuth("claude-a")
 			h, _, _ := newClaudeQuotaHTTPTestHandler(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -225,8 +234,8 @@ func TestClaudeQuotaAPICallLeavesOtherRequestsLive(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(`{"five_hour":{"utilization":20,"resets_at":null}}`))
 			}, auth)
-			requestClaudeQuotaAPICall(t, h, auth, "usage", true, nil)
-			_, response := requestClaudeQuotaAPICall(t, h, auth, "usage", tc.v8, tc.mutate)
+			requestClaudeQuotaAPICall(t, h, auth, resource, true, nil)
+			_, response := requestClaudeQuotaAPICall(t, h, auth, resource, tc.v8, tc.mutate)
 			if calls.Load() != 2 || response.StatusCode != http.StatusTooManyRequests {
 				t.Fatalf("unrelated APICall was cached: calls=%d response=%+v", calls.Load(), response)
 			}
@@ -354,10 +363,25 @@ func TestClaudeQuotaProfileCanonicalRequestWithoutAcceptUsesCache(t *testing.T) 
 		_, _ = w.Write([]byte(`{"account":{"has_claude_pro":true}}`))
 	}, auth)
 	for range 2 {
-		requestClaudeQuotaAPICall(t, h, auth, "profile", true, func(r *apiCallRequest) { delete(r.Header, "Accept") })
+		requestClaudeQuotaAPICall(t, h, auth, "profile", true, nil)
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("canonical profile request without Accept bypassed the cache: calls=%d", calls.Load())
+	}
+}
+
+func TestTokenRequestHandlerDoesNotStartQuotaRefresher(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, errRegister := manager.Register(context.Background(), claudeQuotaTestAuth("claude-a")); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	h := NewTokenRequestHandler(&config.Config{}, manager)
+	t.Cleanup(h.Close)
+	if h.authManager != manager {
+		t.Fatal("token request handler lost its credential manager")
+	}
+	if h.quotaCtx != nil || h.stopQuotaRefresher != nil || h.quotaRefreshRequests != nil {
+		t.Fatal("token-only SDK handler started a background quota worker without exposing its lifecycle")
 	}
 }
 

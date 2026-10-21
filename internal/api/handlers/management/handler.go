@@ -74,6 +74,10 @@ type configReloadSnapshot struct {
 
 // NewHandler creates a new management handler instance.
 func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager) *Handler {
+	return newHandler(cfg, configFilePath, manager, true)
+}
+
+func newHandler(cfg *config.Config, configFilePath string, manager *coreauth.Manager, refreshQuotas bool) *Handler {
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
 
@@ -87,7 +91,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
-	h.startQuotaRefresher()
+	if refreshQuotas {
+		h.startQuotaRefresher()
+	}
 	return h
 }
 
@@ -124,6 +130,12 @@ func (h *Handler) purgeStaleAttempts() {
 // NewHandler creates a new management handler instance.
 func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager) *Handler {
 	return NewHandler(cfg, "", manager)
+}
+
+// NewTokenRequestHandler creates a handler for the SDK's token-only interface,
+// which exposes neither quota endpoints nor a background-work lifecycle.
+func NewTokenRequestHandler(cfg *config.Config, manager *coreauth.Manager) *Handler {
+	return newHandler(cfg, "", manager, false)
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.

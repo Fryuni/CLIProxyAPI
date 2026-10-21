@@ -43,7 +43,7 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 // NewManagementTokenRequester creates a limited management handler exposing only token request endpoints.
 func NewManagementTokenRequester(cfg *config.Config, manager *coreauth.Manager) ManagementTokenRequester {
 	return &managementTokenRequester{
-		handler: NewHandlerWithoutConfigFilePath(cfg, manager),
+		handler: internalmanagement.NewTokenRequestHandler(cfg, manager),
 	}
 }
 
