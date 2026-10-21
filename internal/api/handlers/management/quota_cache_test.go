@@ -81,9 +81,9 @@ func newQuotaCacheTestHandlerWithManager(t *testing.T, quota *scriptedQuota, aut
 			QuotaProvider: &mockQuotaProvider{identifier: "cloud", fetchFn: quota.fetch},
 		},
 	})
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &Handler{cfg: &config.Config{AuthDir: t.TempDir()}, authManager: manager, pluginHost: host, quotaCtx: ctx, stopQuotaRefresher: cancel}
 	t.Cleanup(h.Close)
-	h.SetPluginHost(host)
 	return h, manager
 }
 
@@ -139,7 +139,7 @@ func TestPluginQuotaServesCachedValueWhenRefreshFails(t *testing.T) {
 		t.Fatalf("API reads must not probe upstream once cached; calls=%d", calls)
 	}
 
-	h.refreshQuotas(context.Background())
+	refreshQuotasAndWait(h)
 	if calls := quota.callsFor(auth.ID); calls != 2 {
 		t.Fatalf("refresh should probe upstream; calls=%d", calls)
 	}
@@ -148,7 +148,7 @@ func TestPluginQuotaServesCachedValueWhenRefreshFails(t *testing.T) {
 	}
 
 	quota.set(0.3, nil)
-	h.refreshQuotas(context.Background())
+	refreshQuotasAndWait(h)
 	if rec, remaining = getPluginQuota(t, h, auth.Index); rec.Code != http.StatusOK || remaining != 0.3 {
 		t.Fatalf("successful refresh must replace cached value: status=%d remaining=%v", rec.Code, remaining)
 	}
@@ -161,7 +161,7 @@ func TestPluginQuotaRefreshWarmsEnabledCredentials(t *testing.T) {
 	other := &coreauth.Auth{ID: "other", FileName: "other.json", Provider: "other"}
 	h := newQuotaCacheTestHandler(t, quota, enabled, disabled, other)
 
-	h.refreshQuotas(context.Background())
+	refreshQuotasAndWait(h)
 	if calls := quota.callsFor(enabled.ID); calls != 1 {
 		t.Fatalf("enabled credential should be probed; calls=%d", calls)
 	}
@@ -355,5 +355,11 @@ func TestPluginQuotaCoalescesConcurrentUncachedFetches(t *testing.T) {
 	}
 	if calls := quota.callsFor(auth.ID); calls != 1 {
 		t.Fatalf("concurrent uncached reads should share one upstream fetch; calls=%d", calls)
+	}
+}
+
+func refreshQuotasAndWait(h *Handler) {
+	for _, flight := range h.refreshQuotas(context.Background()) {
+		<-flight.done
 	}
 }

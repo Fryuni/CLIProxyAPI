@@ -64,6 +64,7 @@ type Handler struct {
 	quotas                  quotaCache
 	quotaCtx                context.Context
 	stopQuotaRefresher      context.CancelFunc
+	quotaRefreshRequests    chan struct{}
 }
 
 type configReloadSnapshot struct {
@@ -166,6 +167,7 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 		h.authManager = manager
 	}
 	h.mu.Unlock()
+	h.requestQuotaRefresh()
 }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.
@@ -178,6 +180,7 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 		h.pluginHost = host
 	}
 	h.mu.Unlock()
+	h.requestQuotaRefresh()
 }
 
 // SetConfigReloadHook updates the callback used after management saves config changes.
