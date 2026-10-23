@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
 type serverOptionConfig struct {
@@ -37,6 +38,11 @@ func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.
 	logsDir := logging.ResolveLogDirectory(cfg)
 	logger := logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
 	logger.SetHomeEnabled(cfg != nil && cfg.Home.Enabled)
+	// No request is running yet, so every incomplete log on disk is orphaned.
+	logger.RemoveIncompleteLogs()
+	if errBucket := logger.SetRemoteBucket(cfg.RequestLogBucket); errBucket != nil {
+		log.WithError(errBucket).Error("request logs will stay on local disk")
+	}
 	return logger
 }
 

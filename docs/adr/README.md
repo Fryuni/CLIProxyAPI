@@ -38,12 +38,13 @@ The retry branch's final tree `5ac127ac` exactly equals its main squash `0c7dd79
 - [ADR-0022: Sync upstream 0d18d3b3 while keeping the retry delta](0022-sync-upstream-0d18d3b3.md)
 - [ADR-0023: Serve plugin quotas from a background-refreshed cache](0023-serve-plugin-quotas-from-a-background-refreshed-cache.md)
 - [ADR-0024: Sync upstream 911f49cb while keeping the fork delta](0024-sync-upstream-911f49cb.md)
+- [ADR-0025: Upload request logs to a bucket](0025-upload-request-logs-to-a-bucket.md)
 
 The runtime tree at the pinned fork main differs from its last shared upstream baseline only in CI, the retry/auth-selection changes and their tests, and the historical future-work document. The local tracker and ADR files are documentation additions made after that tree.
 
 ## Changes after the backfill
 
-The commit tables below cover the pinned backfill snapshot only. Later fork changes each cite their ADR directly: [ADR-0022](0022-sync-upstream-0d18d3b3.md) merges upstream `0d18d3b3` into fork main `1b4e7ca1` in merge commit `2a0f473b`. It adds upstream implementation notes to ADR-0005, ADR-0006, ADR-0009, ADR-0011, and ADR-0021, and extends ADR-0004 with the policy for upstream tests that fork CI exposes. [ADR-0023](0023-serve-plugin-quotas-from-a-background-refreshed-cache.md) serves built-in Claude and plugin quota reads from an in-memory cache refreshed every 2 minutes. [ADR-0024](0024-sync-upstream-911f49cb.md) merges upstream `911f49cb` into fork main `6ba2140d` in merge commit `c5ce0173`. It adds upstream implementation notes to ADR-0005 and ADR-0022, resolves the config-reload ticket, and records two upstream test flakes with runtime causes as tickets.
+The commit tables below cover the pinned backfill snapshot only. Later fork changes each cite their ADR directly: [ADR-0022](0022-sync-upstream-0d18d3b3.md) merges upstream `0d18d3b3` into fork main `1b4e7ca1` in merge commit `2a0f473b`. It adds upstream implementation notes to ADR-0005, ADR-0006, ADR-0009, ADR-0011, and ADR-0021, and extends ADR-0004 with the policy for upstream tests that fork CI exposes. [ADR-0023](0023-serve-plugin-quotas-from-a-background-refreshed-cache.md) serves built-in Claude and plugin quota reads from an in-memory cache refreshed every 2 minutes. [ADR-0024](0024-sync-upstream-911f49cb.md) merges upstream `911f49cb` into fork main `6ba2140d` in merge commit `c5ce0173`. It adds upstream implementation notes to ADR-0005 and ADR-0022, resolves the config-reload ticket, and records two upstream test flakes with runtime causes as tickets. [ADR-0025](0025-upload-request-logs-to-a-bucket.md) uploads completed request logs to a configured `gocloud.dev` bucket and cleans up orphaned local logs at startup.
 
 ## Superseded fork decisions
 

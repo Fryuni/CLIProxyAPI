@@ -3,6 +3,8 @@ package logging
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -133,43 +135,35 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		responseToWrite = response
 	}
 
-	logFile, _, errOpen := createUniqueLogFile(l.logsDir, filename)
-	if errOpen != nil {
-		return fmt.Errorf("failed to create log file: %w", errOpen)
-	}
-
-	writeErr := l.writeNonStreamingLog(
-		logFile,
-		url,
-		method,
-		requestHeaders,
-		body,
-		requestBodyPath,
-		websocketTimeline,
-		websocketTimelineSource,
-		apiRequest,
-		apiRequestSource,
-		apiResponse,
-		apiResponseSource,
-		apiWebsocketTimeline,
-		apiWebsocketTimelineSource,
-		apiResponseErrors,
-		statusCode,
-		responseHeaders,
-		responseToWrite,
-		decompressErr,
-		requestTimestamp,
-		apiResponseTimestamp,
-	)
-	if errClose := logFile.Close(); errClose != nil {
-		log.WithError(errClose).Warn("failed to close request log file")
-		if writeErr == nil {
-			return errClose
-		}
-	}
+	writeErr := writeLogFileAtomically(l.logsDir, filename, func(logFile io.Writer) error {
+		return l.writeNonStreamingLog(
+			logFile,
+			url,
+			method,
+			requestHeaders,
+			body,
+			requestBodyPath,
+			websocketTimeline,
+			websocketTimelineSource,
+			apiRequest,
+			apiRequestSource,
+			apiResponse,
+			apiResponseSource,
+			apiWebsocketTimeline,
+			apiWebsocketTimelineSource,
+			apiResponseErrors,
+			statusCode,
+			responseHeaders,
+			responseToWrite,
+			decompressErr,
+			requestTimestamp,
+			apiResponseTimestamp,
+		)
+	})
 	if writeErr != nil {
 		return fmt.Errorf("failed to write log file: %w", writeErr)
 	}
+	l.notifyLogCompleted()
 
 	if force && !l.enabled {
 		if errCleanup := l.cleanupOldErrorLogs(); errCleanup != nil {
@@ -246,6 +240,7 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 		chunkChan:        make(chan []byte, 100), // Buffered channel for async writes
 		closeChan:        make(chan struct{}),
 		errorChan:        make(chan error, 1),
+		onComplete:       l.notifyLogCompleted,
 	}
 
 	// Start async writer goroutine
@@ -309,19 +304,66 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	return fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart)
 }
 
+// writeLogFileAtomically assembles a log in a temp file and moves it to a unique name derived from filename
+// only once it is complete, so a non-empty .log file never holds partial content.
+func writeLogFileAtomically(dir, filename string, write func(io.Writer) error) error {
+	tmpFile, errCreate := createLogTempFile(dir)
+	if errCreate != nil {
+		return fmt.Errorf("failed to create log file: %w", errCreate)
+	}
+	tmpPath := tmpFile.Name()
+
+	writeErr := write(tmpFile)
+	if errClose := tmpFile.Close(); errClose != nil {
+		log.WithError(errClose).Warn("failed to close request log file")
+		if writeErr == nil {
+			writeErr = errClose
+		}
+	}
+	if writeErr != nil {
+		_ = os.Remove(tmpPath)
+		return writeErr
+	}
+
+	reserved, target, errReserve := createUniqueLogFile(dir, filename)
+	if errReserve != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to create log file: %w", errReserve)
+	}
+	if errClose := reserved.Close(); errClose != nil {
+		log.WithError(errClose).Warn("failed to close reserved request log file")
+	}
+	if errRename := os.Rename(tmpPath, target); errRename != nil {
+		_ = os.Remove(tmpPath)
+		_ = os.Remove(target)
+		return fmt.Errorf("failed to finalize log file: %w", errRename)
+	}
+	return nil
+}
+
+// createLogTempFile creates a uniquely named request-log-*.tmp file in dir. Unlike os.CreateTemp, it uses
+// mode 0644 subject to the umask, so the renamed log keeps the mode logs were created with directly.
+func createLogTempFile(dir string) (*os.File, error) {
+	for attempt := 0; attempt < 10000; attempt++ {
+		var suffix [8]byte
+		if _, errRand := rand.Read(suffix[:]); errRand != nil {
+			return nil, errRand
+		}
+		path := filepath.Join(dir, "request-log-"+hex.EncodeToString(suffix[:])+".tmp")
+		file, errOpen := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if errOpen == nil {
+			return file, nil
+		}
+		if !os.IsExist(errOpen) {
+			return nil, errOpen
+		}
+	}
+	return nil, fmt.Errorf("too many conflicting temp log files in %s", dir)
+}
+
 // createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,
 // it avoids overwriting by injecting an incrementing sequence number before the trailing request ID component.
 func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
-	ext := filepath.Ext(filename)
-	base := strings.TrimSuffix(filename, ext)
-	idx := strings.LastIndex(base, "-")
-	prefix := base
-	idPart := ""
-	if idx > 0 {
-		prefix = base[:idx]
-		idPart = base[idx+1:]
-	}
-
 	target := filepath.Join(dir, filename)
 	logFile, errOpen := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if errOpen == nil {
@@ -332,7 +374,7 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 	}
 
 	for seq := 1; seq <= 1000; seq++ {
-		candidateName := fmt.Sprintf("%s_%d-%s%s", prefix, seq, idPart, ext)
+		candidateName := sequencedLogFilename(filename, seq)
 		candidatePath := filepath.Join(dir, candidateName)
 		logCandidate, errCandidate := os.OpenFile(candidatePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 		if errCandidate == nil {
@@ -343,6 +385,20 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 		}
 	}
 	return nil, "", fmt.Errorf("too many conflicting log files for %s", filename)
+}
+
+// sequencedLogFilename injects seq before the trailing request ID component of filename.
+func sequencedLogFilename(filename string, seq int) string {
+	ext := filepath.Ext(filename)
+	base := strings.TrimSuffix(filename, ext)
+	idx := strings.LastIndex(base, "-")
+	prefix := base
+	idPart := ""
+	if idx > 0 {
+		prefix = base[:idx]
+		idPart = base[idx+1:]
+	}
+	return fmt.Sprintf("%s_%d-%s%s", prefix, seq, idPart, ext)
 }
 
 // sanitizeForFilename replaces characters that are not safe for filenames.
