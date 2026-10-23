@@ -28,6 +28,13 @@ const requestLogUploadInterval = time.Minute
 // and createUniqueLogFile, e.g. v1-responses-2025-12-23T195811-a1b2c3d4.log or ...T195811_1-a1b2c3d4.log.
 var completedRequestLogPattern = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}T\d{6}(_\d+)?-.+\.log$`)
 
+// requestLogHeader starts every request log; the uploader uploads only files that begin with it, so files
+// that merely share the naming pattern are never uploaded or deleted.
+const requestLogHeader = "=== REQUEST INFO ===\n"
+
+// errNotRequestLog reports a file that matches the request log naming pattern but was not written by the request logger.
+var errNotRequestLog = errors.New("file is not a request log")
+
 // incompleteRequestLogTempPrefixes are the temp file prefixes used while a request log is being assembled.
 var incompleteRequestLogTempPrefixes = []string{"request-body-", "response-body-", "request-log-"}
 
@@ -406,8 +413,13 @@ func (u *requestLogUploader) uploadCompleted(retryAll bool) {
 			if errors.Is(errUpload, os.ErrNotExist) {
 				continue
 			}
+			if errors.Is(errUpload, errNotRequestLog) {
+				log.Debugf("skipping file that is not a request log: %s", name)
+				continue
+			}
 			log.WithError(errUpload).Warnf("failed to upload request log: %s", name)
-			retryAt[name] = now.Add(requestLogUploadInterval)
+			// Start the backoff when the attempt fails, which can be long after the sweep started.
+			retryAt[name] = u.now().Add(requestLogUploadInterval)
 			continue
 		}
 		if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) {
@@ -429,6 +441,14 @@ func (u *requestLogUploader) upload(path, name string) error {
 			log.WithError(errClose).Warn("failed to close request log file after upload")
 		}
 	}()
+
+	header := make([]byte, len(requestLogHeader))
+	if _, errRead := io.ReadFull(file, header); errRead != nil || string(header) != requestLogHeader {
+		return errNotRequestLog
+	}
+	if _, errSeek := file.Seek(0, io.SeekStart); errSeek != nil {
+		return errSeek
+	}
 
 	key := name
 	for seq := 1; ; seq++ {

@@ -74,13 +74,14 @@ func TestStartupRemovesIncompleteAndUploadsCompletedLogs(t *testing.T) {
 	completed := "v1-responses-2025-12-23T195811-a1b2c3d4.log"
 	completedError := "error-v1-chat-completions-2025-12-23T195811_1-deadbeef.log"
 	reserved := "v1-responses-2025-12-23T195812-cafebabe.log"
-	writeTestFile(t, filepath.Join(logsDir, completed), "complete log")
-	writeTestFile(t, filepath.Join(logsDir, completedError), "complete error log")
+	writeTestFile(t, filepath.Join(logsDir, completed), requestLogHeader+"complete log")
+	writeTestFile(t, filepath.Join(logsDir, completedError), requestLogHeader+"complete error log")
 	writeTestFile(t, filepath.Join(logsDir, reserved), "")
 	writeTestFile(t, filepath.Join(logsDir, "request-body-1.tmp"), "partial")
 	writeTestFile(t, filepath.Join(logsDir, "response-body-1.tmp"), "partial")
 	writeTestFile(t, filepath.Join(logsDir, "request-log-1.tmp"), "partial")
 	writeTestFile(t, filepath.Join(logsDir, "main.log"), "application log")
+	writeTestFile(t, filepath.Join(logsDir, "audit-2026-10-23T120000-copy.log"), "not written by the request logger")
 	writeTestFile(t, filepath.Join(logsDir, "main-2025-12-23T19-58-11.000.log"), "rotated application log")
 	partsDir := filepath.Join(logsDir, "request-log-parts-api-response-123")
 	if errMkdir := os.MkdirAll(partsDir, 0o755); errMkdir != nil {
@@ -96,11 +97,11 @@ func TestStartupRemovesIncompleteAndUploadsCompletedLogs(t *testing.T) {
 	logger.CloseRemoteBucket(context.Background())
 
 	objects := bucketObjects(t, bucketURL)
-	if len(objects) != 2 || objects[completed] != "complete log" || objects[completedError] != "complete error log" {
+	if len(objects) != 2 || objects[completed] != requestLogHeader+"complete log" || objects[completedError] != requestLogHeader+"complete error log" {
 		t.Fatalf("unexpected bucket objects: %v", objects)
 	}
 	got := strings.Join(localNames(t, logsDir), ",")
-	if got != "main-2025-12-23T19-58-11.000.log,main.log" {
+	if got != "audit-2026-10-23T120000-copy.log,main-2025-12-23T19-58-11.000.log,main.log" {
 		t.Fatalf("unexpected local files: %s", got)
 	}
 }
@@ -212,7 +213,7 @@ func TestUploadDoesNotReplaceExistingRemoteLog(t *testing.T) {
 		t.Fatalf("seed bucket: %v", errWrite)
 	}
 	_ = bucket.Close()
-	writeTestFile(t, filepath.Join(logsDir, name), "local log")
+	writeTestFile(t, filepath.Join(logsDir, name), requestLogHeader+"local log")
 
 	logger := NewFileRequestLogger(true, logsDir, "", 0)
 	if errSet := logger.SetRemoteBucket(bucketURL); errSet != nil {
@@ -221,7 +222,7 @@ func TestUploadDoesNotReplaceExistingRemoteLog(t *testing.T) {
 	logger.CloseRemoteBucket(context.Background())
 
 	objects := bucketObjects(t, bucketURL)
-	if len(objects) != 2 || objects[name] != "other instance log" || objects[sequenced] != "local log" {
+	if len(objects) != 2 || objects[name] != "other instance log" || objects[sequenced] != requestLogHeader+"local log" {
 		t.Fatalf("unexpected bucket objects: %v", objects)
 	}
 	if names := localNames(t, logsDir); len(names) != 0 {
@@ -296,7 +297,7 @@ func TestCompletedLogKeepsDirectCreateMode(t *testing.T) {
 func TestUploadsFromSeparateInstancesKeepBothLogs(t *testing.T) {
 	bucketURL := fileBucketURL(t, t.TempDir())
 	name := "v1-responses-2025-12-23T195811-a1b2c3d4.log"
-	for _, content := range []string{"first instance", "second instance"} {
+	for _, content := range []string{requestLogHeader + "first instance", requestLogHeader + "second instance"} {
 		logsDir := t.TempDir()
 		writeTestFile(t, filepath.Join(logsDir, name), content)
 		logger := NewFileRequestLogger(true, logsDir, "", 0)
@@ -307,7 +308,7 @@ func TestUploadsFromSeparateInstancesKeepBothLogs(t *testing.T) {
 	}
 
 	objects := bucketObjects(t, bucketURL)
-	if len(objects) != 2 || objects[name] != "first instance" || objects["v1-responses-2025-12-23T195811_1-a1b2c3d4.log"] != "second instance" {
+	if len(objects) != 2 || objects[name] != requestLogHeader+"first instance" || objects["v1-responses-2025-12-23T195811_1-a1b2c3d4.log"] != requestLogHeader+"second instance" {
 		t.Fatalf("unexpected bucket objects: %v", objects)
 	}
 }
@@ -326,16 +327,30 @@ func TestFailedUploadWaitsForRetryInterval(t *testing.T) {
 	defer func() { _ = bucket.Close() }()
 
 	clock := time.Date(2025, 12, 23, 19, 58, 11, 0, time.UTC)
-	uploader := &requestLogUploader{logsDir: logsDir, bucket: bucket, ctx: context.Background(), now: func() time.Time { return clock }}
+	// pending holds times returned before falling back to clock, to simulate time passing during a sweep.
+	var pending []time.Time
+	now := func() time.Time {
+		if len(pending) > 0 {
+			next := pending[0]
+			pending = pending[1:]
+			return next
+		}
+		return clock
+	}
+	uploader := &requestLogUploader{logsDir: logsDir, bucket: bucket, ctx: context.Background(), now: now}
 
 	failed := "v1-responses-2025-12-23T195811-a1b2c3d4.log"
-	writeTestFile(t, filepath.Join(logsDir, failed), "failed log")
+	writeTestFile(t, filepath.Join(logsDir, failed), requestLogHeader+"failed log")
 	// Replace the bucket directory with a file so writes fail.
 	if errRemove := os.RemoveAll(bucketDir); errRemove != nil {
 		t.Fatalf("remove bucket dir: %v", errRemove)
 	}
 	writeTestFile(t, bucketDir, "not a directory")
+	// The sweep starts at clock and the upload fails 70 seconds later, past a full retry interval.
+	failedAt := clock.Add(requestLogUploadInterval + 10*time.Second)
+	pending = []time.Time{clock, failedAt}
 	uploader.uploadCompleted(false)
+	clock = failedAt
 
 	if errRemove := os.Remove(bucketDir); errRemove != nil {
 		t.Fatalf("remove bucket file: %v", errRemove)
@@ -344,11 +359,11 @@ func TestFailedUploadWaitsForRetryInterval(t *testing.T) {
 		t.Fatalf("restore bucket dir: %v", errMkdir)
 	}
 	fresh := "v1-responses-2025-12-23T195840-cafebabe.log"
-	writeTestFile(t, filepath.Join(logsDir, fresh), "fresh log")
+	writeTestFile(t, filepath.Join(logsDir, fresh), requestLogHeader+"fresh log")
 	clock = clock.Add(requestLogUploadInterval / 2)
 	uploader.uploadCompleted(false)
 
-	if objects := bucketObjects(t, bucketURL); len(objects) != 1 || objects[fresh] != "fresh log" {
+	if objects := bucketObjects(t, bucketURL); len(objects) != 1 || objects[fresh] != requestLogHeader+"fresh log" {
 		t.Fatalf("expected only the new log before the retry time, got %v", objects)
 	}
 	if _, errStat := os.Stat(filepath.Join(logsDir, failed)); errStat != nil {
@@ -357,7 +372,7 @@ func TestFailedUploadWaitsForRetryInterval(t *testing.T) {
 
 	clock = clock.Add(requestLogUploadInterval)
 	uploader.uploadCompleted(false)
-	if objects := bucketObjects(t, bucketURL); len(objects) != 2 || objects[failed] != "failed log" {
+	if objects := bucketObjects(t, bucketURL); len(objects) != 2 || objects[failed] != requestLogHeader+"failed log" {
 		t.Fatalf("expected failed log to upload after its retry time, got %v", objects)
 	}
 }
