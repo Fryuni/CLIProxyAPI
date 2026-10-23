@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -418,5 +420,73 @@ func TestSetRemoteBucketRejectsAliasOfMissingLogsDirectory(t *testing.T) {
 	bucketURL := fileBucketURL(t, filepath.Join(alias, "logs")) + "?create_dir=1"
 	if errSet := logger.SetRemoteBucket(bucketURL); errSet == nil {
 		t.Fatalf("expected %s to be rejected before the logs directory exists", bucketURL)
+	}
+}
+
+func TestSetRemoteBucketAcceptsOnlySeparateDirectoriesBehindSymlinkedLogs(t *testing.T) {
+	real := t.TempDir()
+	logsDir := filepath.Join(t.TempDir(), "logs")
+	if errLink := os.Symlink(real, logsDir); errLink != nil {
+		t.Skipf("symlinks unavailable: %v", errLink)
+	}
+	logger := NewFileRequestLogger(true, logsDir, "", 0)
+	defer logger.CloseRemoteBucket(context.Background())
+
+	if errSet := logger.SetRemoteBucket(fileBucketURL(t, real) + "?prefix=archived-"); errSet == nil {
+		t.Fatal("expected the real directory behind a symlinked logs directory to be rejected")
+	}
+	if errSet := logger.SetRemoteBucket(fileBucketURL(t, real) + "?prefix=archive/"); errSet != nil {
+		t.Fatalf("expected a subdirectory of the real logs directory to be accepted: %v", errSet)
+	}
+}
+
+// blockingBucketOpener blocks OpenBucketURL until its context is canceled.
+type blockingBucketOpener struct {
+	entered chan struct{}
+	exited  chan struct{}
+}
+
+func (o *blockingBucketOpener) OpenBucketURL(ctx context.Context, _ *url.URL) (*blob.Bucket, error) {
+	close(o.entered)
+	<-ctx.Done()
+	close(o.exited)
+	return nil, ctx.Err()
+}
+
+// blockingBucketScheme routes the blockingtest scheme to the current test's opener; schemes can be registered only once.
+type blockingBucketScheme struct {
+	current atomic.Pointer[blockingBucketOpener]
+}
+
+func (s *blockingBucketScheme) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucket, error) {
+	return s.current.Load().OpenBucketURL(ctx, u)
+}
+
+var (
+	blockingScheme         blockingBucketScheme
+	registerBlockingScheme sync.Once
+)
+
+func TestSetRemoteBucketContextHonorsCancellation(t *testing.T) {
+	opener := &blockingBucketOpener{entered: make(chan struct{}), exited: make(chan struct{})}
+	blockingScheme.current.Store(opener)
+	registerBlockingScheme.Do(func() { blob.DefaultURLMux().RegisterBucket("blockingtest", &blockingScheme) })
+
+	logger := NewFileRequestLogger(true, t.TempDir(), "", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- logger.SetRemoteBucketContext(ctx, "blockingtest://bucket") }()
+
+	<-opener.entered
+	// Completing logs must not wait for the bucket to open.
+	logger.notifyLogCompleted()
+	cancel()
+	if errSet := <-result; !errors.Is(errSet, context.Canceled) {
+		t.Fatalf("expected the canceled open to fail with context.Canceled, got %v", errSet)
+	}
+	// The abandoned open is canceled too, so it does not outlive the call.
+	<-opener.exited
+	if logger.currentUploader() != nil {
+		t.Fatal("expected no uploader after a canceled open")
 	}
 }

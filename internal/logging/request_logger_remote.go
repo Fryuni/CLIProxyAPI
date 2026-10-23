@@ -110,55 +110,107 @@ func (l *FileRequestLogger) TrackRequest() func() {
 // The URL uses gocloud.dev syntax (gs://, s3://, file://). An empty URL disables uploads
 // and keeps logs locally. Changing the URL stops the previous uploader before starting the new one.
 func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
+	return l.SetRemoteBucketContext(context.Background(), bucketURL)
+}
+
+// SetRemoteBucketContext is SetRemoteBucket with a context that bounds opening the bucket.
+// Canceling ctx abandons the open; the running uploader does not depend on ctx.
+func (l *FileRequestLogger) SetRemoteBucketContext(ctx context.Context, bucketURL string) error {
 	if l == nil {
 		return nil
 	}
 	bucketURL = strings.TrimSpace(bucketURL)
 
-	l.uploaderMu.Lock()
-	defer l.uploaderMu.Unlock()
+	l.remoteMu.Lock()
+	defer l.remoteMu.Unlock()
 
-	if l.uploader != nil && l.uploader.bucketURL == bucketURL {
+	previous := l.currentUploader()
+	if previous != nil && previous.bucketURL == bucketURL {
 		return nil
 	}
-	if l.uploader != nil {
+	var uploader *requestLogUploader
+	var errSetup error
+	if bucketURL != "" {
+		uploader, errSetup = l.openUploader(ctx, bucketURL)
+	}
+
+	if previous != nil {
+		l.setUploader(nil)
 		// Abort the old uploader without draining; files it leaves behind are picked up by the next one.
 		canceled, cancel := context.WithCancel(context.Background())
 		cancel()
-		l.uploader.close(canceled)
-		l.uploader = nil
+		previous.close(canceled)
 	}
-	if bucketURL == "" {
-		return nil
+	if uploader == nil {
+		return errSetup
 	}
+	l.setUploader(uploader)
+	go uploader.run()
+	return nil
+}
+
+// openUploader validates bucketURL and opens its bucket. The bucket is opened with the uploader's own
+// lifetime context, because providers may keep that context for later credential refreshes, while ctx
+// only bounds how long the caller waits.
+func (l *FileRequestLogger) openUploader(ctx context.Context, bucketURL string) (*requestLogUploader, error) {
 	// The logs directory must exist so the bucket check can compare directory identities.
 	if errEnsure := l.ensureLogsDir(); errEnsure != nil {
-		return fmt.Errorf("failed to create logs directory: %w", errEnsure)
+		return nil, fmt.Errorf("failed to create logs directory: %w", errEnsure)
 	}
 	if errURL := checkRequestLogBucketURL(bucketURL, l.logsDir); errURL != nil {
-		return errURL
+		return nil, errURL
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	bucket, errOpen := blob.OpenBucket(ctx, bucketURL)
-	if errOpen != nil {
-		cancel()
-		return fmt.Errorf("failed to open request log bucket: %w", errOpen)
+	lifetime, cancel := context.WithCancel(context.Background())
+	type openResult struct {
+		bucket *blob.Bucket
+		err    error
 	}
-	uploader := &requestLogUploader{
+	opened := make(chan openResult, 1)
+	go func() {
+		bucket, errOpen := blob.OpenBucket(lifetime, bucketURL)
+		opened <- openResult{bucket: bucket, err: errOpen}
+	}()
+
+	var result openResult
+	select {
+	case result = <-opened:
+	case <-ctx.Done():
+		cancel()
+		go func() {
+			if late := <-opened; late.bucket != nil {
+				_ = late.bucket.Close()
+			}
+		}()
+		return nil, fmt.Errorf("failed to open request log bucket: %w", ctx.Err())
+	}
+	if result.err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to open request log bucket: %w", result.err)
+	}
+	return &requestLogUploader{
 		logsDir:   l.logsDir,
 		bucketURL: bucketURL,
-		bucket:    bucket,
-		ctx:       ctx,
+		bucket:    result.bucket,
+		ctx:       lifetime,
 		cancel:    cancel,
 		kick:      make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 		now:       time.Now,
-	}
+	}, nil
+}
+
+func (l *FileRequestLogger) currentUploader() *requestLogUploader {
+	l.uploaderMu.Lock()
+	defer l.uploaderMu.Unlock()
+	return l.uploader
+}
+
+func (l *FileRequestLogger) setUploader(uploader *requestLogUploader) {
+	l.uploaderMu.Lock()
 	l.uploader = uploader
-	go uploader.run()
-	return nil
+	l.uploaderMu.Unlock()
 }
 
 // checkRequestLogBucketURL rejects bucket URLs that cannot archive distinct logs: a "key" option, which maps
@@ -205,21 +257,15 @@ func (l *FileRequestLogger) CloseRemoteBucket(ctx context.Context) {
 	if l == nil {
 		return
 	}
-	l.uploaderMu.Lock()
-	hasUploader := l.uploader != nil
-	l.uploaderMu.Unlock()
-	if !hasUploader {
+	l.remoteMu.Lock()
+	defer l.remoteMu.Unlock()
+	uploader := l.currentUploader()
+	if uploader == nil {
 		return
 	}
-	// Wait without holding uploaderMu: finishing requests take it to notify the uploader.
 	l.active.wait(ctx)
-
-	l.uploaderMu.Lock()
-	defer l.uploaderMu.Unlock()
-	if l.uploader != nil {
-		l.uploader.close(ctx)
-		l.uploader = nil
-	}
+	l.setUploader(nil)
+	uploader.close(ctx)
 }
 
 // notifyLogCompleted wakes the uploader after a request log file is finalized.

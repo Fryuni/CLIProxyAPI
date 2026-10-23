@@ -146,7 +146,10 @@ type FileRequestLogger struct {
 
 	homeEnabled bool
 
-	// uploaderMu guards uploader.
+	// remoteMu serializes bucket configuration changes, which can block on bucket I/O.
+	remoteMu sync.Mutex
+
+	// uploaderMu guards uploader and is held only briefly, so completing logs never wait on bucket I/O.
 	uploaderMu sync.Mutex
 
 	// uploader moves completed logs to a remote bucket when one is configured.
