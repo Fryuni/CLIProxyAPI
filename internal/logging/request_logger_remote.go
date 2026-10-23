@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,6 +67,9 @@ func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
 	if bucketURL == "" {
 		return nil
 	}
+	if errDir := checkBucketOutsideLogsDir(bucketURL, l.logsDir); errDir != nil {
+		return errDir
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	bucket, errOpen := blob.OpenBucket(ctx, bucketURL)
@@ -85,6 +89,22 @@ func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
 	}
 	l.uploader = uploader
 	go uploader.run()
+	return nil
+}
+
+// checkBucketOutsideLogsDir rejects file buckets whose objects would land in the scanned logs directory,
+// where every uploaded object would be picked up again as a pending log.
+func checkBucketOutsideLogsDir(bucketURL, logsDir string) error {
+	parsed, errParse := url.Parse(bucketURL)
+	if errParse != nil || parsed.Scheme != "file" {
+		return nil
+	}
+	objectPath := filepath.Join(filepath.FromSlash(parsed.Path), filepath.FromSlash(parsed.Query().Get("prefix")+"object"))
+	objectsDir, errObjects := filepath.Abs(filepath.Dir(objectPath))
+	absLogsDir, errLogs := filepath.Abs(logsDir)
+	if errObjects == nil && errLogs == nil && objectsDir == absLogsDir {
+		return fmt.Errorf("request log bucket must not store objects in the logs directory %s", absLogsDir)
+	}
 	return nil
 }
 

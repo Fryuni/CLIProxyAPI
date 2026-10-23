@@ -225,3 +225,19 @@ func TestUploadDoesNotReplaceExistingRemoteLog(t *testing.T) {
 		t.Fatalf("expected local logs to be removed, got %v", names)
 	}
 }
+
+func TestSetRemoteBucketRejectsLogsDirectory(t *testing.T) {
+	logsDir := t.TempDir()
+	logger := NewFileRequestLogger(true, logsDir, "", 0)
+	defer logger.CloseRemoteBucket(context.Background())
+
+	sameDir := fileBucketURL(t, logsDir)
+	for _, bucketURL := range []string{sameDir, sameDir + "?prefix=archived-", fileBucketURL(t, filepath.Join(logsDir, "sub")) + "?prefix=../"} {
+		if errSet := logger.SetRemoteBucket(bucketURL); errSet == nil {
+			t.Fatalf("expected %s to be rejected", bucketURL)
+		}
+	}
+	if errSet := logger.SetRemoteBucket(sameDir + "?prefix=archive/"); errSet != nil {
+		t.Fatalf("expected a subdirectory prefix to be accepted: %v", errSet)
+	}
+}
