@@ -1160,7 +1160,8 @@ observability:
     # Upload completed request and error logs to a bucket, then delete the local copy.
     # Uses gocloud.dev URLs; credentials come from the provider's standard environment.
     # Examples: "gs://my-bucket?prefix=request-logs/", "s3://my-bucket?region=us-east-1&prefix=logs/",
-    # "file:///var/lib/cliproxy/request-logs". Empty keeps logs on local disk.
+    # "file:///var/lib/cliproxy/request-logs?create_dir=1" (without create_dir the directory must already exist).
+    # Empty keeps logs on local disk.
     request-log-bucket: ""
 
     # Record proxy request/response logs. Management requests are excluded.
