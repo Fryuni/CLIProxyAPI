@@ -131,6 +131,10 @@ func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
 	if bucketURL == "" {
 		return nil
 	}
+	// The logs directory must exist so the bucket check can compare directory identities.
+	if errEnsure := l.ensureLogsDir(); errEnsure != nil {
+		return fmt.Errorf("failed to create logs directory: %w", errEnsure)
+	}
 	if errURL := checkRequestLogBucketURL(bucketURL, l.logsDir); errURL != nil {
 		return errURL
 	}

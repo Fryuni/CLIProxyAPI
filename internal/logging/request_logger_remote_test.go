@@ -404,3 +404,19 @@ func TestCloseRemoteBucketStopsWaitingWhenContextEnds(t *testing.T) {
 	cancel()
 	logger.CloseRemoteBucket(ctx)
 }
+
+func TestSetRemoteBucketRejectsAliasOfMissingLogsDirectory(t *testing.T) {
+	data := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if errLink := os.Symlink(data, alias); errLink != nil {
+		t.Skipf("symlinks unavailable: %v", errLink)
+	}
+	logsDir := filepath.Join(data, "logs")
+	logger := NewFileRequestLogger(true, logsDir, "", 0)
+	defer logger.CloseRemoteBucket(context.Background())
+
+	bucketURL := fileBucketURL(t, filepath.Join(alias, "logs")) + "?create_dir=1"
+	if errSet := logger.SetRemoteBucket(bucketURL); errSet == nil {
+		t.Fatalf("expected %s to be rejected before the logs directory exists", bucketURL)
+	}
+}
