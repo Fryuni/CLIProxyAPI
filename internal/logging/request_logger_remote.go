@@ -131,8 +131,8 @@ func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
 	if bucketURL == "" {
 		return nil
 	}
-	if errDir := checkBucketOutsideLogsDir(bucketURL, l.logsDir); errDir != nil {
-		return errDir
+	if errURL := checkRequestLogBucketURL(bucketURL, l.logsDir); errURL != nil {
+		return errURL
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,14 +157,26 @@ func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
 	return nil
 }
 
-// checkBucketOutsideLogsDir rejects file buckets whose objects would land in the scanned logs directory,
-// directly or through a symbolic link, where every uploaded object would be picked up again as a pending log.
-func checkBucketOutsideLogsDir(bucketURL, logsDir string) error {
+// checkRequestLogBucketURL rejects bucket URLs that cannot archive distinct logs: a "key" option, which maps
+// every object to one key, and file buckets whose objects would land in the scanned logs directory, directly
+// or through a symbolic link, where every uploaded object would be picked up again as a pending log.
+func checkRequestLogBucketURL(bucketURL, logsDir string) error {
 	parsed, errParse := url.Parse(bucketURL)
-	if errParse != nil || parsed.Scheme != "file" {
+	if errParse != nil {
 		return nil
 	}
-	objectPath := filepath.Join(filepath.FromSlash(parsed.Path), filepath.FromSlash(parsed.Query().Get("prefix")+"object"))
+	if parsed.Query().Has("key") {
+		return fmt.Errorf("request log bucket URL must not set the key option, which stores every log under one key")
+	}
+	if parsed.Scheme != "file" {
+		return nil
+	}
+	// Resolve the root as fileblob does: host "." means a relative path, and Windows paths drop the leading "/".
+	root := parsed.Path
+	if parsed.Host == "." || os.PathSeparator != '/' {
+		root = strings.TrimPrefix(root, "/")
+	}
+	objectPath := filepath.Join(filepath.FromSlash(root), filepath.FromSlash(parsed.Query().Get("prefix")+"object"))
 	objectsDir, errObjects := filepath.Abs(filepath.Dir(objectPath))
 	absLogsDir, errLogs := filepath.Abs(logsDir)
 	if errObjects != nil || errLogs != nil {

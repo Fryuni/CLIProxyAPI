@@ -239,6 +239,15 @@ func TestSetRemoteBucketRejectsLogsDirectory(t *testing.T) {
 		}
 	}
 	alias := filepath.Join(t.TempDir(), "logs-alias")
+	// A relative "file://./" root resolves against the working directory, as fileblob resolves it.
+	t.Chdir(filepath.Dir(logsDir))
+	relative := "file://./" + filepath.ToSlash(filepath.Base(logsDir))
+	if errSet := logger.SetRemoteBucket(relative); errSet == nil {
+		t.Fatalf("expected %s to be rejected", relative)
+	}
+	if errSet := logger.SetRemoteBucket(fileBucketURL(t, t.TempDir()) + "?key=single.log"); errSet == nil {
+		t.Fatal("expected a single-key bucket URL to be rejected")
+	}
 	if errLink := os.Symlink(logsDir, alias); errLink == nil {
 		if errSet := logger.SetRemoteBucket(fileBucketURL(t, alias)); errSet == nil {
 			t.Fatal("expected a symlink to the logs directory to be rejected")
