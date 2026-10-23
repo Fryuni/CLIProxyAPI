@@ -139,6 +139,11 @@ func (l *FileRequestLogger) SetRemoteBucketContext(ctx context.Context, bucketUR
 	var errSetup error
 	if bucketURL != "" {
 		uploader, errSetup = l.openUploader(ctx, bucketURL)
+		// A canceled change is abandoned: the caller does not record the new configuration, so a retry with
+		// the current URL would be skipped and must find the current uploader still running.
+		if errors.Is(errSetup, context.Canceled) || errors.Is(errSetup, context.DeadlineExceeded) {
+			return errSetup
+		}
 	}
 
 	if previous != nil {

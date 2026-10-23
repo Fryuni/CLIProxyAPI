@@ -487,7 +487,12 @@ func TestSetRemoteBucketContextHonorsCancellation(t *testing.T) {
 	blockingScheme.current.Store(opener)
 	registerBlockingScheme.Do(func() { blob.DefaultURLMux().RegisterBucket("blockingtest", &blockingScheme) })
 
-	logger := NewFileRequestLogger(true, t.TempDir(), "", 0)
+	logsDir := t.TempDir()
+	logger := NewFileRequestLogger(true, logsDir, "", 0)
+	current := fileBucketURL(t, t.TempDir())
+	if errSet := logger.SetRemoteBucket(current); errSet != nil {
+		t.Fatalf("SetRemoteBucket: %v", errSet)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- logger.SetRemoteBucketContext(ctx, "blockingtest://bucket") }()
@@ -501,7 +506,16 @@ func TestSetRemoteBucketContextHonorsCancellation(t *testing.T) {
 	}
 	// The abandoned open is canceled too, so it does not outlive the call.
 	<-opener.exited
-	if logger.currentUploader() != nil {
-		t.Fatal("expected no uploader after a canceled open")
+	// Canceling abandons only the pending change; the current bucket keeps archiving.
+	if uploader := logger.currentUploader(); uploader == nil || uploader.bucketURL != current {
+		t.Fatalf("expected the current uploader to keep running after a canceled change, got %+v", uploader)
+	}
+	errLog := logger.LogRequest("/v1/responses", "POST", nil, []byte("{}"), 200, nil, []byte("{}"), nil, nil, nil, nil, nil, "req-keep0001", time.Now(), time.Now())
+	if errLog != nil {
+		t.Fatalf("LogRequest: %v", errLog)
+	}
+	logger.CloseRemoteBucket(context.Background())
+	if objects := bucketObjects(t, current); len(objects) != 1 {
+		t.Fatalf("expected the current bucket to receive the log, got %v", objects)
 	}
 }
