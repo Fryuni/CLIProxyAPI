@@ -281,3 +281,117 @@ func TestCompletedLogKeepsDirectCreateMode(t *testing.T) {
 		t.Fatalf("expected mode %o, got %o", want, mode)
 	}
 }
+
+func TestUploadsFromSeparateInstancesKeepBothLogs(t *testing.T) {
+	bucketURL := fileBucketURL(t, t.TempDir())
+	name := "v1-responses-2025-12-23T195811-a1b2c3d4.log"
+	for _, content := range []string{"first instance", "second instance"} {
+		logsDir := t.TempDir()
+		writeTestFile(t, filepath.Join(logsDir, name), content)
+		logger := NewFileRequestLogger(true, logsDir, "", 0)
+		if errSet := logger.SetRemoteBucket(bucketURL); errSet != nil {
+			t.Fatalf("SetRemoteBucket: %v", errSet)
+		}
+		logger.CloseRemoteBucket(context.Background())
+	}
+
+	objects := bucketObjects(t, bucketURL)
+	if len(objects) != 2 || objects[name] != "first instance" || objects["v1-responses-2025-12-23T195811_1-a1b2c3d4.log"] != "second instance" {
+		t.Fatalf("unexpected bucket objects: %v", objects)
+	}
+}
+
+func TestFailedUploadWaitsForRetryInterval(t *testing.T) {
+	logsDir := t.TempDir()
+	bucketDir := filepath.Join(t.TempDir(), "bucket")
+	if errMkdir := os.MkdirAll(bucketDir, 0o755); errMkdir != nil {
+		t.Fatalf("mkdir bucket: %v", errMkdir)
+	}
+	bucketURL := fileBucketURL(t, bucketDir)
+	bucket, errOpen := blob.OpenBucket(context.Background(), bucketURL)
+	if errOpen != nil {
+		t.Fatalf("open bucket: %v", errOpen)
+	}
+	defer func() { _ = bucket.Close() }()
+
+	clock := time.Date(2025, 12, 23, 19, 58, 11, 0, time.UTC)
+	uploader := &requestLogUploader{logsDir: logsDir, bucket: bucket, ctx: context.Background(), now: func() time.Time { return clock }}
+
+	failed := "v1-responses-2025-12-23T195811-a1b2c3d4.log"
+	writeTestFile(t, filepath.Join(logsDir, failed), "failed log")
+	// Replace the bucket directory with a file so writes fail.
+	if errRemove := os.RemoveAll(bucketDir); errRemove != nil {
+		t.Fatalf("remove bucket dir: %v", errRemove)
+	}
+	writeTestFile(t, bucketDir, "not a directory")
+	uploader.uploadCompleted(false)
+
+	if errRemove := os.Remove(bucketDir); errRemove != nil {
+		t.Fatalf("remove bucket file: %v", errRemove)
+	}
+	if errMkdir := os.MkdirAll(bucketDir, 0o755); errMkdir != nil {
+		t.Fatalf("restore bucket dir: %v", errMkdir)
+	}
+	fresh := "v1-responses-2025-12-23T195840-cafebabe.log"
+	writeTestFile(t, filepath.Join(logsDir, fresh), "fresh log")
+	clock = clock.Add(requestLogUploadInterval / 2)
+	uploader.uploadCompleted(false)
+
+	if objects := bucketObjects(t, bucketURL); len(objects) != 1 || objects[fresh] != "fresh log" {
+		t.Fatalf("expected only the new log before the retry time, got %v", objects)
+	}
+	if _, errStat := os.Stat(filepath.Join(logsDir, failed)); errStat != nil {
+		t.Fatalf("expected failed log to stay local until its retry time: %v", errStat)
+	}
+
+	clock = clock.Add(requestLogUploadInterval)
+	uploader.uploadCompleted(false)
+	if objects := bucketObjects(t, bucketURL); len(objects) != 2 || objects[failed] != "failed log" {
+		t.Fatalf("expected failed log to upload after its retry time, got %v", objects)
+	}
+}
+
+func TestCloseRemoteBucketWaitsForTrackedRequests(t *testing.T) {
+	logsDir := t.TempDir()
+	bucketURL := fileBucketURL(t, t.TempDir())
+	logger := NewFileRequestLogger(true, logsDir, "", 0)
+	if errSet := logger.SetRemoteBucket(bucketURL); errSet != nil {
+		t.Fatalf("SetRemoteBucket: %v", errSet)
+	}
+
+	waiting := make(chan struct{})
+	logger.active.onWait = func() { close(waiting) }
+	done := logger.TrackRequest()
+	closed := make(chan struct{})
+	go func() {
+		logger.CloseRemoteBucket(context.Background())
+		close(closed)
+	}()
+
+	<-waiting
+	errLog := logger.LogRequest("/v1/responses", "POST", nil, []byte("{}"), 200, nil, []byte("late"), nil, nil, nil, nil, nil, "req-late0001", time.Now(), time.Now())
+	if errLog != nil {
+		t.Fatalf("LogRequest: %v", errLog)
+	}
+	done()
+	<-closed
+
+	if objects := bucketObjects(t, bucketURL); len(objects) != 1 {
+		t.Fatalf("expected the late log to be uploaded, got %v", objects)
+	}
+	if names := localNames(t, logsDir); len(names) != 0 {
+		t.Fatalf("expected local logs to be removed, got %v", names)
+	}
+}
+
+func TestCloseRemoteBucketStopsWaitingWhenContextEnds(t *testing.T) {
+	logger := NewFileRequestLogger(true, t.TempDir(), "", 0)
+	if errSet := logger.SetRemoteBucket(fileBucketURL(t, t.TempDir())); errSet != nil {
+		t.Fatalf("SetRemoteBucket: %v", errSet)
+	}
+	defer logger.TrackRequest()()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	logger.CloseRemoteBucket(ctx)
+}

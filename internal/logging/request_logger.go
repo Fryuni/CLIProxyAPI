@@ -151,6 +151,9 @@ type FileRequestLogger struct {
 
 	// uploader moves completed logs to a remote bucket when one is configured.
 	uploader *requestLogUploader
+
+	// active tracks logged requests so shutdown can wait for their logs.
+	active activeRequests
 }
 
 // NewFileRequestLogger creates a new file-based request logger.

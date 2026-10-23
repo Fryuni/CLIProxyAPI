@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -40,6 +41,69 @@ type requestLogUploader struct {
 	kick      chan struct{}
 	stop      chan struct{}
 	done      chan struct{}
+
+	// now returns the current time; tests replace it to control retry timing.
+	now func() time.Time
+
+	// retryAt holds, for each log whose upload failed, when it may be retried. Only the worker goroutine uses it.
+	retryAt map[string]time.Time
+}
+
+// activeRequests counts logged requests whose logs may still be written.
+type activeRequests struct {
+	mu    sync.Mutex
+	count int
+	idle  chan struct{}
+
+	// onWait is called when wait starts blocking; tests use it to order events.
+	onWait func()
+}
+
+func (a *activeRequests) begin() func() {
+	a.mu.Lock()
+	if a.count == 0 {
+		a.idle = make(chan struct{})
+	}
+	a.count++
+	a.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			a.mu.Lock()
+			a.count--
+			if a.count == 0 {
+				close(a.idle)
+			}
+			a.mu.Unlock()
+		})
+	}
+}
+
+// wait blocks until no tracked request is active or ctx is done.
+func (a *activeRequests) wait(ctx context.Context) {
+	a.mu.Lock()
+	count, idle, onWait := a.count, a.idle, a.onWait
+	a.mu.Unlock()
+	if count == 0 {
+		return
+	}
+	if onWait != nil {
+		onWait()
+	}
+	select {
+	case <-idle:
+	case <-ctx.Done():
+	}
+}
+
+// TrackRequest marks a logged request as in flight until the returned function is called.
+// CloseRemoteBucket waits for tracked requests so their logs are included in the final upload pass.
+func (l *FileRequestLogger) TrackRequest() func() {
+	if l == nil {
+		return func() {}
+	}
+	return l.active.begin()
 }
 
 // SetRemoteBucket configures the bucket that completed request logs are uploaded to.
@@ -86,6 +150,7 @@ func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
 		kick:      make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
+		now:       time.Now,
 	}
 	l.uploader = uploader
 	go uploader.run()
@@ -117,13 +182,22 @@ func checkBucketOutsideLogsDir(bucketURL, logsDir string) error {
 	return nil
 }
 
-// CloseRemoteBucket uploads pending request logs and stops the uploader.
-// Uploads still running when ctx is done are abandoned; their files stay local
-// and are uploaded on the next start.
+// CloseRemoteBucket waits for tracked requests to finish logging, uploads pending request logs,
+// and stops the uploader. Work still running when ctx is done is abandoned; those files stay
+// local and are uploaded on the next start.
 func (l *FileRequestLogger) CloseRemoteBucket(ctx context.Context) {
 	if l == nil {
 		return
 	}
+	l.uploaderMu.Lock()
+	hasUploader := l.uploader != nil
+	l.uploaderMu.Unlock()
+	if !hasUploader {
+		return
+	}
+	// Wait without holding uploaderMu: finishing requests take it to notify the uploader.
+	l.active.wait(ctx)
+
 	l.uploaderMu.Lock()
 	defer l.uploaderMu.Unlock()
 	if l.uploader != nil {
@@ -206,16 +280,17 @@ func (u *requestLogUploader) run() {
 	ticker := time.NewTicker(requestLogUploadInterval)
 	defer ticker.Stop()
 
-	u.uploadCompleted()
+	u.uploadCompleted(false)
 	for {
 		select {
 		case <-u.kick:
 		case <-ticker.C:
 		case <-u.stop:
-			u.uploadCompleted()
+			// Shutdown is the last chance to upload, so retry every log regardless of backoff.
+			u.uploadCompleted(true)
 			return
 		}
-		u.uploadCompleted()
+		u.uploadCompleted(false)
 	}
 }
 
@@ -235,7 +310,9 @@ func (u *requestLogUploader) close(ctx context.Context) {
 }
 
 // uploadCompleted uploads every completed request log in the logs directory and deletes each uploaded file.
-func (u *requestLogUploader) uploadCompleted() {
+// A log whose upload failed is skipped until requestLogUploadInterval has passed, unless retryAll is set,
+// so completion notifications during an outage do not retry the whole backlog on every request.
+func (u *requestLogUploader) uploadCompleted(retryAll bool) {
 	entries, errRead := os.ReadDir(u.logsDir)
 	if errRead != nil {
 		if !os.IsNotExist(errRead) {
@@ -243,11 +320,18 @@ func (u *requestLogUploader) uploadCompleted() {
 		}
 		return
 	}
+	now := u.now()
+	retryAt := make(map[string]time.Time)
+	defer func() { u.retryAt = retryAt }()
 	for _, entry := range entries {
-		if u.ctx.Err() != nil {
-			return
-		}
 		name := entry.Name()
+		if next, failed := u.retryAt[name]; failed && !retryAll && now.Before(next) {
+			retryAt[name] = next
+			continue
+		}
+		if u.ctx.Err() != nil {
+			continue
+		}
 		if entry.IsDir() || !completedRequestLogPattern.MatchString(name) {
 			continue
 		}
@@ -261,6 +345,7 @@ func (u *requestLogUploader) uploadCompleted() {
 				continue
 			}
 			log.WithError(errUpload).Warnf("failed to upload request log: %s", name)
+			retryAt[name] = now.Add(requestLogUploadInterval)
 			continue
 		}
 		if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) {

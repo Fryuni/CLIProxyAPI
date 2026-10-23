@@ -714,3 +714,50 @@ func TestRequestLoggingMiddleware_StreamingPreservesFullUUIDForLogger(t *testing
 		t.Fatalf("streaming request ID version = %d, want 7", parsed.Version())
 	}
 }
+
+type trackingRequestLogger struct {
+	spyRequestLogger
+	active   int
+	tracked  int
+	loggedIn int
+}
+
+func (l *trackingRequestLogger) TrackRequest() func() {
+	l.active++
+	l.tracked++
+	return func() { l.active-- }
+}
+
+func (l *trackingRequestLogger) LogRequest(url, method string, requestHeaders map[string][]string, body []byte, statusCode int, responseHeaders map[string][]string, response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte, apiResponseErrors []*interfaces.ErrorMessage, requestID string, requestTimestamp, apiResponseTimestamp time.Time) error {
+	l.loggedIn = l.active
+	return nil
+}
+
+func TestRequestLoggingMiddleware_TracksRequestUntilLogIsWritten(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logger := &trackingRequestLogger{}
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	activeInHandler := 0
+	router.POST("/v1/chat/completions", func(c *gin.Context) {
+		activeInHandler = logger.active
+		c.JSON(http.StatusOK, gin.H{"choices": []string{}})
+	})
+	router.GET("/v1/responses", func(c *gin.Context) {
+		c.Status(http.StatusSwitchingProtocols)
+	})
+
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}")))
+	if logger.tracked != 1 || activeInHandler != 1 || logger.loggedIn != 1 || logger.active != 0 {
+		t.Fatalf("expected the request to stay tracked through its log write, got tracked=%d handler=%d logged=%d active=%d", logger.tracked, activeInHandler, logger.loggedIn, logger.active)
+	}
+
+	upgrade := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	upgrade.Header.Set("Connection", "Upgrade")
+	upgrade.Header.Set("Upgrade", "websocket")
+	router.ServeHTTP(httptest.NewRecorder(), upgrade)
+	if logger.tracked != 1 {
+		t.Fatalf("expected websocket upgrades not to be tracked, got tracked=%d", logger.tracked)
+	}
+}
