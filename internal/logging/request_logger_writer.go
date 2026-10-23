@@ -133,43 +133,35 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		responseToWrite = response
 	}
 
-	logFile, _, errOpen := createUniqueLogFile(l.logsDir, filename)
-	if errOpen != nil {
-		return fmt.Errorf("failed to create log file: %w", errOpen)
-	}
-
-	writeErr := l.writeNonStreamingLog(
-		logFile,
-		url,
-		method,
-		requestHeaders,
-		body,
-		requestBodyPath,
-		websocketTimeline,
-		websocketTimelineSource,
-		apiRequest,
-		apiRequestSource,
-		apiResponse,
-		apiResponseSource,
-		apiWebsocketTimeline,
-		apiWebsocketTimelineSource,
-		apiResponseErrors,
-		statusCode,
-		responseHeaders,
-		responseToWrite,
-		decompressErr,
-		requestTimestamp,
-		apiResponseTimestamp,
-	)
-	if errClose := logFile.Close(); errClose != nil {
-		log.WithError(errClose).Warn("failed to close request log file")
-		if writeErr == nil {
-			return errClose
-		}
-	}
+	writeErr := writeLogFileAtomically(l.logsDir, filename, func(logFile io.Writer) error {
+		return l.writeNonStreamingLog(
+			logFile,
+			url,
+			method,
+			requestHeaders,
+			body,
+			requestBodyPath,
+			websocketTimeline,
+			websocketTimelineSource,
+			apiRequest,
+			apiRequestSource,
+			apiResponse,
+			apiResponseSource,
+			apiWebsocketTimeline,
+			apiWebsocketTimelineSource,
+			apiResponseErrors,
+			statusCode,
+			responseHeaders,
+			responseToWrite,
+			decompressErr,
+			requestTimestamp,
+			apiResponseTimestamp,
+		)
+	})
 	if writeErr != nil {
 		return fmt.Errorf("failed to write log file: %w", writeErr)
 	}
+	l.notifyLogCompleted()
 
 	if force && !l.enabled {
 		if errCleanup := l.cleanupOldErrorLogs(); errCleanup != nil {
@@ -246,6 +238,7 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 		chunkChan:        make(chan []byte, 100), // Buffered channel for async writes
 		closeChan:        make(chan struct{}),
 		errorChan:        make(chan error, 1),
+		onComplete:       l.notifyLogCompleted,
 	}
 
 	// Start async writer goroutine
@@ -307,6 +300,43 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 	}
 
 	return fmt.Sprintf("%s-%s-%s.log", sanitized, timestamp, idPart)
+}
+
+// writeLogFileAtomically assembles a log in a temp file and moves it to a unique name derived from filename
+// only once it is complete, so a non-empty .log file never holds partial content.
+func writeLogFileAtomically(dir, filename string, write func(io.Writer) error) error {
+	tmpFile, errCreate := os.CreateTemp(dir, "request-log-*.tmp")
+	if errCreate != nil {
+		return fmt.Errorf("failed to create log file: %w", errCreate)
+	}
+	tmpPath := tmpFile.Name()
+
+	writeErr := write(tmpFile)
+	if errClose := tmpFile.Close(); errClose != nil {
+		log.WithError(errClose).Warn("failed to close request log file")
+		if writeErr == nil {
+			writeErr = errClose
+		}
+	}
+	if writeErr != nil {
+		_ = os.Remove(tmpPath)
+		return writeErr
+	}
+
+	reserved, target, errReserve := createUniqueLogFile(dir, filename)
+	if errReserve != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to create log file: %w", errReserve)
+	}
+	if errClose := reserved.Close(); errClose != nil {
+		log.WithError(errClose).Warn("failed to close reserved request log file")
+	}
+	if errRename := os.Rename(tmpPath, target); errRename != nil {
+		_ = os.Remove(tmpPath)
+		_ = os.Remove(target)
+		return fmt.Errorf("failed to finalize log file: %w", errRename)
+	}
+	return nil
 }
 
 // createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,

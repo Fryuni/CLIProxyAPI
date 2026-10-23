@@ -6,6 +6,7 @@ package logging
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
@@ -144,6 +145,12 @@ type FileRequestLogger struct {
 	errorLogsMaxFiles int
 
 	homeEnabled bool
+
+	// uploaderMu guards uploader.
+	uploaderMu sync.Mutex
+
+	// uploader moves completed logs to a remote bucket when one is configured.
+	uploader *requestLogUploader
 }
 
 // NewFileRequestLogger creates a new file-based request logger.

@@ -1157,6 +1157,12 @@ observability:
     # When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
     error-logs-max-files: 10
 
+    # Upload completed request and error logs to a bucket, then delete the local copy.
+    # Uses gocloud.dev URLs; credentials come from the provider's standard environment.
+    # Examples: "gs://my-bucket?prefix=request-logs/", "s3://my-bucket?region=us-east-1&prefix=logs/",
+    # "file:///var/lib/cliproxy/request-logs". Empty keeps logs on local disk.
+    request-log-bucket: ""
+
     # Record proxy request/response logs. Management requests are excluded.
     request-log: false
 

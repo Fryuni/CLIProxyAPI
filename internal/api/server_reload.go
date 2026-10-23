@@ -100,6 +100,14 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
 	}
 
+	if s.requestLogger != nil && (oldCfg == nil || oldCfg.RequestLogBucket != cfg.RequestLogBucket) {
+		if setter, ok := s.requestLogger.(interface{ SetRemoteBucket(string) error }); ok {
+			if errBucket := setter.SetRemoteBucket(cfg.RequestLogBucket); errBucket != nil {
+				log.WithError(errBucket).Error("request logs will stay on local disk")
+			}
+		}
+	}
+
 	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != cfg.ErrorLogsMaxFiles) {
 		if setter, ok := s.requestLogger.(interface{ SetErrorLogsMaxFiles(int) }); ok {
 			setter.SetErrorLogsMaxFiles(cfg.ErrorLogsMaxFiles)
