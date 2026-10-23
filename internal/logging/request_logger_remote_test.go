@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -237,7 +238,46 @@ func TestSetRemoteBucketRejectsLogsDirectory(t *testing.T) {
 			t.Fatalf("expected %s to be rejected", bucketURL)
 		}
 	}
+	alias := filepath.Join(t.TempDir(), "logs-alias")
+	if errLink := os.Symlink(logsDir, alias); errLink == nil {
+		if errSet := logger.SetRemoteBucket(fileBucketURL(t, alias)); errSet == nil {
+			t.Fatal("expected a symlink to the logs directory to be rejected")
+		}
+	} else {
+		t.Logf("skipping symlink case: %v", errLink)
+	}
 	if errSet := logger.SetRemoteBucket(sameDir + "?prefix=archive/"); errSet != nil {
 		t.Fatalf("expected a subdirectory prefix to be accepted: %v", errSet)
+	}
+}
+
+func TestCompletedLogKeepsDirectCreateMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	errWrite := writeLogFileAtomically(dir, "v1-responses-2025-12-23T195811-a1b2c3d4.log", func(w io.Writer) error {
+		_, errWrite := w.Write([]byte("complete"))
+		return errWrite
+	})
+	if errWrite != nil {
+		t.Fatalf("writeLogFileAtomically: %v", errWrite)
+	}
+	info, errStat := os.Stat(filepath.Join(dir, "v1-responses-2025-12-23T195811-a1b2c3d4.log"))
+	if errStat != nil {
+		t.Fatalf("stat: %v", errStat)
+	}
+	// Compare with a file created the way logs were created before atomic finalization.
+	reference, _, errReference := createUniqueLogFile(dir, "reference-2025-12-23T195811-a1b2c3d4.log")
+	if errReference != nil {
+		t.Fatalf("create reference: %v", errReference)
+	}
+	referenceInfo, errReferenceStat := reference.Stat()
+	_ = reference.Close()
+	if errReferenceStat != nil {
+		t.Fatalf("stat reference: %v", errReferenceStat)
+	}
+	if mode, want := info.Mode().Perm(), referenceInfo.Mode().Perm(); mode != want {
+		t.Fatalf("expected mode %o, got %o", want, mode)
 	}
 }

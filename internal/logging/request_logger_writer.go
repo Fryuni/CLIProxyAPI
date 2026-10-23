@@ -3,6 +3,8 @@ package logging
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -305,7 +307,7 @@ func (l *FileRequestLogger) generateFilename(url string, requestID ...string) st
 // writeLogFileAtomically assembles a log in a temp file and moves it to a unique name derived from filename
 // only once it is complete, so a non-empty .log file never holds partial content.
 func writeLogFileAtomically(dir, filename string, write func(io.Writer) error) error {
-	tmpFile, errCreate := os.CreateTemp(dir, "request-log-*.tmp")
+	tmpFile, errCreate := createLogTempFile(dir)
 	if errCreate != nil {
 		return fmt.Errorf("failed to create log file: %w", errCreate)
 	}
@@ -337,6 +339,26 @@ func writeLogFileAtomically(dir, filename string, write func(io.Writer) error) e
 		return fmt.Errorf("failed to finalize log file: %w", errRename)
 	}
 	return nil
+}
+
+// createLogTempFile creates a uniquely named request-log-*.tmp file in dir. Unlike os.CreateTemp, it uses
+// mode 0644 subject to the umask, so the renamed log keeps the mode logs were created with directly.
+func createLogTempFile(dir string) (*os.File, error) {
+	for attempt := 0; attempt < 10000; attempt++ {
+		var suffix [8]byte
+		if _, errRand := rand.Read(suffix[:]); errRand != nil {
+			return nil, errRand
+		}
+		path := filepath.Join(dir, "request-log-"+hex.EncodeToString(suffix[:])+".tmp")
+		file, errOpen := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if errOpen == nil {
+			return file, nil
+		}
+		if !os.IsExist(errOpen) {
+			return nil, errOpen
+		}
+	}
+	return nil, fmt.Errorf("too many conflicting temp log files in %s", dir)
 }
 
 // createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,

@@ -93,7 +93,7 @@ func (l *FileRequestLogger) SetRemoteBucket(bucketURL string) error {
 }
 
 // checkBucketOutsideLogsDir rejects file buckets whose objects would land in the scanned logs directory,
-// where every uploaded object would be picked up again as a pending log.
+// directly or through a symbolic link, where every uploaded object would be picked up again as a pending log.
 func checkBucketOutsideLogsDir(bucketURL, logsDir string) error {
 	parsed, errParse := url.Parse(bucketURL)
 	if errParse != nil || parsed.Scheme != "file" {
@@ -102,7 +102,16 @@ func checkBucketOutsideLogsDir(bucketURL, logsDir string) error {
 	objectPath := filepath.Join(filepath.FromSlash(parsed.Path), filepath.FromSlash(parsed.Query().Get("prefix")+"object"))
 	objectsDir, errObjects := filepath.Abs(filepath.Dir(objectPath))
 	absLogsDir, errLogs := filepath.Abs(logsDir)
-	if errObjects == nil && errLogs == nil && objectsDir == absLogsDir {
+	if errObjects != nil || errLogs != nil {
+		return nil
+	}
+	sameDir := objectsDir == absLogsDir
+	if !sameDir {
+		objectsInfo, errObjectsStat := os.Stat(objectsDir)
+		logsInfo, errLogsStat := os.Stat(absLogsDir)
+		sameDir = errObjectsStat == nil && errLogsStat == nil && os.SameFile(objectsInfo, logsInfo)
+	}
+	if sameDir {
 		return fmt.Errorf("request log bucket must not store objects in the logs directory %s", absLogsDir)
 	}
 	return nil
