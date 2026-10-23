@@ -194,3 +194,34 @@ func TestLogsStayLocalWithoutBucket(t *testing.T) {
 		t.Fatalf("expected one completed local log, got %v", names)
 	}
 }
+
+func TestUploadDoesNotReplaceExistingRemoteLog(t *testing.T) {
+	logsDir := t.TempDir()
+	bucketURL := fileBucketURL(t, t.TempDir())
+
+	name := "v1-responses-2025-12-23T195811-a1b2c3d4.log"
+	sequenced := "v1-responses-2025-12-23T195811_1-a1b2c3d4.log"
+	bucket, errOpen := blob.OpenBucket(context.Background(), bucketURL)
+	if errOpen != nil {
+		t.Fatalf("open bucket: %v", errOpen)
+	}
+	if errWrite := bucket.WriteAll(context.Background(), name, []byte("other instance log"), nil); errWrite != nil {
+		t.Fatalf("seed bucket: %v", errWrite)
+	}
+	_ = bucket.Close()
+	writeTestFile(t, filepath.Join(logsDir, name), "local log")
+
+	logger := NewFileRequestLogger(true, logsDir, "", 0)
+	if errSet := logger.SetRemoteBucket(bucketURL); errSet != nil {
+		t.Fatalf("SetRemoteBucket: %v", errSet)
+	}
+	logger.CloseRemoteBucket(context.Background())
+
+	objects := bucketObjects(t, bucketURL)
+	if len(objects) != 2 || objects[name] != "other instance log" || objects[sequenced] != "local log" {
+		t.Fatalf("unexpected bucket objects: %v", objects)
+	}
+	if names := localNames(t, logsDir); len(names) != 0 {
+		t.Fatalf("expected local logs to be removed, got %v", names)
+	}
+}

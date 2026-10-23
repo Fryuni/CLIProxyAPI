@@ -342,16 +342,6 @@ func writeLogFileAtomically(dir, filename string, write func(io.Writer) error) e
 // createUniqueLogFile atomically opens a unique log file within dir. If a file with filename already exists,
 // it avoids overwriting by injecting an incrementing sequence number before the trailing request ID component.
 func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
-	ext := filepath.Ext(filename)
-	base := strings.TrimSuffix(filename, ext)
-	idx := strings.LastIndex(base, "-")
-	prefix := base
-	idPart := ""
-	if idx > 0 {
-		prefix = base[:idx]
-		idPart = base[idx+1:]
-	}
-
 	target := filepath.Join(dir, filename)
 	logFile, errOpen := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if errOpen == nil {
@@ -362,7 +352,7 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 	}
 
 	for seq := 1; seq <= 1000; seq++ {
-		candidateName := fmt.Sprintf("%s_%d-%s%s", prefix, seq, idPart, ext)
+		candidateName := sequencedLogFilename(filename, seq)
 		candidatePath := filepath.Join(dir, candidateName)
 		logCandidate, errCandidate := os.OpenFile(candidatePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 		if errCandidate == nil {
@@ -373,6 +363,20 @@ func createUniqueLogFile(dir, filename string) (*os.File, string, error) {
 		}
 	}
 	return nil, "", fmt.Errorf("too many conflicting log files for %s", filename)
+}
+
+// sequencedLogFilename injects seq before the trailing request ID component of filename.
+func sequencedLogFilename(filename string, seq int) string {
+	ext := filepath.Ext(filename)
+	base := strings.TrimSuffix(filename, ext)
+	idx := strings.LastIndex(base, "-")
+	prefix := base
+	idPart := ""
+	if idx > 0 {
+		prefix = base[:idx]
+		idPart = base[idx+1:]
+	}
+	return fmt.Sprintf("%s_%d-%s%s", prefix, seq, idPart, ext)
 }
 
 // sanitizeForFilename replaces characters that are not safe for filenames.

@@ -16,6 +16,7 @@ import (
 	_ "gocloud.dev/blob/fileblob"
 	_ "gocloud.dev/blob/gcsblob"
 	_ "gocloud.dev/blob/s3blob"
+	"gocloud.dev/gcerrors"
 )
 
 // requestLogUploadInterval is how often the uploader retries logs left behind by failed uploads.
@@ -239,7 +240,10 @@ func (u *requestLogUploader) uploadCompleted() {
 	}
 }
 
-func (u *requestLogUploader) upload(path, key string) error {
+// upload stores the log at path under name without replacing existing objects. Local names are unique only
+// within one directory at one time, so when instances share a bucket or a name is reused after an earlier
+// upload, the log is stored under the next free sequenced name instead.
+func (u *requestLogUploader) upload(path, name string) error {
 	file, errOpen := os.Open(path)
 	if errOpen != nil {
 		return errOpen
@@ -250,9 +254,26 @@ func (u *requestLogUploader) upload(path, key string) error {
 		}
 	}()
 
+	key := name
+	for seq := 1; ; seq++ {
+		errUpload := u.uploadAs(file, key)
+		if gcerrors.Code(errUpload) != gcerrors.FailedPrecondition {
+			return errUpload
+		}
+		if seq > 1000 {
+			return fmt.Errorf("too many conflicting remote request logs for %s", name)
+		}
+		if _, errSeek := file.Seek(0, io.SeekStart); errSeek != nil {
+			return errSeek
+		}
+		key = sequencedLogFilename(name, seq)
+	}
+}
+
+func (u *requestLogUploader) uploadAs(file io.Reader, key string) error {
 	ctx, cancel := context.WithCancel(u.ctx)
 	defer cancel()
-	writer, errWriter := u.bucket.NewWriter(ctx, key, &blob.WriterOptions{ContentType: "text/plain; charset=utf-8"})
+	writer, errWriter := u.bucket.NewWriter(ctx, key, &blob.WriterOptions{ContentType: "text/plain; charset=utf-8", IfNotExist: true})
 	if errWriter != nil {
 		return errWriter
 	}
