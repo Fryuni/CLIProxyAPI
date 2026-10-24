@@ -4,7 +4,7 @@ status: accepted
 
 # Sync upstream 8289ec4c while keeping the fork delta
 
-This merge brings 137 upstream commits (122 excluding merges), from `911f49cb` to `8289ec4c`, into fork main at `0deb4f86`, its first parent. The fork keeps:
+Merge commit `a2fd3c78` brings 137 upstream commits (122 excluding merges), from `911f49cb` to `8289ec4c`, into fork main at `0deb4f86`, its first parent. The fork keeps:
 
 - its CI ([ADR-0004](0004-minimal-fork-ci.md))
 - its HTTP 500 retry-round behavior ([ADR-0005](0005-request-scoped-http-500-retry-rounds.md), [ADR-0006](0006-closed-network-errors-are-transport-failures.md), [ADR-0007](0007-select-prepared-candidates-for-delegated-strategies.md))
