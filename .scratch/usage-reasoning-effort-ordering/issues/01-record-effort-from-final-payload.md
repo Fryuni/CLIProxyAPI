@@ -42,3 +42,10 @@ For each executor family, add a regression in which a payload override changes t
 ## Comments
 
 Reported by Codex review on PR #11 at `internal/runtime/executor/xai_executor_execute.go:50`, `internal/runtime/executor/gemini_executor.go:187`, and `internal/runtime/executor/antigravity_executor_execute.go:99`. Every call site was then audited. The fork's runtime is unchanged.
+
+Upstream sync `8289ec4c` ([ADR-0026](../../../docs/adr/0026-sync-upstream-8289ec4c.md)): upstream `07b5a7a1` moves the reasoning-effort report after the payload rules for Gemini, Vertex, Kimi, openai-compat, xAI (HTTP and WebSocket) and Antigravity. Two gaps remain:
+
+- `codex_openai_images.go` still reports before `ApplyMediaPayloadConfig`.
+- No per-executor reasoning-effort regression tests exist. `07b5a7a1` only tests service tier, for Codex and openai-compat.
+
+Five of the Codex sites in the table above were never wrong. They read the body returned by `cacheHelper`, which `helps.FinalizePayload` had already finalized: `codex_executor_execute.go` (two sites), `codex_executor_stream.go`, and the first two sites in `codex_openai_images.go`. The fork's runtime is unchanged.

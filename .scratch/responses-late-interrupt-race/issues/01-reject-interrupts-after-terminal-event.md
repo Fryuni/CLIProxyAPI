@@ -27,3 +27,5 @@ Deactivate the local interrupt before the terminal event is written to the clien
 ## Comments
 
 Recorded during the upstream `911f49cb` sync. Until this is fixed upstream or here, a failure of this test in fork CI is a known upstream flake, not a sync regression.
+
+Upstream sync `8289ec4c` ([ADR-0026](../../../docs/adr/0026-sync-upstream-8289ec4c.md)): the forward loop and the local-interrupt logic are unchanged upstream. The test failed 15 of 300 runs on clean `8289ec4c` and 23 of 300 on the merged tree, under concurrent load from other test runs. The failures show both modes described above. The fork's runtime is unchanged.
