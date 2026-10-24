@@ -30,6 +30,10 @@ Automated review of the merged upstream diff found three defects in upstream cod
 
 `TestCodexClientModelsApplyPatchRouting` also fails, but only when its package runs more than once in one process (`-count` above 1). An earlier iteration's WebSocket test leaves a `gpt-5.4` registration behind. Fork CI runs each test once, so this is not recorded.
 
+## Upstream implementation notes
+
+Upstream `c4c1d43e`, `d5816d5e`, and `d69962e4`, merged by [ADR-0026](0026-sync-upstream-8289ec4c.md), implement the intended fix of the [auth-file lost-update ticket](../../.scratch/auth-file-patch-lost-update/issues/01-fence-watcher-auth-updates-against-management-writes.md). Watcher updates now carry a digest of the file bytes they parsed and are dropped when the file has changed since, and management PATCHes edit the auth under the manager's lock. `TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559` passed 1,000 of 1,000 runs on the merged tree, and that ticket is resolved. The late-interrupt ticket and the three review-finding tickets are unchanged upstream.
+
 ## Evidence
 
 Upstream [`35af74f9`](https://github.com/router-for-me/CLIProxyAPI/commit/35af74f9), [`b946d54e`](https://github.com/router-for-me/CLIProxyAPI/commit/b946d54e), [`a19a8ecd`](https://github.com/router-for-me/CLIProxyAPI/commit/a19a8ecd), and [`1631875b`](https://github.com/router-for-me/CLIProxyAPI/commit/1631875b). Each new regression case fails under a temporary mutation: reusing a stale execution sequence for the retry dispatch, or removing the bypass's quota exclusion. The late-interrupt test failed 6 of 300 runs on clean `911f49cb` and 2 of 300 on clean `0d18d3b3`. The `Issue6559` test failed 2 of 100 runs on clean `911f49cb`; instrumented runs on the merged tree showed both causes in the ticket. The keepalive tests and the executor they exercise are identical to upstream. Holding the client for 50 ms after the pong reproduced the CI error every time, or the panic in the session variant. With the repair, the same delay passed 60 of 60 runs, and normal runs passed 300 of 300.

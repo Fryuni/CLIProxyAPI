@@ -1,6 +1,6 @@
 # Keep watcher auth reloads from reverting newer management writes
 
-Status: needs-triage
+Status: resolved
 Type: task
 
 ## Context
@@ -27,3 +27,5 @@ The test passes 300 consecutive runs (`go test -count=300 -run '^TestPutOpenAICo
 Fork CI on PR #13 also saw a third failure mode, where both management requests returned 404. It is recorded separately in [the config-write ticket](../../config-write-atomicity/issues/01-write-config-atomically.md).
 
 Recorded during the upstream `911f49cb` sync. The test is unchanged as well: a test-only wait would still leave the runtime lost update. Until this is fixed upstream or here, a failure of this test in fork CI is a known upstream flake, not a sync regression.
+
+Upstream sync `8289ec4c` ([ADR-0026](../../../docs/adr/0026-sync-upstream-8289ec4c.md)): upstream implements the intended runtime fix. `c4c1d43e` ties each watcher-parsed auth to its file path and a digest of the bytes it read, and `updateInternalLocked` drops a file-derived update when the file on disk no longer matches (`sdk/cliproxy/auth/conductor_lifecycle.go`). `prepareCoreAuthForModelRegistration` also skips stale snapshots. `d5816d5e` re-reads a discarded snapshot, which covers the suspected skipped final event, and `d69962e4` moves `PatchAuthFileFields` to the lock-and-edit `Manager.Modify`. The fork keeps upstream's implementation. The test still asserts without waiting for asynchronous registration, but it passed 1,300 of 1,300 runs on clean `8289ec4c` and 1,000 of 1,000 on the merged tree. This ticket is resolved.
