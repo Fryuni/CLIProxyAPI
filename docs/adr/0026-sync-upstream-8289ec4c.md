@@ -36,6 +36,11 @@ Under ADR-0004's test policy, two upstream defects surfaced:
 
 `TestResponsesLateInterruptDoesNotPoisonNextCreate` still fails intermittently: 15 of 300 runs on clean `8289ec4c` and 23 of 300 on the merged tree, both under concurrent load. Its [ticket](../../.scratch/responses-late-interrupt-race/issues/01-reject-interrupts-after-terminal-event.md) is unchanged. A failure of that test in fork CI is a known upstream flake.
 
+Automated review of the merged upstream diff found two upstream changes that conflict with `AGENTS.md`. Each is recorded as a local ticket for the same reason, without patching upstream code:
+
+- Home latency telemetry (`e45f9426`) puts 3-second deadlines on commands over established connections ([ticket](../../.scratch/home-latency-deadlines/issues/01-drop-post-connection-latency-deadlines.md)).
+- The plugin-model fallback in `GetStaticModelDefinitions` (`50cfd238`) also changes the deprecated v0 route ([ticket](../../.scratch/v0-model-definitions-fallback/issues/01-keep-v0-model-definitions-unchanged.md)).
+
 `internal/runtime/executor/claude_thinking_replay_test.go` and `codex_stream_bootstrap_buffering_test.go` are not `gofmt`-clean upstream. They are left identical to upstream.
 
 ## Evidence
