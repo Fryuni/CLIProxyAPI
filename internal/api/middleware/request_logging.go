@@ -48,12 +48,6 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			return
 		}
 
-		// Let shutdown wait for this request's log. Hijacked websocket sessions are not ended
-		// by server shutdown, so waiting for them would only stall it.
-		if tracker, ok := logger.(interface{ TrackRequest() func() }); ok && !c.IsWebsocket() {
-			defer tracker.TrackRequest()()
-		}
-
 		loggerEnabled := logger.IsEnabled()
 		captureBody := shouldCaptureRequestBody(loggerEnabled, c.Request)
 

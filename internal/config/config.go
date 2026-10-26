@@ -71,10 +71,6 @@ type Config struct {
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
 
-	// RequestLogBucket is a gocloud.dev bucket URL (gs://, s3://, file://) that completed request logs
-	// are uploaded to. Uploaded logs are deleted locally. Empty keeps request logs on local disk.
-	RequestLogBucket string `yaml:"request-log-bucket" json:"request-log-bucket"`
-
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 

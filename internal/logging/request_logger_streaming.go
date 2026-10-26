@@ -2,7 +2,7 @@ package logging
 
 import (
 	"bytes"
-	"io"
+	"fmt"
 	"os"
 	"time"
 
@@ -75,9 +75,6 @@ type FileStreamingLogWriter struct {
 
 	// apiResponseTimestamp captures when the API response was received.
 	apiResponseTimestamp time.Time
-
-	// onComplete is called after the final log file is written.
-	onComplete func()
 }
 
 // WriteChunkAsync writes a response chunk asynchronously (non-blocking).
@@ -225,11 +222,21 @@ func (w *FileStreamingLogWriter) Close() error {
 		return nil
 	}
 
-	writeErr := writeLogFileAtomically(w.logsDir, w.logFilename, w.writeFinalLog)
-	w.cleanupTempFiles()
-	if writeErr == nil && w.onComplete != nil {
-		w.onComplete()
+	logFile, _, errOpen := createUniqueLogFile(w.logsDir, w.logFilename)
+	if errOpen != nil {
+		w.cleanupTempFiles()
+		return fmt.Errorf("failed to create log file: %w", errOpen)
 	}
+
+	writeErr := w.writeFinalLog(logFile)
+	if errClose := logFile.Close(); errClose != nil {
+		log.WithError(errClose).Warn("failed to close request log file")
+		if writeErr == nil {
+			writeErr = errClose
+		}
+	}
+
+	w.cleanupTempFiles()
 	return writeErr
 }
 
@@ -269,7 +276,7 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 	w.responseBodyFile = nil
 }
 
-func (w *FileStreamingLogWriter) writeFinalLog(logFile io.Writer) error {
+func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
 	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiWebsocketTimeline, nil, nil), true); errWrite != nil {
 		return errWrite
 	}
