@@ -452,9 +452,6 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.mgmt != nil {
 		s.mgmt.Close()
 	}
-	if closer, ok := s.requestLogger.(interface{ CloseRemoteBucket(context.Context) }); ok {
-		closer.CloseRemoteBucket(ctx)
-	}
 	if errCloseServer != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errCloseServer)
 	}

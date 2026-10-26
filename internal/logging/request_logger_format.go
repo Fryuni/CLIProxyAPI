@@ -85,7 +85,7 @@ func writeRequestInfoWithBody(
 	upstreamTransport string,
 	includeBody bool,
 ) error {
-	if _, errWrite := io.WriteString(w, requestLogHeader); errWrite != nil {
+	if _, errWrite := io.WriteString(w, "=== REQUEST INFO ===\n"); errWrite != nil {
 		return errWrite
 	}
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("Version: %s\n", buildinfo.Version)); errWrite != nil {

@@ -6,7 +6,6 @@ package logging
 import (
 	"fmt"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
@@ -145,18 +144,6 @@ type FileRequestLogger struct {
 	errorLogsMaxFiles int
 
 	homeEnabled bool
-
-	// remoteMu serializes bucket configuration changes, which can block on bucket I/O.
-	remoteMu sync.Mutex
-
-	// uploaderMu guards uploader and is held only briefly, so completing logs never wait on bucket I/O.
-	uploaderMu sync.Mutex
-
-	// uploader moves completed logs to a remote bucket when one is configured.
-	uploader *requestLogUploader
-
-	// active tracks logged requests so shutdown can wait for their logs.
-	active activeRequests
 }
 
 // NewFileRequestLogger creates a new file-based request logger.
