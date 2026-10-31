@@ -8,7 +8,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
@@ -60,40 +59,20 @@ func (c *Client) rebalanceCommand(ctx context.Context, address string, args ...a
 	}
 	options.ReadTimeout = -1
 	options.WriteTimeout = -1
-	// go-redis Close health-checks in-use connections and waits behind a blocked read,
-	// so cancellation closes the dialed sockets itself before closing the client.
-	var (
-		connsMu  sync.Mutex
-		conns    []net.Conn
-		canceled bool
-	)
-	dial := redis.NewDialer(options)
-	options.Dialer = func(dialCtx context.Context, network string, addr string) (net.Conn, error) {
-		conn, errDial := dial(dialCtx, network, addr)
+	baseDialer := redis.NewDialer(options)
+	options.Dialer = func(dialCtx context.Context, network, dialAddress string) (net.Conn, error) {
+		conn, errDial := baseDialer(dialCtx, network, dialAddress)
 		if errDial != nil {
 			return nil, errDial
 		}
-		connsMu.Lock()
-		defer connsMu.Unlock()
-		if canceled {
-			_ = conn.Close()
+		if ctx.Err() != nil {
+			_ = closeUnderlyingTransport(conn)
 			return nil, context.Cause(ctx)
 		}
-		conns = append(conns, conn)
-		return conn, nil
+		return newPluginSyncCancelableConn(ctx, conn), nil
 	}
 	command := redis.NewClient(options)
-	stopCancel := context.AfterFunc(ctx, func() {
-		connsMu.Lock()
-		canceled = true
-		open := conns
-		conns = nil
-		connsMu.Unlock()
-		for _, conn := range open {
-			_ = conn.Close()
-		}
-		_ = command.Close()
-	})
+	stopCancel := context.AfterFunc(ctx, func() { _ = command.Close() })
 	defer func() {
 		stopCancel()
 		if errClose := command.Close(); errClose != nil && ctx.Err() == nil {

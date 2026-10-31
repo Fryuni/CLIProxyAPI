@@ -26,3 +26,5 @@ Interrupt the RPC at the socket rather than through `Client.Close`. For example,
 Recorded during the upstream `8289ec4c` sync. Goroutine dumps taken 2 seconds after the heartbeat expired show the subscriber in `rebalanceCommand` → `Do` waiting on the socket read, and the cancellation goroutine in `ConnPool.Close` → `isHealthyConn` → `connCheck` waiting for the same socket's read lock. Both were unchanged 6 seconds later.
 
 Fixed in the fork as described above. With the fix, the acceptance run passes 20 of 20, and `go test -race ./internal/home/` passes. When upstream fixes #6946, take its implementation and drop the fork patch along with ADR-0027.
+
+Upstream sync `dbb70621` ([ADR-0029](../../../docs/adr/0029-sync-upstream-dbb70621.md)): upstream `0d3ca1d3` and `50147aec` fix this by closing the underlying transport on cancellation. The fork dropped its patch and takes upstream's implementation, and ADR-0027 is superseded. The acceptance run passes 20 of 20 on the merged tree.

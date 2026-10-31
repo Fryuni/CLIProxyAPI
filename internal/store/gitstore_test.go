@@ -1798,14 +1798,21 @@ func corruptGitRepository(t *testing.T, repoDir string) {
 	if errOpen != nil {
 		t.Fatalf("open repository before corruption: %v", errOpen)
 	}
-	errRepack := repo.RepackObjects(&git.RepackConfig{})
-	// Close the repacking handle before corrupting: it keeps the packfile open
-	// and caches objects, so it would not observe the removal.
-	if errClose := repo.Close(); errClose != nil {
-		t.Fatalf("close repository after repack: %v", errClose)
-	}
-	if errRepack != nil {
+	repoClosed := false
+	defer func() {
+		if !repoClosed {
+			if errClose := repo.Close(); errClose != nil {
+				t.Errorf("close repository before corruption: %v", errClose)
+			}
+		}
+	}()
+	if errRepack := repo.RepackObjects(&git.RepackConfig{}); errRepack != nil {
 		t.Fatalf("repack repository objects: %v", errRepack)
+	}
+	errClose := repo.Close()
+	repoClosed = true
+	if errClose != nil {
+		t.Fatalf("close repacked repository: %v", errClose)
 	}
 	objectsDir := filepath.Join(repoDir, ".git", "objects")
 	objectEntries, errReadDir := os.ReadDir(objectsDir)
@@ -1831,16 +1838,16 @@ func corruptGitRepository(t *testing.T, repoDir string) {
 			t.Fatalf("remove packfile %s: %v", filepath.Base(packfile), errRemove)
 		}
 	}
-	corrupted, errReopen := git.PlainOpen(repoDir)
-	if errReopen != nil {
-		t.Fatalf("reopen corrupted repository: %v", errReopen)
+	corruptedRepo, errOpenCorrupted := git.PlainOpen(repoDir)
+	if errOpenCorrupted != nil {
+		t.Fatalf("open corrupted repository: %v", errOpenCorrupted)
 	}
 	defer func() {
-		if errClose := corrupted.Close(); errClose != nil {
-			t.Errorf("close corrupted repository: %v", errClose)
+		if errCloseCorrupted := corruptedRepo.Close(); errCloseCorrupted != nil {
+			t.Errorf("close corrupted repository: %v", errCloseCorrupted)
 		}
 	}()
-	if errVerify := verifyRepositoryHead(corrupted); !isRepositoryCorruptionError(errVerify) {
+	if errVerify := verifyRepositoryHead(corruptedRepo); !isRepositoryCorruptionError(errVerify) {
 		t.Fatalf("verifyRepositoryHead error = %v, want repository corruption", errVerify)
 	}
 }

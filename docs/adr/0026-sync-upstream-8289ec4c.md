@@ -43,6 +43,10 @@ Automated review of the merged upstream diff found two upstream changes that con
 
 `internal/runtime/executor/claude_thinking_replay_test.go` and `codex_stream_bootstrap_buffering_test.go` are not `gofmt`-clean upstream. They are left identical to upstream.
 
+## Upstream implementation notes
+
+Upstream fixes both patches from this sync, and [ADR-0029](0029-sync-upstream-dbb70621.md) takes its code. `0d3ca1d3` and `50147aec` fix the Home rebalance RPC cancellation, which supersedes ADR-0027. Upstream's `corruptGitRepository` also closes the repacking handle and verifies through a fresh one.
+
 ## Evidence
 
 On clean `8289ec4c`, the gitstore tests pass at `633a294f^` and fail at `633a294f`. Disabling `isRepositoryCorruptionError` makes five gitstore tests fail with the repaired helper. On the merged tree, `go build ./...` and `go test ./...` pass. The fork's 33 retry, closed-network, and delegated-offset tests also pass under `-race`. `TestPutOpenAICompatConcurrentWithAuthFieldsPatch_Issue6559` passed 1,300 of 1,300 runs on clean upstream and 1,000 of 1,000 on the merged tree.
