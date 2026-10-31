@@ -27,6 +27,8 @@ Two upstream tests, `conductor_issue7017_review_r4_test.go` and `conductor_issue
 
 Upstream `ad8bdd3f` bounds the request-logging zstd decoder (see [ADR-0009](0009-bound-transcription-upload-and-decoder-memory.md)). Every other open ticket was checked against the upstream diff and is unchanged: the Home latency deadlines, the v0 model-definitions fallback, the Codex image reasoning-effort report, the late-interrupt race, and the HTTP 500 provenance gaps.
 
+Automated review of the merged upstream diff found one upstream defect. It is recorded as a local ticket without patching upstream code: the Antigravity stream assembler keeps the first chunk's root-level usage metadata and ignores later totals ([ticket](../../.scratch/antigravity-root-usage-metadata/issues/01-refresh-root-usage-per-chunk.md)).
+
 ## Evidence
 
 On the merged tree, `go build ./...`, `go vet ./...`, and `go test ./...` pass. `go test -race` passes for `sdk/cliproxy/auth`, `internal/home`, and `internal/store`. `TestClusterBalanceBlockedRPCDoesNotDelayHeartbeatExpiry` passes 20 of 20 runs with upstream's implementation.
