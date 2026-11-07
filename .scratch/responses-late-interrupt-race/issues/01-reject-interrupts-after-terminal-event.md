@@ -1,6 +1,6 @@
 # Reject interrupts that arrive after a turn's terminal event
 
-Status: needs-triage
+Status: resolved
 Type: task
 
 ## Context
@@ -29,3 +29,5 @@ Deactivate the local interrupt before the terminal event is written to the clien
 Recorded during the upstream `911f49cb` sync. Until this is fixed upstream or here, a failure of this test in fork CI is a known upstream flake, not a sync regression.
 
 Upstream sync `8289ec4c` ([ADR-0026](../../../docs/adr/0026-sync-upstream-8289ec4c.md)): the forward loop and the local-interrupt logic are unchanged upstream. The test failed 15 of 300 runs on clean `8289ec4c` and 23 of 300 on the merged tree, under concurrent load from other test runs. The failures show both modes described above. The fork's runtime is unchanged.
+
+Upstream sync `c5251b57` ([ADR-0030](../../../docs/adr/0030-sync-upstream-c5251b57.md)): upstream `9717e325` (#7065) implements the intended fix. The forward loop deactivates the local interrupt before writing a terminal event, the local path is gated by turn ownership, and the Codex WebSocket session rejects interrupts that do not target its running response. The commit was already part of the `dbb70621` sync, which missed it. The acceptance run passes 300 of 300 on the merged tree and on clean `c5251b57`.
