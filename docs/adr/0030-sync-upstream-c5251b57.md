@@ -26,10 +26,13 @@ Under ADR-0004's test policy, fork CI exposes two upstream tests with defects in
 
 `TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart` and `TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart` fail only when their package runs more than once in one process (`-count` above 1), on clean upstream as well. `service_snapshot_runtime_state_test.go` leaves an `acct.json` Codex registration in the global registry, which keeps `gpt-6-astra` listed. Fork CI runs each test once, so this is not recorded, as in ADR-0024.
 
-Automated review of the merged upstream diff found two issues in upstream code, and neither is patched in the fork:
+Automated review of the merged upstream diff found three defects in upstream code. Each is recorded as a local ticket without patching the runtime:
 
-- The xAI WebSocket send retry applies user payload rules a second time to the already-configured body, a regression from upstream `6e6afab9`. It is recorded as a local ticket ([ticket](../../.scratch/xai-websocket-retry-payload-rules/issues/01-apply-payload-rules-once-on-send-retry.md)).
-- `antigravity_reasoning_replay.go` still mutates serialized bytes with `ojson.SetBytes` instead of sharing one `*ojson.Doc`, as upstream's JSON convention in `AGENTS.md` asks. This is a convention gap with no behavior change, so it is declined, not recorded.
+- The xAI WebSocket send retry applies user payload rules a second time to the already-configured body, a regression from upstream `6e6afab9` ([ticket](../../.scratch/xai-websocket-retry-payload-rules/issues/01-apply-payload-rules-once-on-send-retry.md)).
+- A service that never configured the local KV store still closes the process-wide store when it shuts down ([ticket](../../.scratch/kvstore-shutdown-ownership/issues/01-shut-down-only-an-owned-kv-store.md)).
+- The Codex refresh journal's directory depends on whether the token store has a `baseDir`, so differently configured processes can refresh the same rotating token twice ([ticket](../../.scratch/codex-refresh-journal-location/issues/01-derive-one-journal-location-per-credential.md)).
+
+Review also flagged five upstream call sites that still mutate serialized bytes through `ojson.SetBytes` or a byte-based delete instead of sharing one `*ojson.Doc`, as upstream's JSON convention in `AGENTS.md` asks. These are convention gaps with no behavior change, so they are declined, not recorded.
 
 ## Evidence
 
