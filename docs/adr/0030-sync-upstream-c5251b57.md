@@ -26,6 +26,11 @@ Under ADR-0004's test policy, fork CI exposes two upstream tests with defects in
 
 `TestEndToEndAuthFileReplacement_RestoresModelsInV1ModelsWithoutRestart` and `TestEndToEndAuthFilePatch_RestoresModelsInV1ModelsWithoutRestart` fail only when their package runs more than once in one process (`-count` above 1), on clean upstream as well. `service_snapshot_runtime_state_test.go` leaves an `acct.json` Codex registration in the global registry, which keeps `gpt-6-astra` listed. Fork CI runs each test once, so this is not recorded, as in ADR-0024.
 
+Automated review of the merged upstream diff found two issues in upstream code, and neither is patched in the fork:
+
+- The xAI WebSocket send retry applies user payload rules a second time to the already-configured body, a regression from upstream `6e6afab9`. It is recorded as a local ticket ([ticket](../../.scratch/xai-websocket-retry-payload-rules/issues/01-apply-payload-rules-once-on-send-retry.md)).
+- `antigravity_reasoning_replay.go` still mutates serialized bytes with `ojson.SetBytes` instead of sharing one `*ojson.Doc`, as upstream's JSON convention in `AGENTS.md` asks. This is a convention gap with no behavior change, so it is declined, not recorded.
+
 ## Evidence
 
 On the merged tree, `go build ./...` and `go test ./...` pass. `go test -race` passes for `sdk/cliproxy/auth` and `internal/api/handlers/management`. The repaired WebSocket test passes 30 of 30 runs and the heartbeat test 60 of 60. `TestResponsesLateInterruptDoesNotPoisonNextCreate` passes 300 of 300. `go vet` reports one warning in upstream's `internal/pluginhost/host_test.go`, which is identical to upstream.
