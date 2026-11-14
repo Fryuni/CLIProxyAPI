@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -169,6 +170,19 @@ func TestPeerControl_PendingPongIsBoundedAndKeepsLatestPayload(t *testing.T) {
 	}
 }
 
+// waitTunnelWriterIdle waits until the peer's writer releases writeMu. The client
+// can read server_list before writeFrame unlocks, and a protocol error during a
+// busy write drops the socket without a Close frame.
+func waitTunnelWriterIdle(t *testing.T, p *peer) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !p.writeMu.TryLock(); runtime.Gosched() {
+		if time.Now().After(deadline) {
+			t.Fatal("server writer did not become idle")
+		}
+	}
+	p.writeMu.Unlock()
+}
+
 func TestPeerControl_UnknownWebSocketOpcodeIsFatalProtocolError(t *testing.T) {
 	for _, opcode := range []byte{0x3, 0x7, 0xb, 0xf} {
 		t.Run(fmt.Sprintf("opcode=%x", opcode), func(t *testing.T) {
@@ -180,6 +194,7 @@ func TestPeerControl_UnknownWebSocketOpcodeIsFatalProtocolError(t *testing.T) {
 			p := lookupTunnelPeer(t, hub, "key", "device")
 			transport := p.conn.UnderlyingConn().(*deadlineGuardConn).Conn.(*deadlineTrackingTunnelConn)
 			transport.monitoring.Store(true)
+			waitTunnelWriterIdle(t, p)
 			// Send a final, masked, empty frame using a reserved data/control opcode.
 			raw := []byte{0x80 | opcode, 0x80, 0, 0, 0, 0}
 			if n, errWrite := client.UnderlyingConn().Write(raw); errWrite != nil {

@@ -42,7 +42,23 @@ func dialRoleWithType(t *testing.T, serverURL, apiKey string, role Role, uuid, n
 		t.Fatalf("dialRole(%s, %s) error = %v", role, uuid, errDial)
 	}
 	registerCleanupConn(t, conn)
+	if role == RoleServer {
+		syncTunnelServer(t, conn)
+	}
 	return conn
+}
+
+// syncTunnelServer waits until a dialed server is committed. Peers are committed
+// after the upgrade response, and the hub reads a peer's frames only after
+// commit, so this reply proves the server is discoverable.
+func syncTunnelServer(t *testing.T, conn *websocket.Conn) {
+	t.Helper()
+	if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"list_servers","request_id":"dial-sync"}`)); errWrite != nil {
+		t.Fatalf("server sync write error = %v", errWrite)
+	}
+	if reply := readTextJSONFrame(t, conn); reply.Get("request_id").String() != "dial-sync" {
+		t.Fatalf("server sync reply = %s", reply.Raw)
+	}
 }
 
 func readBinaryDataFrame(t *testing.T, conn *websocket.Conn) DataFrameView {

@@ -169,7 +169,8 @@ func TestPeerControl_ProtocolErrorReclaimsSaturatedTransport(t *testing.T) {
 			transport := p.conn.UnderlyingConn().(*deadlineGuardConn).Conn.(*deadlineTrackingTunnelConn)
 			transport.monitoring.Store(true)
 			gated := transport.Conn.(*gatedTunnelConn)
-			// Servers receive no initial frames, so the protocol-error close is the next write.
+			// Once the dial-sync reply's write finishes, the protocol-error close is the next write.
+			waitTunnelWriterIdle(t, p)
 			gated.arm()
 			if n, errWrite := stalled.UnderlyingConn().Write(tc.raw); errWrite != nil || n != len(tc.raw) {
 				t.Fatalf("write malformed frame: bytes=%d, error=%v", n, errWrite)
@@ -232,6 +233,7 @@ func TestPeerControl_MalformedCloseNeverSetsFiniteDeadlines(t *testing.T) {
 			p := lookupTunnelPeer(t, hub, "key", "device")
 			transport := p.conn.UnderlyingConn().(*deadlineGuardConn).Conn.(*deadlineTrackingTunnelConn)
 			transport.monitoring.Store(true)
+			waitTunnelWriterIdle(t, p)
 			// A zero mask preserves the malformed payload without mutating any slices.
 			raw := append([]byte{0x88, 0x80 | byte(len(tc.payload)), 0, 0, 0, 0}, tc.payload...)
 			if n, errWrite := client.UnderlyingConn().Write(raw); errWrite != nil || n != len(raw) {

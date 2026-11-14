@@ -223,7 +223,16 @@ func TestPeerClose_ActiveWriteAndQueuedFramesReceivePolicyClose(t *testing.T) {
 				hub.UpdateAllowedAPIKeys(nil)
 			} else {
 				// A topology event cannot fit behind the active and queued frames.
-				_ = dialRole(t, srv.URL, "key", RoleServer, "server", "Server")
+				// Dial without syncTunnelServer: its reply would count in the tenant's queued bytes.
+				server, resp, errDial := websocket.DefaultDialer.Dial(
+					dialTunnelURL(srv.URL, url.Values{"role": {string(RoleServer)}, "uuid": {"server"}, "name": {"Server"}, "type": {"test-server"}}),
+					http.Header{"Authorization": {"Bearer key"}},
+				)
+				closeHTTPResponseBody(t, resp)
+				if errDial != nil {
+					t.Fatal(errDial)
+				}
+				registerCleanupConn(t, server)
 			}
 			waitTunnelSignal(t, p.closed, "policy close request")
 			close(transport.gate)
@@ -434,15 +443,9 @@ func TestHubLimits_BinaryPayloadAndTransportBoundaries(t *testing.T) {
 	srv := httptest.NewServer(hub)
 	t.Cleanup(srv.Close)
 	t.Cleanup(hub.Close)
-	// Peers are committed after the upgrade response, so a server dialed first can
-	// still come online after the client. Commit the client, then wait for the
-	// server's server_online so no discovery frame is left to interleave below.
+	server := dialRole(t, srv.URL, "key", RoleServer, "s", "Server")
 	client := dialRole(t, srv.URL, "key", RoleClient, "c", "Client")
 	_ = readTextJSONFrame(t, client)
-	server := dialRole(t, srv.URL, "key", RoleServer, "s", "Server")
-	if online := readTextJSONFrame(t, client); online.Get("type").String() != ControlTypeServerOnline {
-		t.Fatalf("server online = %s", online.Raw)
-	}
 	for _, size := range []int{MaxRawPayloadBytes, MaxRawPayloadBytes + 1, MaxInboundFrameBytes - 6, MaxInboundFrameBytes - 5} {
 		raw := append([]byte{ProtocolVersion1, PayloadTypeBinary, 1, 1, 'c', 's'}, make([]byte, size)...)
 		written := make(chan error, 1)

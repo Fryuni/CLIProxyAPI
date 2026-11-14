@@ -190,6 +190,7 @@ func TestHubAuth_MethodAndCredentials(t *testing.T) {
 			t.Fatalf("Dial with X-Tunnel-* headers error = %v", errDial)
 		}
 		registerCleanupConn(t, conn)
+		syncTunnelServer(t, conn)
 
 		overrideConn, overResp, errOver := websocket.DefaultDialer.Dial(
 			dialTunnelURL(srv.URL, url.Values{"role": {"server"}, "uuid": {"hdr-srv-2"}, "name": {"Override Server"}, "type": {"Query-Type"}}),
@@ -200,6 +201,7 @@ func TestHubAuth_MethodAndCredentials(t *testing.T) {
 			t.Fatalf("Dial with query type override error = %v", errOver)
 		}
 		registerCleanupConn(t, overrideConn)
+		syncTunnelServer(t, overrideConn)
 
 		// Client role ignores type (both omitted and blank/arbitrary values allowed).
 		cliCheck, cliResp, errCli := websocket.DefaultDialer.Dial(
