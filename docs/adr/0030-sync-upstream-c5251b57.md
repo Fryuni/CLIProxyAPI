@@ -34,6 +34,10 @@ Automated review of the merged upstream diff found three defects in upstream cod
 
 Review also flagged five upstream call sites that still mutate serialized bytes through `ojson.SetBytes` or a byte-based delete instead of sharing one `*ojson.Doc`, as upstream's JSON convention in `AGENTS.md` asks. These are convention gaps with no behavior change, so they are declined, not recorded.
 
+## Upstream implementation notes
+
+Upstream `8e8e8231`, merged by [ADR-0031](0031-sync-upstream-1aaf56bc.md), repairs `TestServerResponsesWebsocketReauthorizesEachTurn` the same way: the test waits for its hijacked handlers after closing the server. The fork takes upstream's test. The heartbeat test repair remains fork-only.
+
 ## Evidence
 
 On the merged tree, `go build ./...` and `go test ./...` pass. `go test -race` passes for `sdk/cliproxy/auth` and `internal/api/handlers/management`. The repaired WebSocket test passes 30 of 30 runs and the heartbeat test 60 of 60. `TestResponsesLateInterruptDoesNotPoisonNextCreate` passes 300 of 300. `go vet` reports one warning in upstream's `internal/pluginhost/host_test.go`, which is identical to upstream.

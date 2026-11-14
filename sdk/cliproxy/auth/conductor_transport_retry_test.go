@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -897,6 +898,125 @@ func TestHTTP500RetryPreservesLongerConcurrent503Cooldown(t *testing.T) {
 	updated, ok := manager.GetByID(authID)
 	if !ok || updated == nil || updated.ModelStates[model] == nil || !updated.ModelStates[model].NextRetryAfter.Equal(concurrentDeadline) {
 		t.Fatalf("concurrent deadline changed: %#v", updated)
+	}
+}
+
+func TestHTTP500RetryPreservesConcurrentForceCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	for _, scope := range []string{"model", "auth"} {
+		t.Run(scope, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.RegisterExecutor(&transportThenSuccessExecutor{identifier: "codex"})
+			model := "gpt-6-astra-" + uuid.NewString()
+			authID := "concurrent-force-" + scope + "-" + uuid.NewString()
+			registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			resultModel := model
+			if scope == "auth" {
+				resultModel = ""
+			}
+
+			longRetryAfter := 30 * time.Minute
+			manager.MarkResult(context.Background(), Result{
+				AuthID:     authID,
+				Provider:   "codex",
+				Model:      resultModel,
+				Success:    false,
+				Error:      &Error{Code: ErrorCodeForceCooldown, HTTPStatus: http.StatusServiceUnavailable, Message: "policy requires cooldown"},
+				RetryAfter: &longRetryAfter,
+			})
+
+			attempted := map[string]requestRetryAttempt{authID: {}}
+			trackedCtx := withAttemptedAuthResultTracker(context.Background(), attempted)
+			manager.MarkResult(trackedCtx, Result{
+				AuthID:   authID,
+				Provider: "codex",
+				Model:    resultModel,
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "ordinary upstream failure"},
+			})
+
+			selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
+			selected, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, model, cliproxyexecutor.Options{}, nil)
+			if errPick == nil || selected != nil {
+				t.Fatalf("pickNextMixed() = (%#v, %v), want concurrent force cooldown preserved", selected, errPick)
+			}
+		})
+	}
+}
+
+func TestHTTP500RetryRoundBypassMatchesResolvedModelSpelling(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&transportThenSuccessExecutor{identifier: "codex"})
+	model := "gpt-6-astra-" + uuid.NewString()
+	requestModel := strings.ToUpper(model)
+	authID := "model-spelling-http-500-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	attempted := map[string]requestRetryAttempt{authID: {}}
+	trackedCtx := withAttemptedAuthResultTracker(context.Background(), attempted)
+	manager.MarkResult(trackedCtx, Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    requestModel,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "ordinary upstream failure"},
+	})
+	if stored, ok := manager.GetByID(authID); !ok || stored.ModelStates[model] == nil || !stored.ModelStates[model].Unavailable {
+		t.Fatalf("cooldown not stored under the registered spelling: %#v", stored)
+	}
+
+	selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
+	selected, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, requestModel, cliproxyexecutor.Options{}, nil)
+	if errPick != nil || selected == nil || selected.ID != authID {
+		t.Fatalf("pickNextMixed() = (%v, %v), want this request's HTTP 500 bypassed", selected, errPick)
+	}
+}
+
+func TestHTTP500RetryRoundBypassKeepsWeightedPinInAccounting(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	manager := NewManager(nil, &WeightedRoundRobinSelector{}, nil)
+	manager.RegisterExecutor(&transportThenSuccessExecutor{identifier: "codex"})
+	model := "gpt-6-astra-" + uuid.NewString()
+	authID := "weighted-pin-http-500-" + uuid.NewString()
+	registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	attempted := map[string]requestRetryAttempt{authID: {}}
+	trackedCtx := withAttemptedAuthResultTracker(context.Background(), attempted)
+	manager.MarkResult(trackedCtx, Result{
+		AuthID:   authID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "ordinary upstream failure"},
+	})
+
+	selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: authID}}
+	selected, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, model, opts, nil)
+	if errPick != nil || selected == nil || selected.ID != authID {
+		t.Fatalf("pickNextMixed() = (%v, %v), want pinned HTTP 500 retry selected", selected, errPick)
 	}
 }
 

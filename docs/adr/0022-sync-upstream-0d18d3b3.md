@@ -25,6 +25,8 @@ Upstream `a19a8ecd`, merged by [ADR-0024](0024-sync-upstream-911f49cb.md), moves
 
 Upstream `07b5a7a1`, merged by [ADR-0026](0026-sync-upstream-8289ec4c.md), moves the reasoning-effort report after the payload rules for most executor families. That partly resolves the [reasoning-effort ticket](../../.scratch/usage-reasoning-effort-ordering/issues/01-record-effort-from-final-payload.md); the Codex image path and per-executor regression tests remain, as the ticket records. The keepalive and prompt-cache tickets are unchanged upstream.
 
+Upstream `23e31fe2`, merged by [ADR-0031](0031-sync-upstream-1aaf56bc.md), makes `TestResponsesInterruptStopsHTTPUpstream` wait on a channel closed when the executor sees cancellation, the same repair as the fork's. The fork takes upstream's test, so the interrupt repair is no longer fork-only.
+
 ## Evidence
 
 Upstream [`6920ed5d`](https://github.com/router-for-me/CLIProxyAPI/commit/6920ed5d), [`8a01bc02`](https://github.com/router-for-me/CLIProxyAPI/commit/8a01bc02), [`56eee6a4`](https://github.com/router-for-me/CLIProxyAPI/commit/56eee6a4), [`7a687f42`](https://github.com/router-for-me/CLIProxyAPI/commit/7a687f42), [`f62d4d28`](https://github.com/router-for-me/CLIProxyAPI/commit/f62d4d28), [`6331b38b`](https://github.com/router-for-me/CLIProxyAPI/commit/6331b38b), [`1672be5d`](https://github.com/router-for-me/CLIProxyAPI/commit/1672be5d), and [`dd7b4334`](https://github.com/router-for-me/CLIProxyAPI/commit/dd7b4334). On a clean `0d18d3b3` checkout, the two catalog tests failed on every run, and the interrupt and `Issue6559` tests each failed in roughly a third or more of 40 runs. The WebSocket retry-bind test failed only under CPU contention, in dozens of 3,600 runs, and in none of 7,200 after the repair.
