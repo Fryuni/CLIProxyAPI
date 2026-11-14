@@ -24,6 +24,8 @@ The merge also breaks one fork guarantee without a textual conflict. Upstream's 
 
 Every open ticket was checked against the upstream diff and is unchanged.
 
+Under ADR-0004's test policy, fork CI exposes one new upstream test with a defect inside the test itself. `TestHubLimits_BinaryPayloadAndTransportBoundaries` dials the tunnel server before the client and assumes the client's first frame lists it. The hub commits a peer only after its upgrade response, so the client can be committed first and receive a late `server_online` where the test expects a protocol error. That ordering is valid discovery behavior. The test now commits the client first and waits for the server's `server_online`, and its assertions are unchanged.
+
 ## Evidence
 
-On the merged tree, `go build ./...` and `go test ./...` pass. `TestHTTP500RetryPreservesConcurrentForceCooldown` passes on pre-merge fork main, fails on the merged tree without the force-deadline guard, and passes with it.
+On the merged tree, `go build ./...` and `go test ./...` pass. `TestHTTP500RetryPreservesConcurrentForceCooldown` passes on pre-merge fork main, fails on the merged tree without the force-deadline guard, and passes with it. The tunnel test failed 7 of 300 runs on clean upstream under CPU contention and none of 300 without it; after the repair it passes 600 of 600 under contention.

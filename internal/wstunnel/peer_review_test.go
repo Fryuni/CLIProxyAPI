@@ -434,9 +434,15 @@ func TestHubLimits_BinaryPayloadAndTransportBoundaries(t *testing.T) {
 	srv := httptest.NewServer(hub)
 	t.Cleanup(srv.Close)
 	t.Cleanup(hub.Close)
-	server := dialRole(t, srv.URL, "key", RoleServer, "s", "Server")
+	// Peers are committed after the upgrade response, so a server dialed first can
+	// still come online after the client. Commit the client, then wait for the
+	// server's server_online so no discovery frame is left to interleave below.
 	client := dialRole(t, srv.URL, "key", RoleClient, "c", "Client")
 	_ = readTextJSONFrame(t, client)
+	server := dialRole(t, srv.URL, "key", RoleServer, "s", "Server")
+	if online := readTextJSONFrame(t, client); online.Get("type").String() != ControlTypeServerOnline {
+		t.Fatalf("server online = %s", online.Raw)
+	}
 	for _, size := range []int{MaxRawPayloadBytes, MaxRawPayloadBytes + 1, MaxInboundFrameBytes - 6, MaxInboundFrameBytes - 5} {
 		raw := append([]byte{ProtocolVersion1, PayloadTypeBinary, 1, 1, 'c', 's'}, make([]byte, size)...)
 		written := make(chan error, 1)
