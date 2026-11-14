@@ -900,6 +900,56 @@ func TestHTTP500RetryPreservesLongerConcurrent503Cooldown(t *testing.T) {
 	}
 }
 
+func TestHTTP500RetryPreservesConcurrentForceCooldown(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	for _, scope := range []string{"model", "auth"} {
+		t.Run(scope, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.RegisterExecutor(&transportThenSuccessExecutor{identifier: "codex"})
+			model := "gpt-6-astra-" + uuid.NewString()
+			authID := "concurrent-force-" + scope + "-" + uuid.NewString()
+			registry.GetGlobalRegistry().RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+			if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+				t.Fatalf("register auth: %v", errRegister)
+			}
+			resultModel := model
+			if scope == "auth" {
+				resultModel = ""
+			}
+
+			longRetryAfter := 30 * time.Minute
+			manager.MarkResult(context.Background(), Result{
+				AuthID:     authID,
+				Provider:   "codex",
+				Model:      resultModel,
+				Success:    false,
+				Error:      &Error{Code: ErrorCodeForceCooldown, HTTPStatus: http.StatusServiceUnavailable, Message: "policy requires cooldown"},
+				RetryAfter: &longRetryAfter,
+			})
+
+			attempted := map[string]requestRetryAttempt{authID: {}}
+			trackedCtx := withAttemptedAuthResultTracker(context.Background(), attempted)
+			manager.MarkResult(trackedCtx, Result{
+				AuthID:   authID,
+				Provider: "codex",
+				Model:    resultModel,
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusInternalServerError, Message: "ordinary upstream failure"},
+			})
+
+			selectionCtx := withRequestRetryRoundSelection(withRequestRetryAttemptedAuths(context.Background(), attempted), 1)
+			selected, _, _, errPick := manager.pickNextMixed(selectionCtx, []string{"codex"}, model, cliproxyexecutor.Options{}, nil)
+			if errPick == nil || selected != nil {
+				t.Fatalf("pickNextMixed() = (%#v, %v), want concurrent force cooldown preserved", selected, errPick)
+			}
+		})
+	}
+}
+
 func TestExecuteHTTP500RetryExhaustionReturns500AndAppliesCooldown(t *testing.T) {
 	previous := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)

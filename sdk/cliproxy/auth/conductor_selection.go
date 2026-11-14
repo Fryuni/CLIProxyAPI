@@ -1756,7 +1756,8 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt
 			if state == nil || state.Quota.Exceeded || !attempt.allowsHTTP500Bypass(stateModel) {
 				continue
 			}
-			if state.LastError != nil && state.LastError.Code == ErrorCodeForceCooldown {
+			// A force deadline can outlive a later HTTP 500 that overwrote LastError.
+			if (state.LastError != nil && state.LastError.Code == ErrorCodeForceCooldown) || state.forceCooldownUntil.After(now) {
 				continue
 			}
 			status := statusCodeFromResult(state.LastError)
@@ -1773,7 +1774,7 @@ func http500RetryRoundCandidate(auth *Auth, model string, now time.Time, attempt
 	}
 	if (len(clone.ModelStates) == 0 || len(attempt.modelErrors) == 0) &&
 		attempt.allowsHTTP500Bypass(model) && !clone.Quota.Exceeded &&
-		(clone.LastError == nil || clone.LastError.Code != ErrorCodeForceCooldown) &&
+		(clone.LastError == nil || clone.LastError.Code != ErrorCodeForceCooldown) && !clone.forceCooldownUntil.After(now) &&
 		statusCodeFromResult(clone.LastError) >= http.StatusInternalServerError &&
 		statusCodeFromResult(clone.LastError) <= 599 {
 		clone.Unavailable = false
