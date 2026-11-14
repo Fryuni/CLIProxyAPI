@@ -2105,7 +2105,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	releaseMutation()
 	if authSnapshot != nil {
-		recordAttemptedAuthResult(ctx, result, authSnapshot.Generation, authSnapshot.RegistrationEpoch, resultCooldownApplied)
+		// Track the attempt under the model key its cooldown was stored under.
+		attemptResult := result
+		attemptResult.Model = modelKey
+		recordAttemptedAuthResult(ctx, attemptResult, authSnapshot.Generation, authSnapshot.RegistrationEpoch, resultCooldownApplied)
 	}
 	if m.scheduler != nil && authSnapshot != nil {
 		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh

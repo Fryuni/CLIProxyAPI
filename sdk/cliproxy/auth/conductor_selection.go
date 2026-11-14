@@ -2962,9 +2962,18 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		_, used := tried[candidate.ID]
+		selectionCandidate := candidate
+		if attemptInfo, okAttempt := requestRetryAttemptForAuth(ctx, candidate.ID); !used && retryRound > 0 && okAttempt {
+			checkModel := model
+			if strings.TrimSpace(model) != "" {
+				checkModel = m.selectionModelForAuth(candidate, model)
+			}
+			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now, attemptInfo)
+		}
 		// Pinning restricts selection, not the eligible pool used for accounting.
+		// Accounting sees the same retry-round clones as selection.
 		if trackPinnedAccounting && !used {
-			accountingCandidates = append(accountingCandidates, candidate)
+			accountingCandidates = append(accountingCandidates, selectionCandidate)
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
@@ -2974,14 +2983,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 		if used {
 			continue
-		}
-		selectionCandidate := candidate
-		if attemptInfo, okAttempt := requestRetryAttemptForAuth(ctx, candidate.ID); retryRound > 0 && okAttempt {
-			checkModel := model
-			if strings.TrimSpace(model) != "" {
-				checkModel = m.selectionModelForAuth(candidate, model)
-			}
-			selectionCandidate = http500RetryRoundCandidate(candidate, checkModel, now, attemptInfo)
 		}
 		candidates = append(candidates, selectionCandidate)
 	}
