@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -479,6 +480,23 @@ func TestHubExchange_SecurityGuardsAndBackpressureIsolation(t *testing.T) {
 	case <-gotBufferFull:
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for target_buffer_full from slow server")
+	}
+
+	// A list_servers reply that cannot be queued closes the client, so the barrier
+	// must wait until the hub has processed the flood and drained cli1's queue.
+	// The hub reads cli1 in order, so srvFast receiving this marker proves the former.
+	markerPkt, _ := EncodeDataFrame(PayloadTypeText, "cli-1", "srv-fast", []byte("flood-processed"))
+	if errWrite := cli1.WriteMessage(websocket.BinaryMessage, markerPkt); errWrite != nil {
+		t.Fatalf("WriteMessage(marker) error = %v", errWrite)
+	}
+	if got := readBinaryDataFrame(t, srvFast); string(got.Payload) != "flood-processed" {
+		t.Fatalf("srvFast marker = %q, want flood-processed", string(got.Payload))
+	}
+	cli1Peer := lookupTunnelPeer(t, hub, "key-sec", "cli-1")
+	for deadline := time.Now().Add(5 * time.Second); len(cli1Peer.sendCh) > 0; runtime.Gosched() {
+		if time.Now().After(deadline) {
+			t.Fatal("cli1 send queue did not drain")
+		}
 	}
 
 	// Barrier sync via list_servers to deterministically drain all in-flight error frames on cli1.
