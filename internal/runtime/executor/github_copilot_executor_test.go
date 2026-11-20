@@ -8,12 +8,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
@@ -201,5 +203,36 @@ func TestGitHubCopilotCredentialHeaderOverridesWinRegardlessOfCase(t *testing.T)
 		if got := request.headers.Get("X-Initiator"); got != copilot.InitiatorAgent {
 			t.Fatalf("X-Initiator = %q, want credential override %q", got, copilot.InitiatorAgent)
 		}
+	}
+}
+
+func TestGitHubCopilotMessagesRouteAttributesUsageToCopilot(t *testing.T) {
+	copilot.RememberModels([]copilot.Model{{ID: "copilot-test-messages-usage", Endpoints: []string{copilot.EndpointMessages}}})
+	server, captured := newCopilotTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"copilot-test-messages-usage","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}`)
+	})
+	pluginName := "test-github-copilot-messages-usage"
+	plugin := &captureAnyProviderUsagePlugin{records: make(chan usage.Record, 4)}
+	usage.RegisterNamedPlugin(pluginName, plugin)
+	t.Cleanup(func() { usage.RegisterNamedPlugin(pluginName, noopClaudeUsagePlugin{}) })
+
+	exec := NewGitHubCopilotExecutor(&config.Config{})
+	payload := []byte(`{"model":"copilot-test-messages-usage","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+	if _, err := exec.Execute(context.Background(), copilotTestAuth(server.URL), cliproxyexecutor.Request{Model: "copilot-test-messages-usage", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+	}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if requests := captured(); len(requests) != 1 || requests[0].path != copilot.EndpointMessages {
+		t.Fatalf("upstream requests = %+v, want one POST /v1/messages", requests)
+	}
+	select {
+	case record := <-plugin.records:
+		if record.Provider != copilot.Provider {
+			t.Fatalf("usage provider = %q, want %q", record.Provider, copilot.Provider)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no usage record published")
 	}
 }

@@ -34,6 +34,7 @@ func NewGitHubCopilotExecutor(cfg *config.Config) *GitHubCopilotExecutor {
 		ClaudeExecutor: ClaudeExecutor{
 			cfg:                cfg,
 			requestLogProvider: copilot.Provider,
+			usageProvider:      copilot.Provider,
 			oauthToolAliases:   &claudeOAuthToolAliasStore{},
 			threadBetas:        &helps.ClaudeThreadBetaStore{},
 		},
