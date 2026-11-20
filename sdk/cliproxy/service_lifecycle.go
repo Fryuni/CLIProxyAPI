@@ -237,6 +237,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if !homeEnabled {
 		go s.runAntigravityModelRefresh(ctx)
 	}
+	go s.runGitHubCopilotCatalogRefresh(ctx)
 
 	select {
 	case <-ctx.Done():

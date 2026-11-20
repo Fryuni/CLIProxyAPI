@@ -151,6 +151,8 @@ type Service struct {
 	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
 	antigravityPersistPending map[string]*antigravityHintPersistRequest
 	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+	// copilotCatalogs caches each GitHub Copilot credential's model catalog.
+	copilotCatalogs copilotCatalogs
 }
 
 // SetResultPolicy sets an execution result policy on the underlying core auth manager.

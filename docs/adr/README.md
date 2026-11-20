@@ -43,6 +43,7 @@ The retry branch's final tree `5ac127ac` exactly equals its main squash `0c7dd79
 - [ADR-0029: Sync upstream dbb70621 while keeping the fork delta](0029-sync-upstream-dbb70621.md)
 - [ADR-0030: Sync upstream c5251b57 while keeping the fork delta](0030-sync-upstream-c5251b57.md)
 - [ADR-0031: Sync upstream 1aaf56bc while keeping the fork delta](0031-sync-upstream-1aaf56bc.md)
+- [ADR-0032: Serve GitHub Copilot subscriptions as a native provider](0032-serve-github-copilot-subscriptions-natively.md)
 
 The runtime tree at the pinned fork main differs from its last shared upstream baseline only in CI, the retry/auth-selection changes and their tests, and the historical future-work document. The local tracker and ADR files are documentation additions made after that tree.
 
