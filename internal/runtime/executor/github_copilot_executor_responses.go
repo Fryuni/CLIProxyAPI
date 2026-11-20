@@ -334,6 +334,16 @@ func (e *GitHubCopilotExecutor) executeResponsesStream(ctx context.Context, auth
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			send(cliproxyexecutor.StreamChunk{Err: errScan})
+			return
+		}
+		if !terminalDelivered {
+			// A clean EOF without a terminal event is a truncated response, not a success.
+			streamErr := statusErr{code: http.StatusBadGateway, msg: "github-copilot stream closed before response.completed or response.incomplete", streamTruncated: true}
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			if !streamUsage.PublishFailure(ctx, reporter, streamErr) {
+				reporter.PublishFailure(ctx, streamErr)
+			}
+			send(cliproxyexecutor.StreamChunk{Err: streamErr})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil

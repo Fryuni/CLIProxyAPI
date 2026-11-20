@@ -153,3 +153,53 @@ func TestGitHubCopilotRequestToFormatFollowsModelEndpoints(t *testing.T) {
 		}
 	}
 }
+
+func TestGitHubCopilotResponsesStreamWithoutTerminalEventFails(t *testing.T) {
+	copilot.RememberModels([]copilot.Model{{ID: "copilot-test-truncated", Endpoints: []string{copilot.EndpointResponses}}})
+	server, _ := newCopilotTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"po\"}\n\n")
+	})
+	exec := NewGitHubCopilotExecutor(&config.Config{})
+	payload := []byte(`{"model":"copilot-test-truncated","input":"ping","stream":true}`)
+	result, err := exec.ExecuteStream(context.Background(), copilotTestAuth(server.URL), cliproxyexecutor.Request{Model: "copilot-test-truncated", Payload: payload}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("stream closed before a terminal event reported success")
+	}
+}
+
+func TestGitHubCopilotCredentialHeaderOverridesWinRegardlessOfCase(t *testing.T) {
+	server, captured := newCopilotTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	})
+	auth := copilotTestAuth(server.URL)
+	auth.Attributes = map[string]string{"header:x-initiator": "agent"}
+	exec := NewGitHubCopilotExecutor(&config.Config{})
+	payload := []byte(`{"model":"copilot-test-chat","messages":[{"role":"user","content":"hi"}]}`)
+	// Map iteration order varies, so repeat to expose a duplicate attribute.
+	for range 20 {
+		if _, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{Model: "copilot-test-chat", Payload: payload}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FormatOpenAI,
+		}); err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+	}
+	for _, request := range captured() {
+		if got := request.headers.Get("X-Initiator"); got != copilot.InitiatorAgent {
+			t.Fatalf("X-Initiator = %q, want credential override %q", got, copilot.InitiatorAgent)
+		}
+	}
+}

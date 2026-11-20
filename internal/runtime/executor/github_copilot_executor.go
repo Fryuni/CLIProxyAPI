@@ -210,14 +210,19 @@ func copilotRequestAuth(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, o
 
 	view := *auth
 	view.Attributes = make(map[string]string, len(auth.Attributes)+5)
+	configured := make(map[string]struct{}, len(auth.Attributes))
 	for key, value := range auth.Attributes {
 		view.Attributes[key] = value
+		if name, ok := strings.CutPrefix(key, "header:"); ok && strings.TrimSpace(value) != "" {
+			configured[http.CanonicalHeaderKey(strings.TrimSpace(name))] = struct{}{}
+		}
 	}
 	view.Attributes["base_url"] = baseURL
+	// Credential-defined headers win regardless of spelling; a second attribute
+	// for the same header would apply in map order.
 	setDefault := func(name, value string) {
-		key := "header:" + name
-		if strings.TrimSpace(view.Attributes[key]) == "" {
-			view.Attributes[key] = value
+		if _, ok := configured[http.CanonicalHeaderKey(name)]; !ok {
+			view.Attributes["header:"+name] = value
 		}
 	}
 	setDefault("Copilot-Integration-Id", copilot.IntegrationID)
