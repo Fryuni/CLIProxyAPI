@@ -37,6 +37,9 @@ type ClaudeExecutor struct {
 	// constructors allocate it so copies made per request reuse one store.
 	oauthToolAliases *claudeOAuthToolAliasStore
 	threadBetas      *helps.ClaudeThreadBetaStore
+	// usageProvider attributes usage records to a delegating provider; empty
+	// keeps the executor's own identifier.
+	usageProvider string
 }
 
 type claudeOAuthCancellationError struct {
@@ -575,6 +578,13 @@ func (e *ClaudeExecutor) upstreamRequestLogProvider() string {
 		return provider
 	}
 	return e.Identifier()
+}
+
+func (e *ClaudeExecutor) newUsageReporter(ctx context.Context, model string, auth *cliproxyauth.Auth) *helps.UsageReporter {
+	if provider := strings.TrimSpace(e.usageProvider); provider != "" {
+		return helps.NewExecutorUsageReporterAs(ctx, e, provider, model, auth)
+	}
+	return helps.NewExecutorUsageReporter(ctx, e, model, auth)
 }
 
 func (e *ClaudeExecutor) upstreamModel(baseModel string) string {

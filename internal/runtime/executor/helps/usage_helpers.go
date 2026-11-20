@@ -87,6 +87,13 @@ func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model
 	if executor != nil {
 		provider = executor.Identifier()
 	}
+	return NewExecutorUsageReporterAs(ctx, executor, provider, model, auth)
+}
+
+// NewExecutorUsageReporterAs attributes usage to provider while keeping the
+// executor's token-accounting semantics, for executors that delegate a
+// protocol to another executor on behalf of a different provider.
+func NewExecutorUsageReporterAs(ctx context.Context, executor usageExecutor, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
 	reporter := NewUsageReporter(ctx, provider, model, auth)
 	reporter.executorType = ExecutorTypeName(executor)
 	return reporter
