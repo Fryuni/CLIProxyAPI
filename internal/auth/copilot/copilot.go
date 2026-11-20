@@ -83,7 +83,8 @@ func ApplyIdentityHeaders(h http.Header, token string) {
 
 // RequestTraits reports the X-Initiator value and whether the request carries
 // images, from a client payload in the given translator format ("openai",
-// "openai-response", or "claude"). Other formats report a user turn without images.
+// "openai-response", "claude", or "gemini"). Other formats report a user turn
+// without images.
 func RequestTraits(format string, payload []byte) (initiator string, vision bool) {
 	switch format {
 	case "openai":
@@ -92,9 +93,45 @@ func RequestTraits(format string, payload []byte) (initiator string, vision bool
 		return responsesTraits(payload)
 	case "claude":
 		return messagesTraits(payload)
+	case "gemini":
+		return geminiTraits(payload)
 	default:
 		return InitiatorUser, false
 	}
+}
+
+func geminiTraits(payload []byte) (string, bool) {
+	contents := ojson.GetBytesNoCopy(payload, "contents").Array()
+	vision := false
+	for _, content := range contents {
+		for _, part := range content.Get("parts").Array() {
+			for _, field := range [...]string{"inlineData.mimeType", "inline_data.mime_type", "fileData.mimeType", "file_data.mime_type"} {
+				if strings.HasPrefix(part.Get(field).String(), "image/") {
+					vision = true
+				}
+			}
+		}
+		if vision {
+			break
+		}
+	}
+	if len(contents) == 0 {
+		return InitiatorUser, vision
+	}
+	last := contents[len(contents)-1]
+	if role := last.Get("role").String(); role != "" && role != "user" {
+		return InitiatorAgent, vision
+	}
+	parts := last.Get("parts").Array()
+	if len(parts) == 0 {
+		return InitiatorUser, vision
+	}
+	for _, part := range parts {
+		if !part.Get("functionResponse").Exists() && !part.Get("function_response").Exists() {
+			return InitiatorUser, vision
+		}
+	}
+	return InitiatorAgent, vision
 }
 
 func chatTraits(payload []byte) (string, bool) {

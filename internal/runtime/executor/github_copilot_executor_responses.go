@@ -45,8 +45,9 @@ func (e *GitHubCopilotExecutor) prepareResponsesRequest(ctx context.Context, req
 	originalPayload = bytes.Clone(originalPayload)
 	isCompat := helps.APIKeyModelIsCompat(req)
 	targetModel := resolveResponsesSignatureTargetModel(baseModel, req, opts)
-	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, targetModel, originalPayload, true, isCompat)
-	originalTranslated = helps.SetStringIfDifferent(originalTranslated, "model", baseModel)
+	originalDoc := ojson.NewDoc(helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, targetModel, originalPayload, true, isCompat))
+	helps.SetStringIfDifferentDoc(originalDoc, "model", baseModel)
+	originalTranslated := originalDoc.Bytes()
 	body, err := helps.TranslateRequestReturningError(ctx, opts.Headers, e.cfg, from, to, targetModel, bytes.Clone(req.Payload), true, isCompat)
 	if err != nil {
 		return nil, err

@@ -115,6 +115,8 @@ func TestRequestTraits(t *testing.T) {
 		{"responses function output", "openai-response", `{"input":[{"role":"user","content":"hi"},{"type":"function_call_output","output":[{"type":"input_image"}]}]}`, InitiatorAgent, true},
 		{"claude user text", "claude", `{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image"}]}]}`, InitiatorUser, true},
 		{"claude tool result only", "claude", `{"messages":[{"role":"user","content":[{"type":"tool_result","content":"ok"}]}]}`, InitiatorAgent, false},
+		{"gemini user image", "gemini", `{"contents":[{"role":"user","parts":[{"text":"look"},{"inlineData":{"mimeType":"image/png","data":"AA=="}}]}]}`, InitiatorUser, true},
+		{"gemini function response", "gemini", `{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"functionCall":{"name":"f"}}]},{"role":"user","parts":[{"functionResponse":{"name":"f","response":{}}}]}]}`, InitiatorAgent, false},
 	}
 	for _, tc := range cases {
 		initiator, vision := RequestTraits(tc.format, []byte(tc.payload))
