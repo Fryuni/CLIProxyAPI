@@ -25,6 +25,8 @@ Upstream `b4410dd5` implements the intended fix of the [xAI WebSocket retry payl
 
 Under ADR-0004's test policy, fork CI exposes one new upstream flake. `TestResponsesWebsocketSameSessionLaterCreate429DoesNotReplayAfterDownstreamCommit` (`a8c9c8a4`) sometimes sees the downstream socket close before the terminal 429 frame is written. This is a runtime race, recorded as a [local ticket](../../.scratch/responses-websocket-post-commit-429-close/issues/01-write-post-commit-429-before-closing.md) without patching the runtime. `TestCodexClientModelsApplyPatchRouting` fails only when its package runs more than once in one process (`-count` above 1), on clean upstream as well. Fork CI runs each test once, so it is not recorded, as in ADR-0024.
 
+Automated review flagged two upstream changes in files the fork does not change, both from `99a1c1ca`. The post-refresh Antigravity credit query now runs under a response deadline, which `AGENTS.md` forbids after credential acquisition. It is recorded as a [local ticket](../../.scratch/antigravity-credits-refresh-deadline/issues/01-drop-response-deadline-on-post-refresh-credits.md) without patching the runtime. Its shared-refresh regression test orders its goroutines with a sleep, but it has not failed in fork CI, so it is declined, not recorded, as in [ADR-0031](0031-sync-upstream-1aaf56bc.md).
+
 ## Evidence
 
 On the merged tree, `go build ./...`, `go vet` of the conflicted packages, and `go test ./...` pass; one earlier full run hit the WebSocket flake below. The new WebSocket flake failed 41 of 400 runs on clean upstream and 55 of 400 on the merged tree under twelve busy CPU loops, and passed 200 of 200 on each without load.
