@@ -22,3 +22,5 @@ For a stream whose chunks carry root-level `usageMetadata` with growing totals, 
 ## Comments
 
 Reported by Codex review on PR #18 at `internal/runtime/executor/antigravity_executor_execute.go:638`. The file is identical to upstream `dbb70621`. The fork's runtime is unchanged.
+
+Upstream sync `f5c5681a` ([ADR-0033](../../../docs/adr/0033-sync-upstream-f5c5681a.md)): upstream `cf07c78a` makes a usage-only chunk, with neither `response` nor `candidates`, overwrite the stored usage. A chunk with `response` and root-level `usageMetadata` is still guarded by `if usageRaw == ""`, so the first such chunk's usage still wins. The fork's runtime is unchanged.

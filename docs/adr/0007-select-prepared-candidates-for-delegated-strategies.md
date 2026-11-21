@@ -10,6 +10,10 @@ For mixed-provider delegation, narrow to the global highest-priority tier before
 
 Bound the mixed-provider offset map to 4096 keys using the existing reset convention, so arbitrary model/provider combinations cannot grow that state indefinitely. The original implementation was reset and reapplied; the priority and state-bound fixes are retained review corrections.
 
+## Upstream implementation notes
+
+Upstream `22d40703`, merged by [ADR-0033](0033-sync-upstream-f5c5681a.md), lets a plugin scheduler exclude candidates, and delegates built-in selection through the stored scheduler with the excluded IDs marked tried. The fork keeps delegation over its prepared candidates and drops the excluded IDs from them. When no available candidate remains, it reports the remaining candidates' availability error, so a cooled-down remainder returns the model cooldown error as upstream does.
+
 ## Evidence
 
 [1e3118fd](https://github.com/Fryuni/CLIProxyAPI/commit/1e3118fd95fb3f0fd1b1041f815e84ca5c9b4cea), [db058ba0](https://github.com/Fryuni/CLIProxyAPI/commit/db058ba06a81e78334466afd581c7d6ad62eafa2), [553a4474](https://github.com/Fryuni/CLIProxyAPI/commit/553a447450feea49692dbb77921b8d2451974782), [0c7dd79d](https://github.com/Fryuni/CLIProxyAPI/commit/0c7dd79de2200742e765b7a30b66207a4e4f2772), [c5fffadd](https://github.com/Fryuni/CLIProxyAPI/commit/c5fffadd9f5521cb58d085a77f6a92fd61e10c85), [a0135cde](https://github.com/Fryuni/CLIProxyAPI/commit/a0135cde35f77c757b59f3c5a4b995062293be3a), [ad5cc00f](https://github.com/Fryuni/CLIProxyAPI/commit/ad5cc00fb5392d1f9f771d00385658be422ee7ce), [5027338b](https://github.com/Fryuni/CLIProxyAPI/commit/5027338b8cf01cec1fcd9547e31e6cfddd46106b).

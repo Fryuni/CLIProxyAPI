@@ -38,6 +38,8 @@ Review also flagged five upstream call sites that still mutate serialized bytes 
 
 Upstream `8e8e8231`, merged by [ADR-0031](0031-sync-upstream-1aaf56bc.md), repairs `TestServerResponsesWebsocketReauthorizesEachTurn` the same way: the test waits for its hijacked handlers after closing the server. The fork takes upstream's test. The heartbeat test repair remains fork-only.
 
+Upstream `b4410dd5`, merged by [ADR-0033](0033-sync-upstream-f5c5681a.md), implements the intended fix of the xAI WebSocket retry ticket: the send retry resends the already-finalized frame. The ticket is resolved.
+
 ## Evidence
 
 On the merged tree, `go build ./...` and `go test ./...` pass. `go test -race` passes for `sdk/cliproxy/auth` and `internal/api/handlers/management`. The repaired WebSocket test passes 30 of 30 runs and the heartbeat test 60 of 60. `TestResponsesLateInterruptDoesNotPoisonNextCreate` passes 300 of 300. `go vet` reports one warning in upstream's `internal/pluginhost/host_test.go`, which is identical to upstream.
