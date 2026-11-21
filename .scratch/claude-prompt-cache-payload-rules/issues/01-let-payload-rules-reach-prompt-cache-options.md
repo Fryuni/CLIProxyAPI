@@ -24,3 +24,5 @@ A payload rule targeting `prompt_cache_options` has the documented effect on all
 ## Comments
 
 Reported by Codex review on PR #11 at `internal/runtime/executor/claude_executor_execute.go:254`. The fork's runtime is unchanged.
+
+Upstream sync `f5c5681a` ([ADR-0033](../../../docs/adr/0033-sync-upstream-f5c5681a.md)): upstream `b4410dd5` partly addresses this. `stripPromptCacheOptionsDoc` now runs before the payload rules on the execute, stream, and count paths, so a rule-injected `prompt_cache_options` survives, which `TestClaudeAndKimiPayloadCacheOptionsAreFinal` covers. The field is sent to Anthropic unchanged and does not affect cache placement, so the acceptance criterion still fails. The fork's runtime is unchanged.

@@ -5,8 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"github.com/MoeForge/moego/base64"
 	"io"
 	"net/http"
 	"net/url"
@@ -16,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
 
 	"github.com/gin-gonic/gin"
 	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
@@ -151,10 +152,13 @@ type Auth struct {
 	// stamped at or below it were dispatched before the cooldown existed and
 	// must not clear it. Runtime only: zero after restart so restored
 	// cooldowns can still be cleared by any success.
-	cooldownRecordedSeq uint64    `json:"-"`
-	forceCooldownUntil  time.Time `json:"-"`
-	credQuotaForceUntil time.Time `json:"-"`
-	forceCooldownSeeded bool      `json:"-"`
+	cooldownRecordedSeq     uint64    `json:"-"`
+	forceCooldownUntil      time.Time `json:"-"`
+	quotaForceCooldownUntil time.Time `json:"-"`
+	credQuotaForceUntil     time.Time `json:"-"`
+	credentialRetryAfter    time.Time `json:"-"`
+	nonQuotaCooldownUntil   time.Time `json:"-"`
+	forceCooldownSeeded     bool      `json:"-"`
 
 	recentRequests recentRequestRing `json:"-"`
 	indexAssigned  bool              `json:"-"`
@@ -403,9 +407,11 @@ type ModelState struct {
 	// stamped at or below it were dispatched before the cooldown existed and
 	// must not clear it. Runtime only: zero after restart so restored
 	// cooldowns can still be cleared by any success.
-	cooldownRecordedSeq uint64    `json:"-"`
-	forceCooldownUntil  time.Time `json:"-"`
-	forceCooldownSeeded bool      `json:"-"`
+	cooldownRecordedSeq     uint64    `json:"-"`
+	forceCooldownUntil      time.Time `json:"-"`
+	quotaForceCooldownUntil time.Time `json:"-"`
+	nonQuotaCooldownUntil   time.Time `json:"-"`
+	forceCooldownSeeded     bool      `json:"-"`
 	// credentialQuotaShadow holds this model's independent (own-failure)
 	// cooldown layer while the outer fields present the auth-level
 	// credential quota propagated over it, so quota restoration can drop
@@ -496,12 +502,10 @@ func (a *Auth) Clone() *Auth {
 	copyAuth := *a
 	copyAuth.Quota = a.Quota.Clone()
 	if a.LastError != nil {
-		copyErr := *a.LastError
-		copyAuth.LastError = &copyErr
+		copyAuth.LastError = a.LastError.Clone()
 	}
 	if a.RefreshError != nil {
-		copyErr := *a.RefreshError
-		copyAuth.RefreshError = &copyErr
+		copyAuth.RefreshError = a.RefreshError.Clone()
 	}
 	if a.Attributes != nil {
 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
@@ -568,26 +572,32 @@ func (o *ProxyConnectionPoolOverride) Clone() *ProxyConnectionPoolOverride {
 	return out
 }
 
+func cloneMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneMetadataMap(typed)
+	case []string:
+		s := make([]string, len(typed))
+		copy(s, typed)
+		return s
+	case []any:
+		s := make([]any, len(typed))
+		for i, item := range typed {
+			s[i] = cloneMetadataValue(item)
+		}
+		return s
+	default:
+		return value
+	}
+}
+
 func cloneMetadataMap(src map[string]any) map[string]any {
 	if src == nil {
 		return nil
 	}
 	dst := make(map[string]any, len(src))
 	for key, value := range src {
-		switch typed := value.(type) {
-		case map[string]any:
-			dst[key] = cloneMetadataMap(typed)
-		case []string:
-			s := make([]string, len(typed))
-			copy(s, typed)
-			dst[key] = s
-		case []any:
-			s := make([]any, len(typed))
-			copy(s, typed)
-			dst[key] = s
-		default:
-			dst[key] = value
-		}
+		dst[key] = cloneMetadataValue(value)
 	}
 	return dst
 }
@@ -766,12 +776,7 @@ func (m *ModelState) Clone() *ModelState {
 	copyState := *m
 	copyState.Quota = m.Quota.Clone()
 	if m.LastError != nil {
-		copyState.LastError = &Error{
-			Code:       m.LastError.Code,
-			Message:    m.LastError.Message,
-			Retryable:  m.LastError.Retryable,
-			HTTPStatus: m.LastError.HTTPStatus,
-		}
+		copyState.LastError = m.LastError.Clone()
 	}
 	if m.credentialQuotaShadow != nil {
 		copyState.credentialQuotaShadow = m.credentialQuotaShadow.cloneShallow()
@@ -788,12 +793,7 @@ func (m *ModelState) cloneShallow() *ModelState {
 	copyState.Quota = m.Quota.Clone()
 	copyState.credentialQuotaShadow = nil
 	if m.LastError != nil {
-		copyState.LastError = &Error{
-			Code:       m.LastError.Code,
-			Message:    m.LastError.Message,
-			Retryable:  m.LastError.Retryable,
-			HTTPStatus: m.LastError.HTTPStatus,
-		}
+		copyState.LastError = m.LastError.Clone()
 	}
 	return &copyState
 }

@@ -1,6 +1,6 @@
 # Apply payload rules once on xAI WebSocket send retries
 
-Status: needs-triage
+Status: resolved
 Type: task
 
 ## Context
@@ -22,3 +22,5 @@ A regression configures a non-idempotent payload rule, fails the first send on a
 ## Comments
 
 Reported by Codex review on PR #19 at `internal/runtime/executor/xai_websockets_executor.go:544`. The file is identical to upstream `c5251b57`. The fork's runtime is unchanged.
+
+Upstream sync `f5c5681a` ([ADR-0033](../../../docs/adr/0033-sync-upstream-f5c5681a.md)): upstream `b4410dd5` implements the intended fix. The executor finalizes the payload once, the send retry resends the finished frame (`wsReqBodyRetry := wsReqBody`), and the helper that re-ran the rules is deleted. `TestXAIPayloadTransportRetryReusesFinalFrame` covers the acceptance criterion.
