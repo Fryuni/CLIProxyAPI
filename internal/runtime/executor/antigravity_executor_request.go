@@ -103,15 +103,17 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	}
 
 	applyAntigravityNativeSignatureReplayIfNeededDoc(modelName, doc)
-	preFinalizeModel := doc.Get("model").Raw
-	helps.FinalizePayloadDoc(ctx, doc)
-	// Re-route the transport envelope model if payload rules changed thinkingConfig
-	// without explicitly overriding or filtering the top-level model field.
+	var touched map[string]bool
 	if len(groupedLevels) > 0 {
-		if postModel := doc.Get("model"); postModel.Exists() && postModel.Raw == preFinalizeModel {
-			if postUpstream := resolveAntigravityGroupedUpstreamModel(modelName, groupedLevels, doc); postUpstream != upstreamModel {
-				_ = doc.Set("model", postUpstream)
-			}
+		touched = helps.FinalizePayloadDocWithTrackedPaths(ctx, doc, "model")
+	} else {
+		helps.FinalizePayloadDoc(ctx, doc)
+	}
+	// Re-route the transport envelope model if payload rules changed thinkingConfig
+	// without touching the top-level model field.
+	if len(groupedLevels) > 0 && !touched["model"] {
+		if postUpstream := resolveAntigravityGroupedUpstreamModel(modelName, groupedLevels, doc); postUpstream != upstreamModel {
+			_ = doc.Set("model", postUpstream)
 		}
 	}
 	finalPayload := doc.Bytes()

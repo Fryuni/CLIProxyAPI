@@ -1078,6 +1078,34 @@ func TestAntigravityGroupedModelUpstreamResolution(t *testing.T) {
 		}
 	})
 
+	t.Run("payload finalizer same-value model override is preserved even when thinkingLevel changes", func(t *testing.T) {
+		cfg := &config.Config{
+			Payload: config.PayloadConfig{
+				Override: []config.PayloadRule{
+					{
+						Models: []config.PayloadModelRule{{Name: "gemini-4-neon", Protocol: "antigravity"}},
+						Params: map[string]any{
+							"model": "gemini-4-neon-low",
+							"request.generationConfig.thinkingConfig.thinkingLevel": "xhigh",
+						},
+					},
+				},
+			},
+		}
+		raw := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`)
+		req := cliproxyexecutor.Request{Model: "gemini-4-neon", Payload: raw}
+		ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", "gemini-4-neon", "antigravity", "", raw, req, cliproxyexecutor.Options{}))
+
+		httpReq, err := exec.buildRequest(ctx, auth, "token", "gemini-4-neon", raw, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequest error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "gemini-4-neon-low" {
+			t.Fatalf("explicitly configured model was overwritten: got %q, want gemini-4-neon-low", got)
+		}
+	})
+
 	t.Run("thinking pipeline + buildRequestDoc clamps prefixed Claude grouped model to account levels", func(t *testing.T) {
 		doc := ojson.NewDoc([]byte(`{"request":{"contents":[]}}`))
 		req := cliproxyexecutor.Request{

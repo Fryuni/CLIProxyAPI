@@ -22,6 +22,12 @@ var (
 	builtinFinalizerCodePtr atomic.Uintptr
 )
 
+type payloadDocProbe struct {
+	doc          *ojson.Doc
+	trackedPaths []string
+	touched      map[string]bool
+}
+
 func payloadFinalizerKeyPtr(f PayloadFinalizer) uintptr {
 	if f == nil {
 		return 0
@@ -31,20 +37,46 @@ func payloadFinalizerKeyPtr(f PayloadFinalizer) uintptr {
 
 // FinalizeDoc applies the finalizer to doc in place without probing custom wrappers.
 func (f PayloadFinalizer) FinalizeDoc(doc *ojson.Doc) {
+	_ = f.FinalizeDocWithTrackedPaths(doc)
+}
+
+// FinalizeDocWithTrackedPaths applies the finalizer to doc in place and reports which
+// trackedPaths were written or deleted by payload rules.
+func (f PayloadFinalizer) FinalizeDocWithTrackedPaths(doc *ojson.Doc, trackedPaths ...string) map[string]bool {
 	if f == nil || doc == nil {
-		return
+		return nil
 	}
 	if ptr := payloadFinalizerKeyPtr(f); ptr != 0 && ptr == builtinFinalizerCodePtr.Load() {
-		var probe [1]byte
-		key := &probe[0]
-		payloadDocProbes.Store(key, doc)
-		_ = f(probe[:0])
+		var probeKey [1]byte
+		key := &probeKey[0]
+		probe := &payloadDocProbe{doc: doc, trackedPaths: trackedPaths}
+		payloadDocProbes.Store(key, probe)
+		_ = f(probeKey[:0])
 		if _, remaining := payloadDocProbes.LoadAndDelete(key); !remaining {
-			return
+			return probe.touched
+		}
+	}
+	var before map[string]string
+	if len(trackedPaths) > 0 {
+		before = make(map[string]string, len(trackedPaths))
+		for _, tp := range trackedPaths {
+			if tp = strings.TrimSpace(tp); tp != "" {
+				before[tp] = doc.Get(tp).Raw
+			}
 		}
 	}
 	updated := f(doc.Bytes())
 	*doc = *ojson.NewDoc(updated)
+	if len(before) == 0 {
+		return nil
+	}
+	touched := make(map[string]bool)
+	for tp, prev := range before {
+		if doc.Get(tp).Raw != prev {
+			touched[tp] = true
+		}
+	}
+	return touched
 }
 
 // NewPayloadFinalizer snapshots matching context before built-in request mutations.
@@ -65,10 +97,10 @@ func NewPayloadFinalizer(cfg *config.Config, executor, model, protocol, root str
 		if len(body) == 0 && cap(body) == 1 {
 			key := &body[:1][0]
 			if v, ok := payloadDocProbes.LoadAndDelete(key); ok {
-				if doc, okDoc := v.(*ojson.Doc); okDoc && doc != nil {
-					applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg, executor, model, protocol, opts.SourceFormat.String(), root, doc, source, requestedModel, requestPath, headers, auth)
+				if probe, okProbe := v.(*payloadDocProbe); okProbe && probe != nil && probe.doc != nil {
+					probe.touched, _ = applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg, executor, model, protocol, opts.SourceFormat.String(), root, probe.doc, source, requestedModel, requestPath, headers, auth, probe.trackedPaths...)
 					if formatCallback != nil {
-						formatCallback(strings.Clone(strings.TrimSpace(doc.Get(buildPayloadPath(root, "response_format")).String())))
+						formatCallback(strings.Clone(strings.TrimSpace(probe.doc.Get(buildPayloadPath(root, "response_format")).String())))
 					}
 				}
 				return nil
@@ -113,4 +145,16 @@ func FinalizePayloadDoc(ctx context.Context, doc *ojson.Doc) {
 	if finalize, ok := ctx.Value(payloadFinalizerKey{}).(PayloadFinalizer); ok && finalize != nil {
 		finalize.FinalizeDoc(doc)
 	}
+}
+
+// FinalizePayloadDocWithTrackedPaths runs immediately before serialization or transport framing,
+// mutating doc in place and reporting which trackedPaths were touched by payload rules.
+func FinalizePayloadDocWithTrackedPaths(ctx context.Context, doc *ojson.Doc, trackedPaths ...string) map[string]bool {
+	if doc == nil {
+		return nil
+	}
+	if finalize, ok := ctx.Value(payloadFinalizerKey{}).(PayloadFinalizer); ok && finalize != nil {
+		return finalize.FinalizeDocWithTrackedPaths(doc, trackedPaths...)
+	}
+	return nil
 }
