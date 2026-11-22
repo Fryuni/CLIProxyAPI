@@ -1028,6 +1028,56 @@ func TestAntigravityGroupedModelUpstreamResolution(t *testing.T) {
 		}
 	})
 
+	t.Run("payload finalizer thinking override re-routes grouped upstream model", func(t *testing.T) {
+		cfg := &config.Config{
+			Payload: config.PayloadConfig{
+				Override: []config.PayloadRule{
+					{
+						Models: []config.PayloadModelRule{{Name: "gemini-4-neon", Protocol: "antigravity"}},
+						Params: map[string]any{"generationConfig.thinkingConfig.thinkingLevel": "xhigh"},
+					},
+				},
+			},
+		}
+		raw := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`)
+		req := cliproxyexecutor.Request{Model: "gemini-4-neon", Payload: raw}
+		ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", "gemini-4-neon", "antigravity", "request", raw, req, cliproxyexecutor.Options{}))
+
+		httpReq, err := exec.buildRequest(ctx, auth, "token", "gemini-4-neon", raw, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequest error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "gemini-4-neon-xhigh" {
+			t.Fatalf("upstream model = %q, want gemini-4-neon-xhigh after payload thinkingLevel override", got)
+		}
+	})
+
+	t.Run("payload finalizer model filter is not restored for grouped model", func(t *testing.T) {
+		cfg := &config.Config{
+			Payload: config.PayloadConfig{
+				Filter: []config.PayloadFilterRule{
+					{
+						Models: []config.PayloadModelRule{{Name: "gemini-4-neon", Protocol: "antigravity"}},
+						Params: []string{"model"},
+					},
+				},
+			},
+		}
+		raw := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`)
+		req := cliproxyexecutor.Request{Model: "gemini-4-neon", Payload: raw}
+		ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", "gemini-4-neon", "antigravity", "", raw, req, cliproxyexecutor.Options{}))
+
+		httpReq, err := exec.buildRequest(ctx, auth, "token", "gemini-4-neon", raw, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequest error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if _, exists := body["model"]; exists {
+			t.Fatalf("filtered model field should not be restored, got %v", body["model"])
+		}
+	})
+
 	t.Run("thinking pipeline + buildRequestDoc clamps prefixed Claude grouped model to account levels", func(t *testing.T) {
 		doc := ojson.NewDoc([]byte(`{"request":{"contents":[]}}`))
 		req := cliproxyexecutor.Request{

@@ -67,19 +67,24 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	if errProject != nil {
 		return nil, nil, errProject
 	}
-	upstreamModel := resolveAntigravityUpstreamModelForDoc(auth, modelName, doc)
+	modelInfo := resolveAntigravityClientModelInfo(auth, modelName)
+	var groupedLevels map[string]string
+	if modelInfo != nil && len(modelInfo.GroupedLevelModelIDs) > 0 {
+		groupedLevels = modelInfo.GroupedLevelModelIDs
+	}
+	upstreamModel := resolveAntigravityGroupedUpstreamModel(modelName, groupedLevels, doc)
 	geminiToAntigravityDocForAuth(doc, upstreamModel, projectID, antigravityAuthID(auth), derivedSessionIDs...)
 	promptStructuredOutput := helps.PrepareAntigravityClaudeStructuredOutputDoc(modelName, doc)
 
 	// Cap maxOutputTokens to model's max_completion_tokens from registry
 	if maxOut := doc.Get("request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == ojson.Number {
-		modelInfo := resolveAntigravityClientModelInfo(auth, modelName)
-		if modelInfo == nil {
-			modelInfo = registry.LookupModelInfo(modelName, "antigravity")
+		capInfo := modelInfo
+		if capInfo == nil {
+			capInfo = registry.LookupModelInfo(modelName, "antigravity")
 		}
-		if modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
-			if int(maxOut.Int()) > modelInfo.MaxCompletionTokens {
-				_ = doc.Set("request.generationConfig.maxOutputTokens", modelInfo.MaxCompletionTokens)
+		if capInfo != nil && capInfo.MaxCompletionTokens > 0 {
+			if int(maxOut.Int()) > capInfo.MaxCompletionTokens {
+				_ = doc.Set("request.generationConfig.maxOutputTokens", capInfo.MaxCompletionTokens)
 			}
 		}
 	}
@@ -98,7 +103,17 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	}
 
 	applyAntigravityNativeSignatureReplayIfNeededDoc(modelName, doc)
+	preFinalizeModel := doc.Get("model").Raw
 	helps.FinalizePayloadDoc(ctx, doc)
+	// Re-route the transport envelope model if payload rules changed thinkingConfig
+	// without explicitly overriding or filtering the top-level model field.
+	if len(groupedLevels) > 0 {
+		if postModel := doc.Get("model"); postModel.Exists() && postModel.Raw == preFinalizeModel {
+			if postUpstream := resolveAntigravityGroupedUpstreamModel(modelName, groupedLevels, doc); postUpstream != upstreamModel {
+				_ = doc.Set("model", postUpstream)
+			}
+		}
+	}
 	finalPayload := doc.Bytes()
 	var (
 		bodyReader io.Reader = bytes.NewReader(finalPayload)
@@ -779,14 +794,6 @@ func applyAntigravityRequestThinkingDoc(doc *ojson.Doc, auth *cliproxyauth.Auth,
 		return helps.ApplyRequestThinkingWithExplicitModelInfoDoc(doc, req, opts, fromFormat, toFormat, provider, &thinkingInfo)
 	}
 	return helps.ApplyRequestThinkingWithModelInfoDoc(doc, req, opts, fromFormat, toFormat, provider, modelInfo)
-}
-
-func resolveAntigravityUpstreamModelForDoc(auth *cliproxyauth.Auth, modelName string, doc *ojson.Doc) string {
-	info := resolveAntigravityClientModelInfo(auth, modelName)
-	if info == nil || len(info.GroupedLevelModelIDs) == 0 {
-		return modelName
-	}
-	return resolveAntigravityGroupedUpstreamModel(modelName, info.GroupedLevelModelIDs, doc)
 }
 
 func resolveAntigravityGroupedUpstreamModel(modelName string, groupedLevels map[string]string, doc *ojson.Doc) string {
