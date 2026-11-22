@@ -522,10 +522,16 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 			model.SupportsWebSearch = true
 			continue
 		}
-		for _, memberID := range model.GroupedLevelModelIDs {
-			if _, ok := hints.WebSearchModelIDs[normalizeAntigravityFetchedModelID(memberID)]; ok {
+		if len(model.GroupedLevelModelIDs) > 0 {
+			allSupportWebSearch := true
+			for _, memberID := range model.GroupedLevelModelIDs {
+				if _, ok := hints.WebSearchModelIDs[normalizeAntigravityFetchedModelID(memberID)]; !ok {
+					allSupportWebSearch = false
+					break
+				}
+			}
+			if allSupportWebSearch {
 				model.SupportsWebSearch = true
-				break
 			}
 		}
 	}
@@ -565,7 +571,8 @@ func (s *Service) antigravityHomeEnabled() bool {
 	return s.cfg != nil && s.cfg.Home.Enabled
 }
 
-func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
+func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabilityHints, excluded []string) []*ModelInfo {
+	excludedPatterns := normalizeExcludedModelPatterns(excluded)
 	staticByID := make(map[string]*ModelInfo, len(models))
 	for _, model := range models {
 		if model == nil {
@@ -611,7 +618,11 @@ func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabili
 				if _, dup := seenLevels[level]; dup {
 					continue
 				}
-				if _, entitled := hints.ModelIDs[groupID+"-"+level]; !entitled {
+				memberID := groupID + "-" + level
+				if _, entitled := hints.ModelIDs[memberID]; !entitled {
+					continue
+				}
+				if isExcludedModelID(memberID, excludedPatterns) {
 					continue
 				}
 				seenLevels[level] = struct{}{}
@@ -721,7 +732,7 @@ func buildAntigravityGroupedModelInfo(template *ModelInfo, groupID, displayName 
 func stripAntigravityLevelDisplaySuffix(displayName string) string {
 	trimmed := strings.TrimSpace(displayName)
 	for _, suffix := range []string{" (XHigh)", " (Extra High)", " (High)", " (Medium)", " (Low)", " (Minimal)", " (Max)"} {
-		if strings.HasSuffix(strings.ToLower(trimmed), strings.ToLower(suffix)) {
+		if len(trimmed) >= len(suffix) && strings.EqualFold(trimmed[len(trimmed)-len(suffix):], suffix) {
 			return strings.TrimSpace(trimmed[:len(trimmed)-len(suffix)])
 		}
 	}
@@ -739,12 +750,12 @@ func (s *Service) antigravityModelsForHintsWithConfig(auth *coreauth.Auth, hints
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
-	models := filterAntigravityModels(registry.GetAntigravityModels(), hints)
-	models = applyAntigravityFetchedModelCapabilities(models, hints)
 	excluded := cfg.OAuthExcludedModels[coreauth.OAuthModelAliasChannel(auth.Provider, auth.AuthKind())]
 	if value := strings.TrimSpace(auth.Attributes["excluded_models"]); value != "" {
 		excluded = strings.Split(value, ",")
 	}
+	models := filterAntigravityModels(registry.GetAntigravityModels(), hints, excluded)
+	models = applyAntigravityFetchedModelCapabilities(models, hints)
 	models = applyExcludedModels(models, excluded)
 	models = applyOAuthModelAliasForAuth(cfg, "antigravity", auth.AuthKind(), auth.Attributes, models)
 	models = s.appendPluginModels("antigravity", models, excluded)

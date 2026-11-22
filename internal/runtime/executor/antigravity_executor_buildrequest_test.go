@@ -1049,4 +1049,31 @@ func TestAntigravityGroupedModelUpstreamResolution(t *testing.T) {
 			t.Fatalf("upstream model = %q, want claude-opus-5-5-high", got)
 		}
 	})
+
+	t.Run("grouped-model thinking preserves reasoning summary includeThoughts intent", func(t *testing.T) {
+		doc := ojson.NewDoc([]byte(`{"request":{"contents":[]}}`))
+		origPayload := []byte(`{"model":"gemini-4-neon","reasoning":{"effort":"low","summary":"detailed"},"input":"hi"}`)
+		req := cliproxyexecutor.Request{
+			Model:   "gemini-4-neon",
+			Payload: []byte(`{"model":"gemini-4-neon","reasoning":{"effort":"low"},"input":"hi"}`),
+		}
+		opts := cliproxyexecutor.Options{
+			OriginalRequest: origPayload,
+		}
+		if err := applyAntigravityRequestThinkingDoc(doc, auth, "gemini-4-neon", req, opts, "openai-response", "antigravity", "antigravity"); err != nil {
+			t.Fatalf("applyAntigravityRequestThinkingDoc error: %v", err)
+		}
+		includeThoughts := doc.Get("request.generationConfig.thinkingConfig.includeThoughts")
+		if !includeThoughts.Exists() || !includeThoughts.Bool() {
+			t.Fatalf("expected includeThoughts=true to be preserved on grouped model, got doc=%s", doc.String())
+		}
+		httpReq, _, err := exec.buildRequestDoc(context.Background(), auth, "token", "gemini-4-neon", doc, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequestDoc error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "gemini-4-neon-low" {
+			t.Fatalf("upstream model = %q, want gemini-4-neon-low", got)
+		}
+	})
 }

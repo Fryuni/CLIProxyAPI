@@ -1194,4 +1194,53 @@ func TestAntigravityGroupedModelsRegistrationAndTransforms(t *testing.T) {
 			t.Errorf("aliasedNeon GroupedLevelModelIDs[xhigh] = %q, want gemini-4-neon-xhigh", aliasedNeon.GroupedLevelModelIDs["xhigh"])
 		}
 	})
+
+	t.Run("excludes individual grouped levels and drops groups when all levels are excluded", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:       "agy-grouped-level-excluded",
+			Provider: "antigravity",
+			Metadata: map[string]any{
+				"access_token": "token-grouped-level-excluded",
+				"project_id":   "proj-grouped-level-excluded",
+				"base_url":     server.URL,
+			},
+		}
+		t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+		cfg := &config.Config{
+			OAuthExcludedModels: map[string][]string{
+				"antigravity": {"gemini-4-neon-xhigh", "claude-opus-5-5-*"},
+			},
+		}
+		svc := &Service{cfg: cfg}
+		svc.registerModelsForAuth(t.Context(), auth)
+		svc.WaitAntigravityProbes()
+
+		waitForAntigravityClientModel(t, auth.ID, "gemini-4-neon")
+		models := GlobalModelRegistry().GetModelsForClient(auth.ID)
+		byID := make(map[string]*registry.ModelInfo, len(models))
+		for _, m := range models {
+			byID[m.ID] = m
+		}
+
+		neon := byID["gemini-4-neon"]
+		if neon == nil {
+			t.Fatal("expected gemini-4-neon to remain registered with non-excluded levels")
+		}
+		if neon.Thinking == nil || !slices.Equal(neon.Thinking.Levels, []string{"low", "medium", "high"}) {
+			t.Errorf("neon Thinking.Levels = %v, want [low medium high]", neon.Thinking)
+		}
+		if _, hasXHigh := neon.GroupedLevelModelIDs["xhigh"]; hasXHigh {
+			t.Errorf("excluded level xhigh must not remain in GroupedLevelModelIDs: %v", neon.GroupedLevelModelIDs)
+		}
+		if byID["gemini-4-neon-xhigh"] != nil {
+			t.Error("excluded gemini-4-neon-xhigh must not be exposed as a standalone model")
+		}
+		if byID["claude-opus-5-5"] != nil {
+			t.Error("expected claude-opus-5-5 to be dropped when all of its levels are excluded")
+		}
+		if byID["claude-opus-5-5-high"] != nil {
+			t.Error("excluded claude-opus-5-5-high must not be exposed")
+		}
+	})
 }

@@ -770,19 +770,13 @@ func resolveAntigravityClientModelInfo(auth *cliproxyauth.Auth, modelName string
 func applyAntigravityRequestThinkingDoc(doc *ojson.Doc, auth *cliproxyauth.Auth, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, fromFormat, toFormat, provider string) error {
 	modelInfo := resolveAntigravityClientModelInfo(auth, baseModel)
 	if modelInfo != nil && len(modelInfo.GroupedLevelModelIDs) > 0 {
-		if _, hasResolved := cliproxyauth.ResolvedModelInfo(req); !hasResolved {
-			thinkingInfo := *modelInfo
-			// Keep the canonical base model ID so Claude-specific budget normalization
-			// still applies when the auth only registered an alias or prefixed route.
-			if strings.TrimSpace(baseModel) != "" {
-				thinkingInfo.ID = strings.TrimSpace(baseModel)
-			}
-			source := req.Payload
-			if len(source) == 0 {
-				source = opts.OriginalRequest
-			}
-			return thinking.ApplyThinkingWithModelInfoAndSummaryDoc(doc, source, req.Model, fromFormat, toFormat, provider, &thinkingInfo, thinking.SummaryConfig{})
+		thinkingInfo := *modelInfo
+		// Keep the canonical base model ID so Claude-specific budget normalization
+		// still applies when the auth only registered an alias or prefixed route.
+		if strings.TrimSpace(baseModel) != "" {
+			thinkingInfo.ID = strings.TrimSpace(baseModel)
 		}
+		return helps.ApplyRequestThinkingWithExplicitModelInfoDoc(doc, req, opts, fromFormat, toFormat, provider, &thinkingInfo)
 	}
 	return helps.ApplyRequestThinkingWithModelInfoDoc(doc, req, opts, fromFormat, toFormat, provider, modelInfo)
 }

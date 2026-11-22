@@ -67,6 +67,17 @@ func ApplyRequestThinkingWithModelInfo(body []byte, req cliproxyexecutor.Request
 // and falls back to fallbackModelInfo when neither request metadata nor the global
 // registry resolves a model definition.
 func ApplyRequestThinkingWithModelInfoDoc(doc *ojson.Doc, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, fromFormat, toFormat, provider string, fallbackModelInfo *registry.ModelInfo, normalizedUpdatesChanged ...bool) error {
+	return applyRequestThinkingDoc(doc, req, opts, fromFormat, toFormat, provider, fallbackModelInfo, false, normalizedUpdatesChanged...)
+}
+
+// ApplyRequestThinkingWithExplicitModelInfoDoc applies request thinking onto doc
+// in place using modelInfo authoritatively unless request metadata already carries
+// a resolved model definition.
+func ApplyRequestThinkingWithExplicitModelInfoDoc(doc *ojson.Doc, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, fromFormat, toFormat, provider string, modelInfo *registry.ModelInfo, normalizedUpdatesChanged ...bool) error {
+	return applyRequestThinkingDoc(doc, req, opts, fromFormat, toFormat, provider, modelInfo, true, normalizedUpdatesChanged...)
+}
+
+func applyRequestThinkingDoc(doc *ojson.Doc, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, fromFormat, toFormat, provider string, modelInfoOverride *registry.ModelInfo, authoritativeOverride bool, normalizedUpdatesChanged ...bool) error {
 	if doc == nil {
 		return nil
 	}
@@ -82,8 +93,10 @@ func ApplyRequestThinkingWithModelInfoDoc(doc *ojson.Doc, req cliproxyexecutor.R
 	var err error
 	if modelInfo, ok := cliproxyauth.ResolvedModelInfo(req); ok {
 		err = thinking.ApplyThinkingWithModelInfoAndSummaryDoc(doc, source, req.Model, fromFormat, toFormat, provider, modelInfo, summaryConfig, normalizedUpdatesChanged...)
+	} else if authoritativeOverride && modelInfoOverride != nil {
+		err = thinking.ApplyThinkingWithModelInfoAndSummaryDoc(doc, source, req.Model, fromFormat, toFormat, provider, modelInfoOverride, summaryConfig, normalizedUpdatesChanged...)
 	} else {
-		err = thinking.ApplyThinkingWithFallbackModelInfoAndSummaryDoc(doc, source, req.Model, fromFormat, toFormat, provider, fallbackModelInfo, summaryConfig, normalizedUpdatesChanged...)
+		err = thinking.ApplyThinkingWithFallbackModelInfoAndSummaryDoc(doc, source, req.Model, fromFormat, toFormat, provider, modelInfoOverride, summaryConfig, normalizedUpdatesChanged...)
 	}
 	if err != nil {
 		return err
