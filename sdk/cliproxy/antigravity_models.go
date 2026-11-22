@@ -530,8 +530,11 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 					break
 				}
 			}
-			if allSupportWebSearch {
-				model.SupportsWebSearch = true
+			model.SupportsWebSearch = allSupportWebSearch
+			if !allSupportWebSearch && model.NativeCapabilities != nil && model.NativeCapabilities.WebSearch != nil {
+				copied := *model.NativeCapabilities
+				copied.WebSearch = nil
+				model.NativeCapabilities = &copied
 			}
 		}
 	}
