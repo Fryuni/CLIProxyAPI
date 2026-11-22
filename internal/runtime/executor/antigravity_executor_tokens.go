@@ -63,7 +63,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 	}
 
 	doc := ojson.NewDoc(payload)
-	if errThinking := helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier()); errThinking != nil {
+	if errThinking := applyAntigravityRequestThinkingDoc(doc, auth, baseModel, req, opts, from.String(), to.String(), e.Identifier()); errThinking != nil {
 		return cliproxyexecutor.Response{}, errThinking
 	}
 	e.obfuscateSensitiveWordsDoc(doc)

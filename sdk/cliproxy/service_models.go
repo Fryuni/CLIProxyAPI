@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -702,6 +703,9 @@ func cloneModelInfoForCatalogRoute(model *ModelInfo) ModelInfo {
 			capabilities.WebSearch = &webSearch
 		}
 		clone.NativeCapabilities = &capabilities
+	}
+	if len(model.GroupedLevelModelIDs) > 0 {
+		clone.GroupedLevelModelIDs = maps.Clone(model.GroupedLevelModelIDs)
 	}
 	return clone
 }

@@ -161,6 +161,94 @@ func TestPersistedAntigravityCapabilityHintsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseAntigravityGroupedModelsAndPersistence(t *testing.T) {
+	body := []byte(`{
+		"models": {
+			"gemini-4-neon-low": {},
+			"gemini-4-neon-medium": {},
+			"gemini-4-neon-high": {},
+			"gemini-4-neon-xhigh": {},
+			"claude-opus-5-5-low": {},
+			"claude-opus-5-5-high": {}
+		},
+		"groupedModels": {
+			"gemini-4-neon": {
+				"displayName": "Gemini 4 Neon",
+				"supportedThinkingLevels": [
+					{"thinkingDisplayName": "Low", "thinkingSuffix": "low"},
+					{"thinkingDisplayName": "Medium", "thinkingSuffix": "medium"},
+					{"thinkingDisplayName": "High", "thinkingSuffix": "high"},
+					{"thinkingDisplayName": "Extra High", "thinkingSuffix": "xhigh"},
+					{"thinkingDisplayName": "High Dup", "thinkingSuffix": "HIGH"}
+				]
+			},
+			"claude-opus-5-5": {
+				"displayName": "Claude Opus 5.5",
+				"supportedThinkingLevels": [
+					{"thinkingDisplayName": "Low", "thinkingSuffix": "low"},
+					{"thinkingDisplayName": "Medium", "thinkingSuffix": "medium"},
+					{"thinkingDisplayName": "High", "thinkingSuffix": "high"}
+				]
+			},
+			"unentitled-model": {
+				"displayName": "Unentitled",
+				"supportedThinkingLevels": [
+					{"thinkingDisplayName": "High", "thinkingSuffix": "high"}
+				]
+			}
+		}
+	}`)
+
+	hints, ok := ParseAntigravityModelCapabilityHints(body)
+	if !ok {
+		t.Fatal("expected groupedModels parse to succeed")
+	}
+	// Mutate buffer in place to verify strings.Clone safety.
+	for i := range body {
+		body[i] = 'X'
+	}
+
+	if len(hints.GroupedModels) != 2 {
+		t.Fatalf("got %d grouped models, want 2: %+v", len(hints.GroupedModels), hints.GroupedModels)
+	}
+	neon := hints.GroupedModels["gemini-4-neon"]
+	if neon.DisplayName != "Gemini 4 Neon" {
+		t.Errorf("neon DisplayName = %q, want %q", neon.DisplayName, "Gemini 4 Neon")
+	}
+	if !slices.Equal(neon.Levels, []string{"low", "medium", "high", "xhigh"}) {
+		t.Errorf("neon Levels = %v, want [low medium high xhigh]", neon.Levels)
+	}
+	opus := hints.GroupedModels["claude-opus-5-5"]
+	if !slices.Equal(opus.Levels, []string{"low", "high"}) {
+		t.Errorf("opus Levels = %v, want [low high] (unentitled medium filtered out)", opus.Levels)
+	}
+
+	serialized := BuildPersistedAntigravityCapabilityHints("proj-1", "https://daily-cloudcode-pa.googleapis.com", hints)
+	parsed, ok := ParsePersistedAntigravityCapabilityHints(map[string]any{
+		AntigravityPersistedHintsMetaKey: serialized,
+	}, "proj-1", "https://daily-cloudcode-pa.googleapis.com")
+	if !ok {
+		t.Fatal("expected persisted grouped models round-trip to succeed")
+	}
+	if !slices.Equal(parsed.GroupedModels["gemini-4-neon"].Levels, []string{"low", "medium", "high", "xhigh"}) {
+		t.Errorf("persisted neon Levels = %v, want [low medium high xhigh]", parsed.GroupedModels["gemini-4-neon"].Levels)
+	}
+	if parsed.GroupedModels["gemini-4-neon"].DisplayName != "Gemini 4 Neon" {
+		t.Errorf("persisted neon DisplayName = %q, want %q", parsed.GroupedModels["gemini-4-neon"].DisplayName, "Gemini 4 Neon")
+	}
+	if !slices.Equal(parsed.GroupedModels["claude-opus-5-5"].Levels, []string{"low", "high"}) {
+		t.Errorf("persisted opus Levels = %v, want [low high]", parsed.GroupedModels["claude-opus-5-5"].Levels)
+	}
+
+	// Malformed grouped_models should reject the persisted payload.
+	serialized["grouped_models"] = "bad-type"
+	if _, okBad := ParsePersistedAntigravityCapabilityHints(map[string]any{
+		AntigravityPersistedHintsMetaKey: serialized,
+	}, "proj-1", "https://daily-cloudcode-pa.googleapis.com"); okBad {
+		t.Error("expected malformed grouped_models to fail parsing")
+	}
+}
+
 func TestFetchAntigravityAvailableModels(t *testing.T) {
 	t.Run("successful probe", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

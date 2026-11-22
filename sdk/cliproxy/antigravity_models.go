@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,12 +129,18 @@ var (
 type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
-	ModelIDs map[string]struct{}
-	revision uint64
+	ModelIDs      map[string]struct{}
+	GroupedModels map[string]sdkauth.AntigravityGroupedModel
+	revision      uint64
 }
 
 func (h antigravityModelCapabilityHints) clone() antigravityModelCapabilityHints {
-	return antigravityModelCapabilityHints{WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs), ModelIDs: maps.Clone(h.ModelIDs), revision: h.revision}
+	return antigravityModelCapabilityHints{
+		WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs),
+		ModelIDs:          maps.Clone(h.ModelIDs),
+		GroupedModels:     sdkauth.CloneAntigravityGroupedModels(h.GroupedModels),
+		revision:          h.revision,
+	}
 }
 
 // antigravityCapabilityKey isolates catalogs by account, project, route and client
@@ -263,6 +270,7 @@ func buildPersistedAntigravityCapabilityHintsValue(project, endpoint string, hin
 	return sdkauth.BuildPersistedAntigravityCapabilityHints(project, endpoint, sdkauth.AntigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		GroupedModels:     hints.GroupedModels,
 	})
 }
 
@@ -274,6 +282,7 @@ func parsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedP
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		GroupedModels:     hints.GroupedModels,
 	}, true
 }
 
@@ -426,6 +435,7 @@ func (s *Service) probeAntigravityModelCapabilityHints(ctx context.Context, auth
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		GroupedModels:     hints.GroupedModels,
 	}, status
 }
 
@@ -494,6 +504,7 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		GroupedModels:     hints.GroupedModels,
 	}, true
 }
 
@@ -509,6 +520,13 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 		modelID := normalizeAntigravityFetchedModelID(model.ID)
 		if _, ok := hints.WebSearchModelIDs[modelID]; ok {
 			model.SupportsWebSearch = true
+			continue
+		}
+		for _, memberID := range model.GroupedLevelModelIDs {
+			if _, ok := hints.WebSearchModelIDs[normalizeAntigravityFetchedModelID(memberID)]; ok {
+				model.SupportsWebSearch = true
+				break
+			}
 		}
 	}
 	return models
@@ -548,15 +566,166 @@ func (s *Service) antigravityHomeEnabled() bool {
 }
 
 func filterAntigravityModels(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
-	filtered := make([]*ModelInfo, 0, len(models))
+	staticByID := make(map[string]*ModelInfo, len(models))
 	for _, model := range models {
-		if model != nil {
-			if _, ok := hints.ModelIDs[normalizeAntigravityFetchedModelID(model.ID)]; ok {
-				filtered = append(filtered, model)
+		if model == nil {
+			continue
+		}
+		if id := normalizeAntigravityFetchedModelID(model.ID); id != "" {
+			staticByID[id] = model
+		}
+	}
+
+	var (
+		grouped        []*ModelInfo
+		coveredMembers map[string]struct{}
+		presentIDs     map[string]struct{}
+	)
+	if len(hints.GroupedModels) > 0 && len(hints.ModelIDs) > 0 {
+		normalizedGroups := make(map[string]sdkauth.AntigravityGroupedModel, len(hints.GroupedModels))
+		groupIDs := make([]string, 0, len(hints.GroupedModels))
+		for rawGroupID, group := range hints.GroupedModels {
+			if groupID := normalizeAntigravityFetchedModelID(rawGroupID); groupID != "" {
+				if _, exists := normalizedGroups[groupID]; !exists {
+					groupIDs = append(groupIDs, groupID)
+				}
+				normalizedGroups[groupID] = group
+			}
+		}
+		slices.Sort(groupIDs)
+		grouped = make([]*ModelInfo, 0, len(groupIDs))
+		coveredMembers = make(map[string]struct{}, len(groupIDs)*4)
+		presentIDs = make(map[string]struct{}, len(groupIDs))
+		for _, groupID := range groupIDs {
+			group := normalizedGroups[groupID]
+			if len(group.Levels) == 0 {
+				continue
+			}
+			levels := make([]string, 0, len(group.Levels))
+			seenLevels := make(map[string]struct{}, len(group.Levels))
+			for _, rawLevel := range group.Levels {
+				level := normalizeAntigravityFetchedModelID(rawLevel)
+				if level == "" {
+					continue
+				}
+				if _, dup := seenLevels[level]; dup {
+					continue
+				}
+				if _, entitled := hints.ModelIDs[groupID+"-"+level]; !entitled {
+					continue
+				}
+				seenLevels[level] = struct{}{}
+				levels = append(levels, level)
+			}
+			if len(levels) == 0 {
+				continue
+			}
+			template := findAntigravityGroupedModelTemplate(staticByID, groupID, levels)
+			if template == nil {
+				continue
+			}
+			grouped = append(grouped, buildAntigravityGroupedModelInfo(template, groupID, group.DisplayName, levels))
+			presentIDs[groupID] = struct{}{}
+			for _, level := range levels {
+				coveredMembers[groupID+"-"+level] = struct{}{}
 			}
 		}
 	}
+
+	filtered := make([]*ModelInfo, 0, len(models)+len(grouped))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		id := normalizeAntigravityFetchedModelID(model.ID)
+		if _, ok := hints.ModelIDs[id]; !ok {
+			continue
+		}
+		if _, covered := coveredMembers[id]; covered {
+			continue
+		}
+		if _, exists := presentIDs[id]; exists {
+			continue
+		}
+		filtered = append(filtered, model)
+	}
+	filtered = append(filtered, grouped...)
 	return filtered
+}
+
+func findAntigravityGroupedModelTemplate(staticByID map[string]*ModelInfo, groupID string, levels []string) *ModelInfo {
+	for i := len(levels) - 1; i >= 0; i-- {
+		if tmpl := staticByID[groupID+"-"+levels[i]]; tmpl != nil {
+			return tmpl
+		}
+	}
+	// Fall back to other standard suffixes in the static catalog when the account
+	// is entitled to lower levels of a model whose static entry only lists a top tier.
+	for _, suffix := range []string{"xhigh", "high", "medium", "low", "max", "minimal"} {
+		if tmpl := staticByID[groupID+"-"+suffix]; tmpl != nil {
+			return tmpl
+		}
+	}
+	return nil
+}
+
+func buildAntigravityGroupedModelInfo(template *ModelInfo, groupID, displayName string, levels []string) *ModelInfo {
+	cloned := cloneModelInfoForCatalogRoute(template)
+	cloned.ID = groupID
+	cloned.Name = groupID
+	cloned.MetadataModelID = ""
+	if len(template.SupportedGenerationMethods) > 0 {
+		cloned.SupportedGenerationMethods = slices.Clone(template.SupportedGenerationMethods)
+	}
+	if len(template.SupportedParameters) > 0 {
+		cloned.SupportedParameters = slices.Clone(template.SupportedParameters)
+	}
+	if len(template.SupportedInputModalities) > 0 {
+		cloned.SupportedInputModalities = slices.Clone(template.SupportedInputModalities)
+	}
+	if len(template.SupportedOutputModalities) > 0 {
+		cloned.SupportedOutputModalities = slices.Clone(template.SupportedOutputModalities)
+	}
+	if template.Config != nil {
+		cfgCopy := *template.Config
+		if len(template.Config.OverrideHeader) > 0 {
+			cfgCopy.OverrideHeader = maps.Clone(template.Config.OverrideHeader)
+		}
+		cloned.Config = &cfgCopy
+	}
+	dn := strings.TrimSpace(displayName)
+	if dn == "" {
+		dn = stripAntigravityLevelDisplaySuffix(template.DisplayName)
+	}
+	if dn == "" {
+		dn = groupID
+	}
+	cloned.DisplayName = dn
+	cloned.Description = dn
+
+	var thinkingCopy registry.ThinkingSupport
+	if template.Thinking != nil {
+		thinkingCopy = *template.Thinking
+	}
+	thinkingCopy.Levels = slices.Clone(levels)
+	cloned.Thinking = &thinkingCopy
+
+	levelModels := make(map[string]string, len(levels))
+	for _, level := range levels {
+		levelModels[level] = groupID + "-" + level
+	}
+	cloned.GroupedLevelModelIDs = levelModels
+	return &cloned
+}
+
+func stripAntigravityLevelDisplaySuffix(displayName string) string {
+	trimmed := strings.TrimSpace(displayName)
+	for _, suffix := range []string{" (XHigh)", " (Extra High)", " (High)", " (Medium)", " (Low)", " (Minimal)", " (Max)"} {
+		if strings.HasSuffix(strings.ToLower(trimmed), strings.ToLower(suffix)) {
+			return strings.TrimSpace(trimmed[:len(trimmed)-len(suffix)])
+		}
+	}
+	return trimmed
 }
 
 func (s *Service) antigravityModelsForHints(auth *coreauth.Auth, hints antigravityModelCapabilityHints) []*ModelInfo {

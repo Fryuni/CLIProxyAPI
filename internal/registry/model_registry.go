@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -96,6 +97,11 @@ type ModelInfo struct {
 	// Thinking holds provider-specific reasoning/thinking budget capabilities.
 	// This is optional and currently used for Gemini thinking budget normalization.
 	Thinking *ThinkingSupport `json:"thinking,omitempty"`
+
+	// GroupedLevelModelIDs maps normalized thinking levels (e.g. "low", "high", "xhigh")
+	// to upstream model IDs (e.g. "gemini-4-neon-low") for grouped Antigravity models.
+	// It is internal and must not be exposed in model-list responses.
+	GroupedLevelModelIDs map[string]string `json:"-"`
 
 	// Config holds model-specific runtime overrides loaded from models.json.
 	Config *ModelConfig `json:"config,omitempty"`
@@ -890,6 +896,9 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 			copyThinking.Levels = append([]string(nil), model.Thinking.Levels...)
 		}
 		copyModel.Thinking = &copyThinking
+	}
+	if len(model.GroupedLevelModelIDs) > 0 {
+		copyModel.GroupedLevelModelIDs = maps.Clone(model.GroupedLevelModelIDs)
 	}
 	if model.Config != nil {
 		copyConfig := *model.Config

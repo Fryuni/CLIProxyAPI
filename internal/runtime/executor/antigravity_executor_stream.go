@@ -95,7 +95,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	}
 
 	doc := ojson.NewDoc(translated)
-	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier()); err != nil {
+	if err = applyAntigravityRequestThinkingDoc(doc, auth, baseModel, req, opts, from.String(), to.String(), e.Identifier()); err != nil {
 		return nil, err
 	}
 
