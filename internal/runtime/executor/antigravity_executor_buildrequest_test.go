@@ -14,6 +14,9 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/MoeForge/moego/regexp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/thinking/provider/antigravity"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -859,4 +862,296 @@ func TestAntigravityPrepareRequestAuth_SharedRefreshFailureMarksEachTracker(t *t
 	if !cliproxyexecutor.UpstreamAttempted(ctxB) {
 		t.Fatalf("request B tracker was not marked on shared upstream refresh failure")
 	}
+}
+
+func TestAntigravityGroupedModelUpstreamResolution(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	authID := "agy-grouped-routing-test"
+	prefixedAuthID := "agy-grouped-prefixed-routing-test"
+
+	reg.RegisterClient(authID, "antigravity", []*registry.ModelInfo{
+		{
+			ID:                  "gemini-4-neon",
+			MaxCompletionTokens: 65536,
+			Thinking: &registry.ThinkingSupport{
+				Min:            1,
+				Max:            65535,
+				DynamicAllowed: true,
+				Levels:         []string{"low", "medium", "high", "xhigh"},
+			},
+			GroupedLevelModelIDs: map[string]string{
+				"low":    "gemini-4-neon-low",
+				"medium": "gemini-4-neon-medium",
+				"high":   "gemini-4-neon-high",
+				"xhigh":  "gemini-4-neon-xhigh",
+			},
+		},
+		{
+			ID:                  "gemini-4-neon-xhigh",
+			MaxCompletionTokens: 65536,
+		},
+	})
+	reg.RegisterClient(prefixedAuthID, "antigravity", []*registry.ModelInfo{
+		{
+			ID:                  "agy/claude-opus-5-5",
+			MetadataModelID:     "claude-opus-5-5",
+			MaxCompletionTokens: 128000,
+			Thinking: &registry.ThinkingSupport{
+				Min:            1024,
+				Max:            64000,
+				ZeroAllowed:    true,
+				DynamicAllowed: true,
+				Levels:         []string{"low", "high"},
+			},
+			GroupedLevelModelIDs: map[string]string{
+				"low":  "claude-opus-5-5-low",
+				"high": "claude-opus-5-5-high",
+			},
+		},
+	})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+		reg.UnregisterClient(prefixedAuthID)
+	})
+
+	exec := &AntigravityExecutor{}
+	auth := &cliproxyauth.Auth{ID: authID, Metadata: map[string]any{"project_id": "proj-1"}}
+	prefixedAuth := &cliproxyauth.Auth{ID: prefixedAuthID, Metadata: map[string]any{"project_id": "proj-1"}}
+
+	cases := []struct {
+		name      string
+		auth      *cliproxyauth.Auth
+		modelName string
+		payload   string
+		wantModel string
+	}{
+		{
+			name:      "explicit thinkingLevel xhigh",
+			auth:      auth,
+			modelName: "gemini-4-neon",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"xhigh"}}}}`,
+			wantModel: "gemini-4-neon-xhigh",
+		},
+		{
+			name:      "explicit thinkingLevel low",
+			auth:      auth,
+			modelName: "gemini-4-neon",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`,
+			wantModel: "gemini-4-neon-low",
+		},
+		{
+			name:      "thinkingBudget maps to medium",
+			auth:      auth,
+			modelName: "gemini-4-neon",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingBudget":4096}}}}`,
+			wantModel: "gemini-4-neon-medium",
+		},
+		{
+			name:      "thinkingBudget maps to xhigh",
+			auth:      auth,
+			modelName: "gemini-4-neon",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingBudget":32000}}}}`,
+			wantModel: "gemini-4-neon-xhigh",
+		},
+		{
+			name:      "omitted thinkingConfig defaults to high",
+			auth:      auth,
+			modelName: "gemini-4-neon",
+			payload:   `{"request":{"contents":[]}}`,
+			wantModel: "gemini-4-neon-high",
+		},
+		{
+			name:      "thinkingLevel none selects lowest level",
+			auth:      auth,
+			modelName: "gemini-4-neon",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"none"}}}}`,
+			wantModel: "gemini-4-neon-low",
+		},
+		{
+			name:      "explicit suffixed model ID passes through unchanged",
+			auth:      auth,
+			modelName: "gemini-4-neon-xhigh",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`,
+			wantModel: "gemini-4-neon-xhigh",
+		},
+		{
+			name:      "force-model-prefix lookup via MetadataModelID",
+			auth:      prefixedAuth,
+			modelName: "claude-opus-5-5",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`,
+			wantModel: "claude-opus-5-5-low",
+		},
+		{
+			name:      "unsupported level clamps to nearest supported level",
+			auth:      prefixedAuth,
+			modelName: "claude-opus-5-5",
+			payload:   `{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"xhigh"}}}}`,
+			wantModel: "claude-opus-5-5-high",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			httpReq, err := exec.buildRequest(context.Background(), tc.auth, "token", tc.modelName, []byte(tc.payload), false, "", "https://example.com")
+			if err != nil {
+				t.Fatalf("buildRequest error: %v", err)
+			}
+			body := requestBody(t, httpReq)
+			if got, _ := body["model"].(string); got != tc.wantModel {
+				t.Fatalf("upstream model = %q, want %q", got, tc.wantModel)
+			}
+		})
+	}
+
+	t.Run("payload finalizer remains final barrier after grouped model rewrite", func(t *testing.T) {
+		cfg := &config.Config{
+			Payload: config.PayloadConfig{
+				Override: []config.PayloadRule{
+					{
+						Models: []config.PayloadModelRule{{Name: "gemini-4-neon", Protocol: "antigravity"}},
+						Params: map[string]any{"model": "custom-override-model"},
+					},
+				},
+			},
+		}
+		raw := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`)
+		req := cliproxyexecutor.Request{Model: "gemini-4-neon", Payload: raw}
+		ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", "gemini-4-neon", "antigravity", "", raw, req, cliproxyexecutor.Options{}))
+
+		httpReq, err := exec.buildRequest(ctx, auth, "token", "gemini-4-neon", raw, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequest error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "custom-override-model" {
+			t.Fatalf("upstream model = %q, want payload override custom-override-model", got)
+		}
+	})
+
+	t.Run("payload finalizer thinking override re-routes grouped upstream model", func(t *testing.T) {
+		cfg := &config.Config{
+			Payload: config.PayloadConfig{
+				Override: []config.PayloadRule{
+					{
+						Models: []config.PayloadModelRule{{Name: "gemini-4-neon", Protocol: "antigravity"}},
+						Params: map[string]any{"generationConfig.thinkingConfig.thinkingLevel": "xhigh"},
+					},
+				},
+			},
+		}
+		raw := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`)
+		req := cliproxyexecutor.Request{Model: "gemini-4-neon", Payload: raw}
+		ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", "gemini-4-neon", "antigravity", "request", raw, req, cliproxyexecutor.Options{}))
+
+		httpReq, err := exec.buildRequest(ctx, auth, "token", "gemini-4-neon", raw, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequest error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "gemini-4-neon-xhigh" {
+			t.Fatalf("upstream model = %q, want gemini-4-neon-xhigh after payload thinkingLevel override", got)
+		}
+	})
+
+	t.Run("payload finalizer model filter is not restored for grouped model", func(t *testing.T) {
+		cfg := &config.Config{
+			Payload: config.PayloadConfig{
+				Filter: []config.PayloadFilterRule{
+					{
+						Models: []config.PayloadModelRule{{Name: "gemini-4-neon", Protocol: "antigravity"}},
+						Params: []string{"model"},
+					},
+				},
+			},
+		}
+		raw := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`)
+		req := cliproxyexecutor.Request{Model: "gemini-4-neon", Payload: raw}
+		ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", "gemini-4-neon", "antigravity", "", raw, req, cliproxyexecutor.Options{}))
+
+		httpReq, err := exec.buildRequest(ctx, auth, "token", "gemini-4-neon", raw, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequest error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if _, exists := body["model"]; exists {
+			t.Fatalf("filtered model field should not be restored, got %v", body["model"])
+		}
+	})
+
+	t.Run("payload finalizer same-value model override is preserved even when thinkingLevel changes", func(t *testing.T) {
+		cfg := &config.Config{
+			Payload: config.PayloadConfig{
+				Override: []config.PayloadRule{
+					{
+						Models: []config.PayloadModelRule{{Name: "gemini-4-neon", Protocol: "antigravity"}},
+						Params: map[string]any{
+							"model": "gemini-4-neon-low",
+							"request.generationConfig.thinkingConfig.thinkingLevel": "xhigh",
+						},
+					},
+				},
+			},
+		}
+		raw := []byte(`{"request":{"generationConfig":{"thinkingConfig":{"thinkingLevel":"low"}}}}`)
+		req := cliproxyexecutor.Request{Model: "gemini-4-neon", Payload: raw}
+		ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", "gemini-4-neon", "antigravity", "", raw, req, cliproxyexecutor.Options{}))
+
+		httpReq, err := exec.buildRequest(ctx, auth, "token", "gemini-4-neon", raw, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequest error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "gemini-4-neon-low" {
+			t.Fatalf("explicitly configured model was overwritten: got %q, want gemini-4-neon-low", got)
+		}
+	})
+
+	t.Run("thinking pipeline + buildRequestDoc clamps prefixed Claude grouped model to account levels", func(t *testing.T) {
+		doc := ojson.NewDoc([]byte(`{"request":{"contents":[]}}`))
+		req := cliproxyexecutor.Request{
+			Model:   "claude-opus-5-5(xhigh)",
+			Payload: []byte(`{"model":"claude-opus-5-5(xhigh)"}`),
+		}
+		if err := applyAntigravityRequestThinkingDoc(doc, prefixedAuth, "claude-opus-5-5", req, cliproxyexecutor.Options{}, "openai", "antigravity", "antigravity"); err != nil {
+			t.Fatalf("applyAntigravityRequestThinkingDoc error: %v", err)
+		}
+		if gotLevel := doc.Get("request.generationConfig.thinkingConfig.thinkingLevel").String(); gotLevel != "high" {
+			t.Fatalf("thinkingLevel = %q, want high (clamped from xhigh to account levels)", gotLevel)
+		}
+		httpReq, _, err := exec.buildRequestDoc(context.Background(), prefixedAuth, "token", "claude-opus-5-5", doc, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequestDoc error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "claude-opus-5-5-high" {
+			t.Fatalf("upstream model = %q, want claude-opus-5-5-high", got)
+		}
+	})
+
+	t.Run("grouped-model thinking preserves reasoning summary includeThoughts intent", func(t *testing.T) {
+		doc := ojson.NewDoc([]byte(`{"request":{"contents":[]}}`))
+		origPayload := []byte(`{"model":"gemini-4-neon","reasoning":{"effort":"low","summary":"detailed"},"input":"hi"}`)
+		req := cliproxyexecutor.Request{
+			Model:   "gemini-4-neon",
+			Payload: []byte(`{"model":"gemini-4-neon","reasoning":{"effort":"low"},"input":"hi"}`),
+		}
+		opts := cliproxyexecutor.Options{
+			OriginalRequest: origPayload,
+		}
+		if err := applyAntigravityRequestThinkingDoc(doc, auth, "gemini-4-neon", req, opts, "openai-response", "antigravity", "antigravity"); err != nil {
+			t.Fatalf("applyAntigravityRequestThinkingDoc error: %v", err)
+		}
+		includeThoughts := doc.Get("request.generationConfig.thinkingConfig.includeThoughts")
+		if !includeThoughts.Exists() || !includeThoughts.Bool() {
+			t.Fatalf("expected includeThoughts=true to be preserved on grouped model, got doc=%s", doc.String())
+		}
+		httpReq, _, err := exec.buildRequestDoc(context.Background(), auth, "token", "gemini-4-neon", doc, false, "", "https://example.com")
+		if err != nil {
+			t.Fatalf("buildRequestDoc error: %v", err)
+		}
+		body := requestBody(t, httpReq)
+		if got, _ := body["model"].(string); got != "gemini-4-neon-low" {
+			t.Fatalf("upstream model = %q, want gemini-4-neon-low", got)
+		}
+	})
 }

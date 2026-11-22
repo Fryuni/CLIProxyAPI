@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1010,4 +1011,304 @@ func TestAntigravityConcurrentAuthUpdatePreservesBothNewTokenAndPersistedHints(t
 	if _, ok := loadedHints.ModelIDs["gemini-3.1-flash-lite"]; !ok || len(loadedHints.ModelIDs) != 2 {
 		t.Fatalf("expected version 2 hints to survive preemption and stale-snapshot Update, got %v", loadedHints.ModelIDs)
 	}
+}
+
+func TestAntigravityGroupedModelsRegistrationAndTransforms(t *testing.T) {
+	resetAntigravityCapabilityCache()
+	t.Cleanup(resetAntigravityCapabilityCache)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"models": {
+				"gemini-4-neon-low": {"supportsWebSearch": true},
+				"gemini-4-neon-medium": {"supportsWebSearch": true},
+				"gemini-4-neon-high": {"supportsWebSearch": true},
+				"gemini-4-neon-xhigh": {"supportsWebSearch": true},
+				"claude-opus-5-5-low": {},
+				"claude-opus-5-5-high": {},
+				"gemini-3.8-flash-tiered": {"supportsWebSearch": true},
+				"gemini-4-argon-high": {"supportsWebSearch": true}
+			},
+			"webSearchModelIds": [
+				"gemini-4-neon-low",
+				"gemini-4-neon-medium",
+				"gemini-4-neon-high",
+				"gemini-4-neon-xhigh",
+				"gemini-3.8-flash-tiered",
+				"gemini-4-argon-high"
+			],
+			"groupedModels": {
+				"gemini-4-neon": {
+					"displayName": "Gemini 4 Neon",
+					"supportedThinkingLevels": [
+						{"thinkingDisplayName": "Low", "thinkingSuffix": "low"},
+						{"thinkingDisplayName": "Medium", "thinkingSuffix": "medium"},
+						{"thinkingDisplayName": "High", "thinkingSuffix": "high"},
+						{"thinkingDisplayName": "Extra High", "thinkingSuffix": "xhigh"}
+					]
+				},
+				"claude-opus-5-5": {
+					"displayName": "Claude Opus 5.5",
+					"supportedThinkingLevels": [
+						{"thinkingDisplayName": "Low", "thinkingSuffix": "low"},
+						{"thinkingDisplayName": "High", "thinkingSuffix": "high"}
+					]
+				}
+			}
+		}`))
+	}))
+	defer server.Close()
+
+	t.Run("exposes clean unified models and omits covered suffixed members while keeping uncovered models", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:       "agy-grouped-basic",
+			Provider: "antigravity",
+			Metadata: map[string]any{
+				"access_token": "token-grouped-basic",
+				"project_id":   "proj-grouped-basic",
+				"base_url":     server.URL,
+			},
+		}
+		t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+		svc := &Service{cfg: &config.Config{}}
+		svc.registerModelsForAuth(t.Context(), auth)
+		svc.WaitAntigravityProbes()
+
+		waitForAntigravityClientModel(t, auth.ID, "gemini-4-neon")
+		models := GlobalModelRegistry().GetModelsForClient(auth.ID)
+		byID := make(map[string]*registry.ModelInfo, len(models))
+		for _, m := range models {
+			byID[m.ID] = m
+		}
+
+		// Suffixed members covered by a synthesized grouped model must not be exposed.
+		if byID["gemini-4-neon-xhigh"] != nil {
+			t.Fatal("expected covered gemini-4-neon-xhigh to be omitted from catalog")
+		}
+		if byID["claude-opus-5-5-high"] != nil {
+			t.Fatal("expected covered claude-opus-5-5-high to be omitted from catalog")
+		}
+
+		// Models not mapped by any grouped model + suffix must remain in the catalog.
+		if byID["gemini-3.8-flash-tiered"] == nil {
+			t.Fatal("expected ungrouped gemini-3.8-flash-tiered to remain registered")
+		}
+		if byID["gemini-4-argon-high"] == nil {
+			t.Fatal("expected suffixed gemini-4-argon-high (not in groupedModels) to remain registered")
+		}
+
+		// Synthesized unified models expose selectable levels and upstream mapping.
+		neon := byID["gemini-4-neon"]
+		if neon == nil {
+			t.Fatal("expected unified gemini-4-neon to be registered")
+		}
+		if neon.MetadataModelID != "" {
+			t.Errorf("neon MetadataModelID = %q, want empty", neon.MetadataModelID)
+		}
+		if neon.DisplayName != "Gemini 4 Neon" {
+			t.Errorf("neon DisplayName = %q, want %q", neon.DisplayName, "Gemini 4 Neon")
+		}
+		if neon.Thinking == nil || !slices.Equal(neon.Thinking.Levels, []string{"low", "medium", "high", "xhigh"}) {
+			t.Errorf("neon Thinking.Levels = %v, want [low medium high xhigh]", neon.Thinking)
+		}
+		if !neon.SupportsWebSearch {
+			t.Error("expected neon SupportsWebSearch to be true")
+		}
+		if got := neon.GroupedLevelModelIDs["xhigh"]; got != "gemini-4-neon-xhigh" {
+			t.Errorf("neon GroupedLevelModelIDs[xhigh] = %q, want gemini-4-neon-xhigh", got)
+		}
+		if got := neon.GroupedLevelModelIDs["low"]; got != "gemini-4-neon-low" {
+			t.Errorf("neon GroupedLevelModelIDs[low] = %q, want gemini-4-neon-low", got)
+		}
+
+		opus := byID["claude-opus-5-5"]
+		if opus == nil {
+			t.Fatal("expected unified claude-opus-5-5 to be registered")
+		}
+		if opus.Thinking == nil || !slices.Equal(opus.Thinking.Levels, []string{"low", "high"}) {
+			t.Errorf("opus Thinking.Levels = %v, want [low high]", opus.Thinking)
+		}
+		if got := opus.GroupedLevelModelIDs["low"]; got != "claude-opus-5-5-low" {
+			t.Errorf("opus GroupedLevelModelIDs[low] = %q, want claude-opus-5-5-low", got)
+		}
+	})
+
+	t.Run("preserves grouped level mappings across aliases, prefixes, and exclusions", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:       "agy-grouped-prefixed",
+			Provider: "antigravity",
+			Prefix:   "agy",
+			Metadata: map[string]any{
+				"access_token": "token-grouped-prefixed",
+				"project_id":   "proj-grouped-prefixed",
+				"base_url":     server.URL,
+			},
+		}
+		t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+		cfg := &config.Config{
+			SDKConfig: config.SDKConfig{ForceModelPrefix: true},
+			OAuthExcludedModels: map[string][]string{
+				"antigravity": {"claude-opus-5-5"},
+			},
+			OAuthModelAlias: map[string][]config.OAuthModelAlias{
+				"antigravity": {
+					{Name: "gemini-4-neon", Alias: "neon-custom", Fork: true},
+				},
+			},
+		}
+		svc := &Service{cfg: cfg}
+		svc.registerModelsForAuth(t.Context(), auth)
+		svc.WaitAntigravityProbes()
+
+		waitForAntigravityClientModel(t, auth.ID, "agy/gemini-4-neon")
+		models := GlobalModelRegistry().GetModelsForClient(auth.ID)
+		byID := make(map[string]*registry.ModelInfo, len(models))
+		for _, m := range models {
+			byID[m.ID] = m
+		}
+
+		if byID["agy/claude-opus-5-5"] != nil {
+			t.Error("expected excluded claude-opus-5-5 not to be registered")
+		}
+		if byID["agy/gemini-4-neon-xhigh"] != nil {
+			t.Error("expected covered gemini-4-neon-xhigh not to be registered")
+		}
+		if byID["agy/gemini-4-argon-high"] == nil {
+			t.Error("expected uncovered gemini-4-argon-high to be registered with prefix")
+		}
+		prefixedNeon := byID["agy/gemini-4-neon"]
+		if prefixedNeon == nil {
+			t.Fatal("expected agy/gemini-4-neon to be registered")
+		}
+		if prefixedNeon.MetadataModelID != "gemini-4-neon" {
+			t.Errorf("prefixedNeon MetadataModelID = %q, want gemini-4-neon", prefixedNeon.MetadataModelID)
+		}
+		if prefixedNeon.GroupedLevelModelIDs["medium"] != "gemini-4-neon-medium" {
+			t.Errorf("prefixedNeon GroupedLevelModelIDs[medium] = %q, want gemini-4-neon-medium", prefixedNeon.GroupedLevelModelIDs["medium"])
+		}
+
+		aliasedNeon := byID["agy/neon-custom"]
+		if aliasedNeon == nil {
+			t.Fatal("expected agy/neon-custom alias to be registered")
+		}
+		if aliasedNeon.MetadataModelID != "gemini-4-neon" {
+			t.Errorf("aliasedNeon MetadataModelID = %q, want gemini-4-neon", aliasedNeon.MetadataModelID)
+		}
+		if aliasedNeon.GroupedLevelModelIDs["xhigh"] != "gemini-4-neon-xhigh" {
+			t.Errorf("aliasedNeon GroupedLevelModelIDs[xhigh] = %q, want gemini-4-neon-xhigh", aliasedNeon.GroupedLevelModelIDs["xhigh"])
+		}
+	})
+
+	t.Run("excludes individual grouped levels and drops groups when all levels are excluded", func(t *testing.T) {
+		auth := &coreauth.Auth{
+			ID:       "agy-grouped-level-excluded",
+			Provider: "antigravity",
+			Metadata: map[string]any{
+				"access_token": "token-grouped-level-excluded",
+				"project_id":   "proj-grouped-level-excluded",
+				"base_url":     server.URL,
+			},
+		}
+		t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+		cfg := &config.Config{
+			OAuthExcludedModels: map[string][]string{
+				"antigravity": {"gemini-4-neon-xhigh", "claude-opus-5-5-*"},
+			},
+		}
+		svc := &Service{cfg: cfg}
+		svc.registerModelsForAuth(t.Context(), auth)
+		svc.WaitAntigravityProbes()
+
+		waitForAntigravityClientModel(t, auth.ID, "gemini-4-neon")
+		models := GlobalModelRegistry().GetModelsForClient(auth.ID)
+		byID := make(map[string]*registry.ModelInfo, len(models))
+		for _, m := range models {
+			byID[m.ID] = m
+		}
+
+		neon := byID["gemini-4-neon"]
+		if neon == nil {
+			t.Fatal("expected gemini-4-neon to remain registered with non-excluded levels")
+		}
+		if neon.Thinking == nil || !slices.Equal(neon.Thinking.Levels, []string{"low", "medium", "high"}) {
+			t.Errorf("neon Thinking.Levels = %v, want [low medium high]", neon.Thinking)
+		}
+		if _, hasXHigh := neon.GroupedLevelModelIDs["xhigh"]; hasXHigh {
+			t.Errorf("excluded level xhigh must not remain in GroupedLevelModelIDs: %v", neon.GroupedLevelModelIDs)
+		}
+		if byID["gemini-4-neon-xhigh"] != nil {
+			t.Error("excluded gemini-4-neon-xhigh must not be exposed as a standalone model")
+		}
+		if byID["claude-opus-5-5"] != nil {
+			t.Error("expected claude-opus-5-5 to be dropped when all of its levels are excluded")
+		}
+		if byID["claude-opus-5-5-high"] != nil {
+			t.Error("excluded claude-opus-5-5-high must not be exposed")
+		}
+	})
+
+	t.Run("clears inherited web search flags when any grouped level lacks webSearchModelIds", func(t *testing.T) {
+		partialServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{
+				"models": {
+					"gemini-4-neon-low": {},
+					"gemini-4-neon-xhigh": {}
+				},
+				"webSearchModelIds": [
+					"gemini-4-neon-xhigh"
+				],
+				"groupedModels": {
+					"gemini-4-neon": {
+						"displayName": "Gemini 4 Neon",
+						"supportedThinkingLevels": [
+							{"thinkingDisplayName": "Low", "thinkingSuffix": "low"},
+							{"thinkingDisplayName": "Extra High", "thinkingSuffix": "xhigh"}
+						]
+					}
+				}
+			}`))
+		}))
+		defer partialServer.Close()
+
+		auth := &coreauth.Auth{
+			ID:       "agy-grouped-partial-websearch",
+			Provider: "antigravity",
+			Metadata: map[string]any{
+				"access_token": "token-grouped-partial-websearch",
+				"project_id":   "proj-grouped-partial-websearch",
+				"base_url":     partialServer.URL,
+			},
+		}
+		t.Cleanup(func() { GlobalModelRegistry().UnregisterClient(auth.ID) })
+
+		svc := &Service{cfg: &config.Config{}}
+		svc.registerModelsForAuth(t.Context(), auth)
+		svc.WaitAntigravityProbes()
+
+		waitForAntigravityClientModel(t, auth.ID, "gemini-4-neon")
+		models := GlobalModelRegistry().GetModelsForClient(auth.ID)
+		var neon *registry.ModelInfo
+		for _, m := range models {
+			if m != nil && m.ID == "gemini-4-neon" {
+				neon = m
+				break
+			}
+		}
+		if neon == nil {
+			t.Fatal("expected gemini-4-neon to be registered")
+		}
+		if neon.SupportsWebSearch {
+			t.Error("expected neon.SupportsWebSearch to be false when not all grouped levels support web search")
+		}
+		if neon.NativeCapabilities != nil && neon.NativeCapabilities.WebSearch != nil && *neon.NativeCapabilities.WebSearch {
+			t.Error("expected inherited NativeCapabilities.WebSearch=true to be cleared when not all grouped levels support web search")
+		}
+	})
 }

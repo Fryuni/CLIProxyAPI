@@ -96,7 +96,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	doc := ojson.NewDoc(translated)
-	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier()); err != nil {
+	if err = applyAntigravityRequestThinkingDoc(doc, auth, baseModel, req, opts, from.String(), to.String(), e.Identifier()); err != nil {
 		return resp, err
 	}
 
@@ -338,7 +338,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	}
 
 	doc := ojson.NewDoc(translated)
-	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier()); err != nil {
+	if err = applyAntigravityRequestThinkingDoc(doc, auth, baseModel, req, opts, from.String(), to.String(), e.Identifier()); err != nil {
 		return resp, err
 	}
 

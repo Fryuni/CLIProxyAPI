@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,8 +19,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -64,14 +67,24 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	if errProject != nil {
 		return nil, nil, errProject
 	}
-	geminiToAntigravityDocForAuth(doc, modelName, projectID, antigravityAuthID(auth), derivedSessionIDs...)
+	modelInfo := resolveAntigravityClientModelInfo(auth, modelName)
+	var groupedLevels map[string]string
+	if modelInfo != nil && len(modelInfo.GroupedLevelModelIDs) > 0 {
+		groupedLevels = modelInfo.GroupedLevelModelIDs
+	}
+	upstreamModel := resolveAntigravityGroupedUpstreamModel(modelName, groupedLevels, doc)
+	geminiToAntigravityDocForAuth(doc, upstreamModel, projectID, antigravityAuthID(auth), derivedSessionIDs...)
 	promptStructuredOutput := helps.PrepareAntigravityClaudeStructuredOutputDoc(modelName, doc)
 
 	// Cap maxOutputTokens to model's max_completion_tokens from registry
 	if maxOut := doc.Get("request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == ojson.Number {
-		if modelInfo := registry.LookupModelInfo(modelName, "antigravity"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
-			if int(maxOut.Int()) > modelInfo.MaxCompletionTokens {
-				_ = doc.Set("request.generationConfig.maxOutputTokens", modelInfo.MaxCompletionTokens)
+		capInfo := modelInfo
+		if capInfo == nil {
+			capInfo = registry.LookupModelInfo(modelName, "antigravity")
+		}
+		if capInfo != nil && capInfo.MaxCompletionTokens > 0 {
+			if int(maxOut.Int()) > capInfo.MaxCompletionTokens {
+				_ = doc.Set("request.generationConfig.maxOutputTokens", capInfo.MaxCompletionTokens)
 			}
 		}
 	}
@@ -90,7 +103,18 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	}
 
 	applyAntigravityNativeSignatureReplayIfNeededDoc(modelName, doc)
-	helps.FinalizePayloadDoc(ctx, doc)
+	if len(groupedLevels) > 0 {
+		helps.FinalizePayloadDocWithReconcile(ctx, doc, []string{"model"}, func(d *ojson.Doc, touched map[string]bool) {
+			if touched["model"] {
+				return
+			}
+			if postUpstream := resolveAntigravityGroupedUpstreamModel(modelName, groupedLevels, d); postUpstream != upstreamModel {
+				_ = d.Set("model", postUpstream)
+			}
+		})
+	} else {
+		helps.FinalizePayloadDoc(ctx, doc)
+	}
 	finalPayload := doc.Bytes()
 	var (
 		bodyReader io.Reader = bytes.NewReader(finalPayload)
@@ -726,6 +750,156 @@ func antigravityAuthID(auth *cliproxyauth.Auth) string {
 		return ""
 	}
 	return strings.TrimSpace(auth.ID)
+}
+
+var (
+	antigravityThinkingLevelOrder        = []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+	antigravityDefaultThinkingLevelOrder = []string{"high", "medium", "xhigh", "low", "minimal", "max"}
+)
+
+func resolveAntigravityClientModelInfo(auth *cliproxyauth.Auth, modelName string) *registry.ModelInfo {
+	target := strings.TrimSpace(modelName)
+	if target == "" {
+		return nil
+	}
+	reg := registry.GetGlobalRegistry()
+	if auth != nil && strings.TrimSpace(auth.ID) != "" {
+		var aliasMatch *registry.ModelInfo
+		for _, m := range reg.GetModelsForClient(auth.ID) {
+			if m == nil {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(m.ID), target) {
+				return m
+			}
+			if aliasMatch == nil && strings.EqualFold(strings.TrimSpace(m.MetadataModelID), target) {
+				aliasMatch = m
+			}
+		}
+		if aliasMatch != nil {
+			return aliasMatch
+		}
+	}
+	return reg.GetModelInfo(target, "antigravity")
+}
+
+func applyAntigravityRequestThinkingDoc(doc *ojson.Doc, auth *cliproxyauth.Auth, baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, fromFormat, toFormat, provider string) error {
+	modelInfo := resolveAntigravityClientModelInfo(auth, baseModel)
+	if modelInfo != nil && len(modelInfo.GroupedLevelModelIDs) > 0 {
+		thinkingInfo := *modelInfo
+		// Keep the canonical base model ID so Claude-specific budget normalization
+		// still applies when the auth only registered an alias or prefixed route.
+		if strings.TrimSpace(baseModel) != "" {
+			thinkingInfo.ID = strings.TrimSpace(baseModel)
+		}
+		return helps.ApplyRequestThinkingWithExplicitModelInfoDoc(doc, req, opts, fromFormat, toFormat, provider, &thinkingInfo)
+	}
+	return helps.ApplyRequestThinkingWithModelInfoDoc(doc, req, opts, fromFormat, toFormat, provider, modelInfo)
+}
+
+func resolveAntigravityGroupedUpstreamModel(modelName string, groupedLevels map[string]string, doc *ojson.Doc) string {
+	if len(groupedLevels) == 0 {
+		return modelName
+	}
+	if doc != nil {
+		for _, path := range []string{
+			"request.generationConfig.thinkingConfig.thinkingLevel",
+			"request.generationConfig.thinkingConfig.thinking_level",
+		} {
+			if res := doc.Get(path); res.Exists() && res.Type == ojson.String {
+				level := strings.ToLower(strings.TrimSpace(res.String()))
+				if level == "" {
+					continue
+				}
+				if upstream := strings.TrimSpace(groupedLevels[level]); upstream != "" {
+					return upstream
+				}
+				if level == "none" {
+					if lowest := pickAntigravityGroupedModelInOrder(groupedLevels, antigravityThinkingLevelOrder); lowest != "" {
+						return lowest
+					}
+				} else if level != "auto" {
+					if nearest := pickNearestAntigravityGroupedModel(groupedLevels, level); nearest != "" {
+						return nearest
+					}
+				}
+				break
+			}
+		}
+		for _, path := range []string{
+			"request.generationConfig.thinkingConfig.thinkingBudget",
+			"request.generationConfig.thinkingConfig.thinking_budget",
+		} {
+			if res := doc.Get(path); res.Exists() && res.Type == ojson.Number {
+				budget := int(res.Int())
+				if budget == 0 {
+					if lowest := pickAntigravityGroupedModelInOrder(groupedLevels, antigravityThinkingLevelOrder); lowest != "" {
+						return lowest
+					}
+				} else if budget > 0 {
+					if derived, ok := thinking.ConvertBudgetToLevel(budget); ok {
+						if upstream := strings.TrimSpace(groupedLevels[derived]); upstream != "" {
+							return upstream
+						}
+						if nearest := pickNearestAntigravityGroupedModel(groupedLevels, derived); nearest != "" {
+							return nearest
+						}
+					}
+				}
+				break
+			}
+		}
+	}
+	if fallback := pickAntigravityGroupedModelInOrder(groupedLevels, antigravityDefaultThinkingLevelOrder); fallback != "" {
+		return fallback
+	}
+	return modelName
+}
+
+func pickAntigravityGroupedModelInOrder(groupedLevels map[string]string, order []string) string {
+	for _, level := range order {
+		if upstream := strings.TrimSpace(groupedLevels[level]); upstream != "" {
+			return upstream
+		}
+	}
+	keys := make([]string, 0, len(groupedLevels))
+	for level, upstream := range groupedLevels {
+		if strings.TrimSpace(upstream) != "" {
+			keys = append(keys, level)
+		}
+	}
+	slices.Sort(keys)
+	if len(keys) > 0 {
+		return strings.TrimSpace(groupedLevels[keys[0]])
+	}
+	return ""
+}
+
+func pickNearestAntigravityGroupedModel(groupedLevels map[string]string, target string) string {
+	targetIdx := slices.Index(antigravityThinkingLevelOrder, target)
+	if targetIdx < 0 {
+		return pickAntigravityGroupedModelInOrder(groupedLevels, antigravityDefaultThinkingLevelOrder)
+	}
+	bestUpstream := ""
+	bestDist := len(antigravityThinkingLevelOrder) + 1
+	for idx, level := range antigravityThinkingLevelOrder {
+		upstream := strings.TrimSpace(groupedLevels[level])
+		if upstream == "" {
+			continue
+		}
+		dist := idx - targetIdx
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist < bestDist {
+			bestDist = dist
+			bestUpstream = upstream
+		}
+	}
+	if bestUpstream != "" {
+		return bestUpstream
+	}
+	return pickAntigravityGroupedModelInOrder(groupedLevels, antigravityDefaultThinkingLevelOrder)
 }
 
 func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, derivedSessionIDs ...string) {

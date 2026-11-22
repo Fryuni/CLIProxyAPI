@@ -38,11 +38,36 @@ const (
 	AntigravityProbeStatusForbidden
 )
 
-// AntigravityModelCapabilityHints holds normalized per-account model IDs and web-search capability IDs.
+// AntigravityGroupedModel describes a grouped Antigravity model family whose
+// upstream model IDs are suffixed by thinking level (e.g. "<base>-<level>").
+type AntigravityGroupedModel struct {
+	DisplayName string
+	// Levels lists normalized supported thinking suffixes in upstream order.
+	Levels []string
+}
+
+// AntigravityModelCapabilityHints holds normalized per-account model IDs, web-search capability IDs,
+// and grouped thinking-level model families.
 type AntigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
-	ModelIDs map[string]struct{}
+	ModelIDs      map[string]struct{}
+	GroupedModels map[string]AntigravityGroupedModel
+}
+
+// CloneAntigravityGroupedModels returns a deep copy of a grouped-model map.
+func CloneAntigravityGroupedModels(in map[string]AntigravityGroupedModel) map[string]AntigravityGroupedModel {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]AntigravityGroupedModel, len(in))
+	for id, group := range in {
+		out[id] = AntigravityGroupedModel{
+			DisplayName: group.DisplayName,
+			Levels:      slices.Clone(group.Levels),
+		}
+	}
+	return out
 }
 
 // Clone returns a deep copy of the capability hints.
@@ -50,6 +75,7 @@ func (h AntigravityModelCapabilityHints) Clone() AntigravityModelCapabilityHints
 	return AntigravityModelCapabilityHints{
 		WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs),
 		ModelIDs:          maps.Clone(h.ModelIDs),
+		GroupedModels:     CloneAntigravityGroupedModels(h.GroupedModels),
 	}
 }
 
@@ -252,9 +278,64 @@ func ParseAntigravityModelCapabilityHints(body []byte) (AntigravityModelCapabili
 		}
 	}
 
+	groupedResult := top.Get("groupedModels")
+	var groupedModels map[string]AntigravityGroupedModel
+	if groupedResult.Exists() && groupedResult.Type != ojson.Null {
+		if !groupedResult.IsObject() {
+			return AntigravityModelCapabilityHints{}, false
+		}
+		groupMap := groupedResult.Map()
+		if len(groupMap) > antigravityMaxCatalogModels {
+			return AntigravityModelCapabilityHints{}, false
+		}
+		for rawGroupID, rawEntry := range groupMap {
+			groupID := NormalizeAntigravityModelID(rawGroupID)
+			if groupID == "" || !rawEntry.IsObject() {
+				continue
+			}
+			levelsRes := rawEntry.Get("supportedThinkingLevels")
+			if !levelsRes.IsArray() {
+				continue
+			}
+			levelItems := levelsRes.Array()
+			levels := make([]string, 0, len(levelItems))
+			seenLevels := make(map[string]struct{}, len(levelItems))
+			for _, item := range levelItems {
+				if !item.IsObject() {
+					continue
+				}
+				suffix := NormalizeAntigravityModelID(item.Get("thinkingSuffix").String())
+				if suffix == "" {
+					continue
+				}
+				if _, dup := seenLevels[suffix]; dup {
+					continue
+				}
+				if modelIDs != nil {
+					if _, entitled := modelIDs[groupID+"-"+suffix]; !entitled {
+						continue
+					}
+				}
+				seenLevels[suffix] = struct{}{}
+				levels = append(levels, suffix)
+			}
+			if len(levels) == 0 {
+				continue
+			}
+			if groupedModels == nil {
+				groupedModels = make(map[string]AntigravityGroupedModel, len(groupMap))
+			}
+			groupedModels[groupID] = AntigravityGroupedModel{
+				DisplayName: strings.Clone(strings.TrimSpace(rawEntry.Get("displayName").String())),
+				Levels:      levels,
+			}
+		}
+	}
+
 	return AntigravityModelCapabilityHints{
 		WebSearchModelIDs: webSearchModels,
 		ModelIDs:          modelIDs,
+		GroupedModels:     groupedModels,
 	}, true
 }
 
@@ -300,6 +381,41 @@ func BuildPersistedAntigravityCapabilityHints(project, endpoint string, hints An
 			value["web_search_model_ids"] = webSearchItems
 		}
 	}
+	if len(hints.GroupedModels) > 0 {
+		grouped := make(map[string]any, len(hints.GroupedModels))
+		for rawGroupID, group := range hints.GroupedModels {
+			groupID := NormalizeAntigravityModelID(rawGroupID)
+			if groupID == "" || len(group.Levels) == 0 {
+				continue
+			}
+			levelItems := make([]any, 0, len(group.Levels))
+			seen := make(map[string]struct{}, len(group.Levels))
+			for _, rawLevel := range group.Levels {
+				level := NormalizeAntigravityModelID(rawLevel)
+				if level == "" {
+					continue
+				}
+				if _, dup := seen[level]; dup {
+					continue
+				}
+				seen[level] = struct{}{}
+				levelItems = append(levelItems, level)
+			}
+			if len(levelItems) == 0 {
+				continue
+			}
+			entry := map[string]any{
+				"levels": levelItems,
+			}
+			if dn := strings.TrimSpace(group.DisplayName); dn != "" {
+				entry["display_name"] = dn
+			}
+			grouped[groupID] = entry
+		}
+		if len(grouped) > 0 {
+			value["grouped_models"] = grouped
+		}
+	}
 	return value
 }
 
@@ -340,10 +456,95 @@ func ParsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedP
 		}
 		webSearchModels = parsedWebSearch
 	}
+	var groupedModels map[string]AntigravityGroupedModel
+	if rawGrouped, hasGrouped := rawMap["grouped_models"]; hasGrouped && rawGrouped != nil {
+		parsedGrouped, okGrouped := parsePersistedAntigravityGroupedModels(rawGrouped, modelIDs)
+		if !okGrouped {
+			return AntigravityModelCapabilityHints{}, false
+		}
+		groupedModels = parsedGrouped
+	}
 	return AntigravityModelCapabilityHints{
 		ModelIDs:          modelIDs,
 		WebSearchModelIDs: webSearchModels,
+		GroupedModels:     groupedModels,
 	}, true
+}
+
+func parsePersistedAntigravityGroupedModels(raw any, modelIDs map[string]struct{}) (map[string]AntigravityGroupedModel, bool) {
+	rawMap, ok := raw.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	var out map[string]AntigravityGroupedModel
+	for rawGroupID, rawEntry := range rawMap {
+		groupID := NormalizeAntigravityModelID(rawGroupID)
+		entryMap, okEntry := rawEntry.(map[string]any)
+		if !okEntry {
+			return nil, false
+		}
+		if groupID == "" {
+			continue
+		}
+		rawLevels, hasLevels := entryMap["levels"]
+		if !hasLevels || rawLevels == nil {
+			continue
+		}
+		levels, okLevels := parsePersistedAntigravityLevelSlice(rawLevels, groupID, modelIDs)
+		if !okLevels {
+			return nil, false
+		}
+		if len(levels) == 0 {
+			continue
+		}
+		displayName, _ := entryMap["display_name"].(string)
+		if out == nil {
+			out = make(map[string]AntigravityGroupedModel, len(rawMap))
+		}
+		out[groupID] = AntigravityGroupedModel{
+			DisplayName: strings.TrimSpace(displayName),
+			Levels:      levels,
+		}
+	}
+	return out, true
+}
+
+func parsePersistedAntigravityLevelSlice(raw any, groupID string, modelIDs map[string]struct{}) ([]string, bool) {
+	var rawStrings []string
+	switch items := raw.(type) {
+	case []any:
+		rawStrings = make([]string, 0, len(items))
+		for _, item := range items {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			rawStrings = append(rawStrings, s)
+		}
+	case []string:
+		rawStrings = items
+	default:
+		return nil, false
+	}
+	levels := make([]string, 0, len(rawStrings))
+	seen := make(map[string]struct{}, len(rawStrings))
+	for _, s := range rawStrings {
+		level := NormalizeAntigravityModelID(s)
+		if level == "" {
+			continue
+		}
+		if _, dup := seen[level]; dup {
+			continue
+		}
+		if modelIDs != nil {
+			if _, entitled := modelIDs[groupID+"-"+level]; !entitled {
+				continue
+			}
+		}
+		seen[level] = struct{}{}
+		levels = append(levels, level)
+	}
+	return levels, true
 }
 
 func parsePersistedAntigravityModelSet(raw any) (map[string]struct{}, bool) {

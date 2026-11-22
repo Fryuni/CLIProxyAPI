@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -658,17 +659,38 @@ func oauthExcludedModelsForConfig(cfg *config.Config, provider, authKind string)
 	return cfg.OAuthExcludedModels[providerKey]
 }
 
-func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
-	if len(models) == 0 || len(excluded) == 0 {
-		return models
+func normalizeExcludedModelPatterns(excluded []string) []string {
+	if len(excluded) == 0 {
+		return nil
 	}
-
 	patterns := make([]string, 0, len(excluded))
 	for _, item := range excluded {
 		if trimmed := strings.TrimSpace(item); trimmed != "" {
 			patterns = append(patterns, strings.ToLower(trimmed))
 		}
 	}
+	return patterns
+}
+
+func isExcludedModelID(modelID string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(modelID))
+	for _, pattern := range patterns {
+		if matchWildcard(pattern, normalized) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
+	if len(models) == 0 || len(excluded) == 0 {
+		return models
+	}
+
+	patterns := normalizeExcludedModelPatterns(excluded)
 	if len(patterns) == 0 {
 		return models
 	}
@@ -678,15 +700,7 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		if model == nil {
 			continue
 		}
-		modelID := strings.ToLower(strings.TrimSpace(model.ID))
-		blocked := false
-		for _, pattern := range patterns {
-			if matchWildcard(pattern, modelID) {
-				blocked = true
-				break
-			}
-		}
-		if !blocked {
+		if !isExcludedModelID(model.ID, patterns) {
 			filtered = append(filtered, model)
 		}
 	}
@@ -702,6 +716,9 @@ func cloneModelInfoForCatalogRoute(model *ModelInfo) ModelInfo {
 			capabilities.WebSearch = &webSearch
 		}
 		clone.NativeCapabilities = &capabilities
+	}
+	if len(model.GroupedLevelModelIDs) > 0 {
+		clone.GroupedLevelModelIDs = maps.Clone(model.GroupedLevelModelIDs)
 	}
 	return clone
 }
