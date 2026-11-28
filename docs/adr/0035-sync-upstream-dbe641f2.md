@@ -24,6 +24,8 @@ Conflicts in the retained delta and their resolutions:
 
 Upstream `69607634` fixes the [config-write atomicity ticket](../../.scratch/config-write-atomicity/issues/01-write-config-atomically.md) with a lock instead of the proposed temporary file and rename. Every config read and write now runs under one process-wide lock and an OS file lock, so a reload never reads a partially written file. The ticket is resolved. Every other open ticket was checked against the upstream diff and is unchanged. The Claude prompt-cache ticket and the reasoning-effort ordering ticket remain partly addressed, as before.
 
+Under ADR-0004's test policy, fork CI exposes one new upstream flake. `TestAIStudioExecutorClaudeMalformedFunctionCallCancelAfterErrorRecordsConductorFailure/stream_end` fails when the client cancels after the executor emits the visible error frame but before its error chunk reaches the conductor. The conductor then drops the failure instead of recording it. This is a runtime race, recorded as a [local ticket](../../.scratch/stream-cancel-after-error-result/issues/01-record-stream-failure-after-client-cancel.md) without patching the runtime.
+
 ## Evidence
 
-On the merged tree, `go build ./...`, `go vet` of the conflicted packages, and `go test ./...` pass.
+On the merged tree, `go build ./...`, `go vet` of the conflicted packages, and `go test ./...` pass; the first fork CI run hit the flake above. The flake failed 8 of 50 runs on clean upstream and 9 of 50 on the merged tree.
