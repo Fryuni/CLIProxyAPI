@@ -1,6 +1,6 @@
 # Write the config file atomically so reloads never apply a partial file
 
-Status: needs-triage
+Status: resolved
 Type: task
 
 ## Context
@@ -26,3 +26,5 @@ Concurrent management saves and reloads never apply a partial config, and manage
 ## Comments
 
 Recorded from the fork CI failure on PR #13 (run `39013841131`). The fork's runtime is unchanged.
+
+Resolved by upstream `69607634`, merged by [ADR-0035](../../../docs/adr/0035-sync-upstream-dbe641f2.md). Upstream fixes it with a lock rather than a temporary file and rename. `internal/config/config_file.go` runs every config read and write under a process-wide lock and an OS file lock. `LoadConfig`, the watcher's hash-check read, `SaveConfigPreserveComments`, and the management config writes all take that lock, so a reload can no longer read a partially written file. The writes still happen in place.

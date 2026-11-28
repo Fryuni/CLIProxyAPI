@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -299,7 +300,7 @@ type AntigravityConnectionPoolConfig struct {
 	IdleConnTimeout string `yaml:"idle-conn-timeout,omitempty" json:"idle-conn-timeout,omitempty"`
 
 	// MaxIdleConnsPerHost specifies the maximum number of idle connections to retain per host per credential.
-	// Defaults to 2.
+	// Defaults to 2. Zero or negative values disable idle pooling (short-lived connection mode).
 	MaxIdleConnsPerHost *int `yaml:"max-idle-conns-per-host,omitempty" json:"max-idle-conns-per-host,omitempty"`
 }
 
@@ -345,7 +346,10 @@ type CodexConfig struct {
 	// intervals rather than one, and can trip client or reverse-proxy read timeouts. The hold is
 	// bounded by a frame and a byte budget, not by wall-clock time, and neither budget is advanced
 	// by a websocket peer that sends only control frames or by an upstream that never terminates an
-	// SSE line. Only overload and rate-limit rejections fail over deliberately. A stream that ends
+	// SSE line. Only overload/rate-limit rejections and structured billing quota exhaustion
+	// (insufficient_quota / credit_balance_exhausted) fail over deliberately while the bootstrap
+	// window is uncommitted; once output or tool events commit the stream, errors are delivered
+	// in-stream with no replay. A stream that ends
 	// while the bootstrap is still holding ends the attempt rather than reaching the client, and
 	// what follows is pre-existing but now far more likely, since the hold can span the whole
 	// reasoning phase instead of ending at the first keepalive: a clean end with no terminal event
@@ -649,13 +653,11 @@ func (s OAuthModelSetting) GetMaxContextLength() int { return s.MaxContextLength
 // ResolveOAuthModelSetting finds the best matching OAuthModelSetting for a given model.
 // An exact Alias match on the model ID takes precedence over a general Name match.
 // Within the same match specificity, later entries in the slice override earlier ones.
-func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID, metadataModelID, modelName string) *OAuthModelSetting {
+func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID string, modelNames ...string) *OAuthModelSetting {
 	if len(settings) == 0 {
 		return nil
 	}
 	id := strings.ToLower(strings.TrimSpace(modelID))
-	metaID := strings.ToLower(strings.TrimSpace(metadataModelID))
-	name := strings.ToLower(strings.TrimSpace(modelName))
 
 	var aliasMatch *OAuthModelSetting
 	var nameMatch *OAuthModelSetting
@@ -670,7 +672,9 @@ func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID, metadataMod
 
 		if entryAlias != "" && id != "" && id == entryAlias {
 			aliasMatch = entry
-		} else if (entryAlias == "" || entryAlias == id) && (id == entryName || (metaID != "" && metaID == entryName) || (name != "" && name == entryName)) {
+		} else if entryAlias == "" && (id == entryName || slices.ContainsFunc(modelNames, func(name string) bool {
+			return strings.ToLower(strings.TrimSpace(name)) == entryName
+		})) {
 			nameMatch = entry
 		}
 	}

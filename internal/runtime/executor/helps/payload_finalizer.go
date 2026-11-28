@@ -22,12 +22,6 @@ var (
 	builtinFinalizerCodePtr atomic.Uintptr
 )
 
-type payloadDocProbe struct {
-	doc          *ojson.Doc
-	trackedPaths []string
-	reconcile    func(doc *ojson.Doc, touched map[string]bool)
-}
-
 func payloadFinalizerKeyPtr(f PayloadFinalizer) uintptr {
 	if f == nil {
 		return 0
@@ -37,60 +31,42 @@ func payloadFinalizerKeyPtr(f PayloadFinalizer) uintptr {
 
 // FinalizeDoc applies the finalizer to doc in place without probing custom wrappers.
 func (f PayloadFinalizer) FinalizeDoc(doc *ojson.Doc) {
-	f.FinalizeDocWithReconcile(doc, nil, nil)
-}
-
-// FinalizeDocWithReconcile applies the finalizer to doc in place and runs reconcile
-// inside the same finalization pass with the set of trackedPaths touched by payload rules.
-func (f PayloadFinalizer) FinalizeDocWithReconcile(doc *ojson.Doc, trackedPaths []string, reconcile func(doc *ojson.Doc, touched map[string]bool)) {
 	if f == nil || doc == nil {
 		return
 	}
 	if ptr := payloadFinalizerKeyPtr(f); ptr != 0 && ptr == builtinFinalizerCodePtr.Load() {
-		var probeKey [1]byte
-		key := &probeKey[0]
-		probe := &payloadDocProbe{doc: doc, trackedPaths: trackedPaths, reconcile: reconcile}
-		payloadDocProbes.Store(key, probe)
-		_ = f(probeKey[:0])
+		var probe [1]byte
+		key := &probe[0]
+		payloadDocProbes.Store(key, doc)
+		_ = f(probe[:0])
 		if _, remaining := payloadDocProbes.LoadAndDelete(key); !remaining {
 			return
 		}
 	}
-	var before map[string]string
-	if reconcile != nil && len(trackedPaths) > 0 {
-		before = make(map[string]string, len(trackedPaths))
-		for _, tp := range trackedPaths {
-			if tp = strings.TrimSpace(tp); tp != "" {
-				before[tp] = doc.Get(tp).Raw
-			}
-		}
-	}
 	updated := f(doc.Bytes())
 	*doc = *ojson.NewDoc(updated)
-	if reconcile != nil {
-		var touched map[string]bool
-		if len(before) > 0 {
-			touched = make(map[string]bool)
-			for tp, prev := range before {
-				if doc.Get(tp).Raw != prev {
-					touched[tp] = true
-				}
-			}
-		}
-		reconcile(doc, touched)
-	}
 }
 
 // NewPayloadFinalizer snapshots matching context before built-in request mutations.
 func NewPayloadFinalizer(cfg *config.Config, executor, model, protocol, root string, original []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, auths ...*cliproxyauth.Auth) PayloadFinalizer {
-	requestedModel := PayloadRequestedModel(opts, req.Model)
-	requestPath := PayloadRequestPath(opts)
-	headers := opts.Headers.Clone()
-	source := append([]byte(nil), original...)
 	var auth *cliproxyauth.Auth
 	if len(auths) > 0 {
 		auth = auths[0]
 	}
+	return newPayloadFinalizer(cfg, executor, model, protocol, root, original, req, opts, auth, nil)
+}
+
+// NewPayloadFinalizerWithSourceModels includes intermediate resolved model IDs
+// when a provider makes a second model selection after alias resolution.
+func NewPayloadFinalizerWithSourceModels(cfg *config.Config, executor, model, protocol, root string, original []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, sourceModels ...string) PayloadFinalizer {
+	return newPayloadFinalizer(cfg, executor, model, protocol, root, original, req, opts, nil, append([]string(nil), sourceModels...))
+}
+
+func newPayloadFinalizer(cfg *config.Config, executor, model, protocol, root string, original []byte, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, auth *cliproxyauth.Auth, sourceModels []string) PayloadFinalizer {
+	requestedModel := PayloadRequestedModel(opts, req.Model)
+	requestPath := PayloadRequestPath(opts)
+	headers := opts.Headers.Clone()
+	source := append([]byte(nil), original...)
 	var formatCallback func(string)
 	if opts.Metadata != nil {
 		formatCallback, _ = opts.Metadata[cliproxyexecutor.FinalizedResponseFormatCallbackMetadataKey].(func(string))
@@ -99,20 +75,17 @@ func NewPayloadFinalizer(cfg *config.Config, executor, model, protocol, root str
 		if len(body) == 0 && cap(body) == 1 {
 			key := &body[:1][0]
 			if v, ok := payloadDocProbes.LoadAndDelete(key); ok {
-				if probe, okProbe := v.(*payloadDocProbe); okProbe && probe != nil && probe.doc != nil {
-					touched, _ := applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg, executor, model, protocol, opts.SourceFormat.String(), root, probe.doc, source, requestedModel, requestPath, headers, auth, probe.trackedPaths...)
-					if probe.reconcile != nil {
-						probe.reconcile(probe.doc, touched)
-					}
+				if doc, okDoc := v.(*ojson.Doc); okDoc && doc != nil {
+					applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg, executor, model, protocol, opts.SourceFormat.String(), root, doc, source, requestedModel, requestPath, headers, auth, sourceModels)
 					if formatCallback != nil {
-						formatCallback(strings.Clone(strings.TrimSpace(probe.doc.Get(buildPayloadPath(root, "response_format")).String())))
+						formatCallback(strings.Clone(strings.TrimSpace(doc.Get(buildPayloadPath(root, "response_format")).String())))
 					}
 				}
 				return nil
 			}
 		}
 		doc := ojson.NewDoc(body)
-		_, mutated := applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg, executor, model, protocol, opts.SourceFormat.String(), root, doc, source, requestedModel, requestPath, headers, auth)
+		_, mutated := applyPayloadConfigWithTrackedPathsForExecutorAndAuthDoc(cfg, executor, model, protocol, opts.SourceFormat.String(), root, doc, source, requestedModel, requestPath, headers, auth, sourceModels)
 		out := body
 		if mutated {
 			out = doc.Bytes()
@@ -149,16 +122,5 @@ func FinalizePayloadDoc(ctx context.Context, doc *ojson.Doc) {
 	}
 	if finalize, ok := ctx.Value(payloadFinalizerKey{}).(PayloadFinalizer); ok && finalize != nil {
 		finalize.FinalizeDoc(doc)
-	}
-}
-
-// FinalizePayloadDocWithReconcile runs immediately before serialization or transport framing,
-// mutating doc in place and running reconcile inside the same finalization pass.
-func FinalizePayloadDocWithReconcile(ctx context.Context, doc *ojson.Doc, trackedPaths []string, reconcile func(doc *ojson.Doc, touched map[string]bool)) {
-	if doc == nil {
-		return
-	}
-	if finalize, ok := ctx.Value(payloadFinalizerKey{}).(PayloadFinalizer); ok && finalize != nil {
-		finalize.FinalizeDocWithReconcile(doc, trackedPaths, reconcile)
 	}
 }
