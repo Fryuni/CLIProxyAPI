@@ -115,6 +115,9 @@ type Service struct {
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
 
+	// copilotCatalogs owns provider-local discovery; protected by cfgMu.
+	copilotCatalogs *copilotCatalogRefresher
+
 	// cooldownStateStore persists runtime cooldown state when enabled.
 	cooldownStateStore coreauth.CooldownStateStore
 
@@ -125,8 +128,14 @@ type Service struct {
 	// installed on request handlers. Nil means the internal pluginHost is used.
 	pluginInterceptorHost handlers.PluginInterceptorHost
 
-	// shutdownOnce ensures shutdown is called only once.
+	// shutdownOnce ensures shutdown teardown runs only once.
 	shutdownOnce sync.Once
+
+	// shutdownRefreshWaiters counts concurrent Shutdown calls waiting for auto-refresh saves.
+	shutdownRefreshWaiters atomic.Int32
+
+	// shutdownCleanupStarted records whether one-time shutdown teardown has begun.
+	shutdownCleanupStarted atomic.Bool
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
@@ -166,8 +175,6 @@ type Service struct {
 	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
 	antigravityPersistPending map[string]*antigravityHintPersistRequest
 	antigravityPersistActive  map[string]*antigravityHintPersistRequest
-	// copilotCatalogs caches each GitHub Copilot credential's model catalog.
-	copilotCatalogs copilotCatalogs
 }
 
 // SetResultPolicy sets an execution result policy on the underlying core auth manager.

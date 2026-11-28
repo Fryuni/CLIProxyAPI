@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0035
 ---
 
 # Serve GitHub Copilot subscriptions as a native provider
@@ -17,3 +17,9 @@ Copilot exposes three wire protocols, and each model serves a subset of them, as
 `RequestToFormat` reports the chosen protocol to the conductor. Every request carries `Copilot-Integration-Id: copilot-developer-cli`. Without it, Copilot uses a narrower integration that rejects some models, such as `gpt-5.4-nano` and `gemini-4-hydrogen`. Requests also carry `X-Initiator`, set to `agent` for tool-result follow-ups so Copilot does not bill them as premium user turns, and `Copilot-Vision-Request` when the request includes images. Header attributes defined on the credential override these defaults. Copilot has no `/responses/compact` endpoint, so compaction is emulated with a summary turn, as Meta and Kimi do. Payload rules stay the final semantic barrier on all three routes. The executor is registered through the service's wrapping `registerExecutor`, as upstream's built-in executors are since the `f5c5681a` sync ([ADR-0033](0033-sync-upstream-f5c5681a.md)).
 
 There is no static catalog, because each account's models depend on its plan and organization policy. Registration publishes only the fetched `/models` catalog. It keeps chat models that serve at least one of the three protocols and drops models whose policy is `disabled`, which Copilot rejects with `model_not_supported`. The fetch runs in the background. It is cached per credential and keyed by token, base URL, and proxy, so a rotated token is never served the previous account's catalog. The cache is refreshed every `ModelsRefreshInterval` and retried 5 minutes after a failure. Thinking support comes from the catalog's `reasoning_effort`, thinking-budget, and `adaptive_thinking` fields. A Claude model that advertises both adaptive thinking and a budget rejects `thinking.type: "enabled"`. Such models therefore advertise levels only, and requested budgets are converted to levels.
+
+## Upstream implementation notes
+
+Upstream `7ae771fc`, `5dff8b67`, `d059cf28`, and `f89d408e`, merged by [ADR-0035](0035-sync-upstream-dbe641f2.md), add a native `copilot` provider. Login runs GitHub's device flow through `--copilot-login`, under the VS Code Copilot OAuth app (`Iv1.b507a08c87ecfe98`). The GitHub token is exchanged through `copilot_internal/v2/token` for a short-lived Copilot token, which upstream refreshes. Each account's `/models` capabilities are intersected with the registry's Copilot presets, and each model is routed to the protocols it serves. Requests carry the same `Copilot-Integration-Id: copilot-developer-cli` and `X-Initiator` headers. Payload rules stay final. Upstream's `internal/auth/copilot` package occupies the same directory as the fork's, so the two cannot coexist. The fork drops its `github-copilot` provider and keeps upstream's implementation.
+
+Two fork behaviors do not carry over. `github-copilot` credential files no longer load, so each account must log in again with `--copilot-login`. Login no longer imports `COPILOT_GITHUB_TOKEN`. Upstream also routes only models that have a registry preset.

@@ -47,7 +47,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// upstreams the native gate accepts.
 	cchSigning := claudeCCHSigningEnabled(apiKey, claudeCCHUpstreamAnthropic, fp.ProfileClaudeCodeCLI, url)
 
-	reporter := e.newUsageReporter(ctx, baseModel, auth)
+	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 	if upstreamModel != baseModel {
 		reporter.SetUpstreamModel(upstreamModel)
